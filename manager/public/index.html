@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>智能图床管理器 · 洛佬の美图</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- ============ 顶部栏：标识 / 视图切换 / 同步状态 ============ -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span class="brand-name">智能图床管理器</span>
+      <span class="brand-sub" id="repoLabel"></span>
+    </div>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-view="upload">上传</button>
+      <button class="tab" data-view="library">图片库</button>
+      <button class="tab" data-view="stats">统计</button>
+    </nav>
+    <div class="topbar-right">
+      <!-- 链接类型切换：jsDelivr CDN / GitHub Raw -->
+      <label class="link-switch" title="生成的访问链接类型">
+        <select id="linkType">
+          <option value="jsdelivr">jsDelivr CDN</option>
+          <option value="raw">GitHub Raw</option>
+        </select>
+      </label>
+      <button class="btn ghost" id="btnGitStatus">
+        同步状态 <span class="badge" id="gitCount">…</span>
+      </button>
+      <button class="btn primary" id="btnGitSync">同步到 GitHub</button>
+    </div>
+  </header>
+
+  <main class="main">
+    <!-- ============ 视图一：上传 ============ -->
+    <section class="view active" id="view-upload">
+      <div class="upload-layout">
+        <!-- 左列：拖拽区 + 上传选项 -->
+        <div class="col">
+          <div class="card dropzone" id="dropzone" tabindex="0" role="button" aria-label="点击或拖拽选择图片">
+            <div class="dz-icon">⇪</div>
+            <div class="dz-title">拖拽图片到此处，或点击选择</div>
+            <div class="dz-sub">支持 JPG / PNG / WebP / GIF / BMP / AVIF · 单批最多 <b id="maxBatch"></b> 张</div>
+            <input type="file" id="fileInput" multiple hidden
+                   accept="image/*,.jpg,.jpeg,.png,.webp,.gif,.bmp,.avif" />
+          </div>
+
+          <div class="card options">
+            <h3 class="card-title">上传选项</h3>
+            <div class="opt-grid">
+              <label class="opt">
+                <span class="opt-label">分类方式</span>
+                <select id="optCategory">
+                  <option value="auto">自动（按宽高比）</option>
+                  <option value="heng">横图 heng</option>
+                  <option value="shu">竖图 shu</option>
+                  <option value="avatar">方形 avatar</option>
+                  <option value="emoticon">表情包 emoticon</option>
+                  <option value="temporary">临时 temporary</option>
+                </select>
+              </label>
+              <label class="opt" id="optThemeWrap" hidden>
+                <span class="opt-label">表情包主题（文件夹名）</span>
+                <input type="text" id="optTheme" placeholder="例如：辟浪" />
+              </label>
+              <label class="opt">
+                <span class="opt-label">格式转换</span>
+                <select id="optConvert">
+                  <option value="keep">保留原格式</option>
+                  <option value="jpg">统一转 JPG</option>
+                  <option value="png">统一转 PNG</option>
+                  <option value="webp">统一转 WebP</option>
+                  <option value="avif">统一转 AVIF</option>
+                </select>
+              </label>
+              <label class="opt">
+                <span class="opt-label">压缩质量 <b id="qualityVal">82</b></span>
+                <input type="range" id="optQuality" min="30" max="100" value="82" />
+              </label>
+              <label class="opt">
+                <span class="opt-label">完全重复时</span>
+                <select id="optDuplicate">
+                  <option value="skip">跳过（推荐）</option>
+                  <option value="keep">仍然保留</option>
+                </select>
+              </label>
+              <label class="opt opt-check">
+                <input type="checkbox" id="optStripMeta" checked />
+                <span>剥离拍摄信息（保护隐私，保留色彩配置）</span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- 右列：上传队列 -->
+        <div class="col wide">
+          <div class="card queue">
+            <h3 class="card-title">上传队列 <span class="muted" id="queueSummary"></span></h3>
+            <div class="queue-empty" id="queueEmpty">队列为空——选择或拖入图片后开始</div>
+            <div class="queue-list" id="queueList"></div>
+            <div class="queue-actions" id="queueActions" hidden>
+              <button class="btn primary" id="btnUpload">开始上传</button>
+              <button class="btn ghost" id="btnClearQueue">清空队列</button>
+              <button class="btn ghost" id="btnCopyBatch" hidden>复制本批全部链接</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 视图二：图片库（左右布局：左侧目录树 + 右侧网格） ============ -->
+    <section class="view" id="view-library">
+      <div class="lib-layout">
+        <!-- 左栏：实际文件夹结构树 -->
+        <aside class="card lib-side">
+          <div class="lib-side-title">目录</div>
+          <div class="dir-tree" id="dirTree"></div>
+        </aside>
+
+        <!-- 右栏：筛选工具条 + 图片网格 -->
+        <div class="lib-main">
+          <div class="card toolbar">
+            <div class="chips" id="catChips"></div>
+            <select id="fmtFilter" class="mini-select"><option value="all">全部格式</option></select>
+            <input type="search" id="searchBox" class="search" placeholder="搜索文件名…" />
+            <span class="muted" id="libCount"></span>
+            <span class="flex-sp"></span>
+            <button class="btn ghost" id="btnDupScan">查重扫描</button>
+            <button class="btn ghost" id="btnTrash">回收站</button>
+          </div>
+
+          <div class="grid" id="libGrid"></div>
+          <div class="empty" id="libEmpty" hidden>没有符合条件的图片</div>
+        </div>
+      </div>
+
+      <!-- 多选浮动操作条 -->
+      <div class="bulkbar" id="bulkbar" hidden>
+        <span>已选 <b id="selCount">0</b> 张</span>
+        <button class="btn small primary" id="btnCopySel">复制链接</button>
+        <button class="btn small" id="btnExportSel">导出链接</button>
+        <button class="btn small" id="btnConvertSel">格式转换</button>
+        <button class="btn small danger" id="btnTrashSel">移入回收站</button>
+        <button class="btn small ghost" id="btnSelAll">全选</button>
+        <button class="btn small ghost" id="btnSelNone">取消</button>
+      </div>
+
+      <!-- 查重结果面板 -->
+      <div class="modal" id="dupPanel" hidden>
+        <div class="modal-card">
+          <div class="modal-head">
+            <h3>重复图片检测结果 <span class="muted" id="dupMeta"></span></h3>
+            <button class="icon-btn" data-close="dupPanel">✕</button>
+          </div>
+          <div class="modal-body" id="dupBody"></div>
+        </div>
+      </div>
+
+      <!-- 回收站面板 -->
+      <div class="modal" id="trashPanel" hidden>
+        <div class="modal-card">
+          <div class="modal-head"><h3>回收站（可恢复）</h3><button class="icon-btn" data-close="trashPanel">✕</button></div>
+          <div class="modal-body" id="trashBody"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 视图三：统计 ============ -->
+    <section class="view" id="view-stats">
+      <div class="stat-cards" id="statCards"></div>
+      <div class="stat-layout">
+        <div class="card">
+          <h3 class="card-title">分类占比</h3>
+          <div class="donut-wrap" id="donutWrap"></div>
+        </div>
+        <div class="card">
+          <h3 class="card-title">格式分布</h3>
+          <div class="bars" id="fmtBars"></div>
+        </div>
+      </div>
+      <div class="stat-layout2">
+        <div class="card">
+          <h3 class="card-title">分类明细</h3>
+          <div id="catDetail"></div>
+        </div>
+        <div class="card">
+          <h3 class="card-title">最近更新</h3>
+          <div id="recentList"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 全局提示（toast） -->
+  <div class="toasts" id="toasts"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

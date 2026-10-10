@@ -1,0 +1,30 @@
+{
+  "name": "lti-manager",
+  "version": "1.0.0",
+  "description": "洛佬の美图 - 智能图床管理器（独立模块，不侵入原有图床目录结构与代码逻辑）",
+  "main": "server.js",
+  "bin": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "build": "node tools/build-exe.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "multer": "^2.0.1",
+    "sharp": "^0.33.5"
+  },
+  "pkg": {
+    "targets": [
+      "node24-win-x64"
+    ],
+    "outputPath": "dist",
+    "assets": [
+      "public/**/*",
+      "config.json",
+      "node_modules/@img/**/*"
+    ]
+  }
+}

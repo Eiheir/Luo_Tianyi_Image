@@ -1,0 +1,7 @@
+# 本文件仅作用于 manager 子目录，不影响仓库其他路径
+node_modules/
+.cache/
+.trash/
+dist/
+.test-tmp/
+*.log
