@@ -22,15 +22,41 @@ const sharp = require('sharp');
 /** 支持的转换目标格式（键=前端传入值，值=落盘扩展名） */
 const TARGETS = { keep: null, jpg: 'jpg', png: 'png', webp: 'webp', avif: 'avif' };
 
+/** 无需像素级重编码的保留型格式：gif 重编码会丢帧、avif 重编码收益低且慢 */
+const PASSTHROUGH_EXT = new Set(['gif', 'avif']);
+
+/** keep 模式下可直接重编码的格式白名单（不在此列的原格式一律兜底转 jpg） */
+const ENCODABLE_EXT = new Set(['jpg', 'png', 'webp']);
+
+/** 构建带方向转正与隐私策略的 sharp 管道 */
+function buildPipe(inputBuffer, stripMeta) {
+  // rotate() 按 EXIF 自动转正物理像素；stripMeta=true 时不 keepExif → 输出丢弃 EXIF
+  // （防 GPS/拍摄参数外泄）。两种情况都 keepIccProfile 保留色彩配置，避免转换后偏色。
+  return stripMeta
+    ? sharp(inputBuffer).rotate().keepIccProfile()
+    : sharp(inputBuffer).rotate().keepExif().keepIccProfile();
+}
+
 /**
- * 判断图片是否为动图（多帧）
+ * 按目标扩展名编码（统一收口各格式的编码参数）。
+ * 返回 sharp 的 { data, info }：info 内已含输出宽高，从而免去"编码后再解析一次 metadata"。
  */
-async function detectAnimated(inputBuffer) {
-  const meta = await sharp(inputBuffer, { pages: 1 }).metadata();
-  // gif/webp 的帧数在 pages / nPages 字段；>1 即动图
-  const pages = meta.pages || meta.nPages || 1;
-  const isMultiFrameExt = ['gif', 'webp'].includes((meta.format || '').toLowerCase());
-  return { meta, animated: isMultiFrameExt && pages > 1 };
+async function encode(pipe, ext, quality) {
+  switch (ext) {
+    case 'jpg':
+      // 白底压平透明通道后再压缩；mozjpeg 提升压缩率与兼容性
+      return pipe.flatten({ background: '#ffffff' }).jpeg({ quality, mozjpeg: true }).toBuffer({ resolveWithObject: true });
+    case 'png':
+      return pipe.png({ compressionLevel: 9, palette: true }).toBuffer({ resolveWithObject: true });
+    case 'webp':
+      return pipe.webp({ quality }).toBuffer({ resolveWithObject: true });
+    case 'avif':
+      // AVIF 压缩率高但编码慢，quality 稍降即可获得极佳体积
+      return pipe.avif({ quality: Math.min(quality, 80) }).toBuffer({ resolveWithObject: true });
+    default:
+      // 未知/不支持的目标：兜底按 jpg 输出
+      return pipe.flatten({ background: '#ffffff' }).jpeg({ quality, mozjpeg: true }).toBuffer({ resolveWithObject: true });
+  }
 }
 
 /**
@@ -44,77 +70,78 @@ async function detectAnimated(inputBuffer) {
  * @returns {Promise<{buffer, ext, width, height, animated, converted, notice?}>}
  */
 async function processImage(inputBuffer, opts = {}) {
-  const { meta, animated } = await detectAnimated(inputBuffer);
+  // 仅解析一次元数据：同时拿到 format（原格式）、pages（判断是否动图）、
+  // orientation（是否需转正）、exif（是否需剥离）与物理宽高，避免重复解码
+  const meta = await sharp(inputBuffer).metadata();
+  // pages > 1 视为动图（GIF、动图 WebP 等），单帧或多帧静态图均为此字段缺省
+  const animated = (meta.pages || 1) > 1;
+
   const targetKey = TARGETS[opts.target] !== undefined ? opts.target : 'keep';
   let ext = (meta.format || 'jpg').toLowerCase();
   // jpeg 统一记作 jpg，方便命名与统计
   if (ext === 'jpeg') ext = 'jpg';
 
-  let notice;
-  let finalExt = ext;
-
-  // 动图保护：目标格式与原格式不同且是动图 → 默认放弃转换
-  if (animated && targetKey !== 'keep' && TARGETS[targetKey] !== ext && !opts.allowAnimatedLoss) {
-    notice = '动图已保留原格式（转静态格式仅会保留第一帧）';
-  } else if (targetKey !== 'keep') {
-    finalExt = TARGETS[targetKey];
-  }
-
   const quality = clampQuality(opts.quality);
+  // stripMeta 默认 true：未显式传 false 即剥离 EXIF（防 GPS/拍摄参数外泄）
+  const stripMeta = opts.stripMeta !== false;
 
-  // 组装 sharp 管道：rotate() 按 EXIF 自动转正物理像素。
-  // 隐私说明：不调用 keepExif() 时，输出默认丢弃 EXIF（防止 GPS/拍摄参数外泄）；
-  // ICC 色彩配置文件用 keepIccProfile() 显式保留，避免转换后偏色。
-  const pipe = opts.stripMeta === false
-    ? sharp(inputBuffer).rotate().keepExif().keepIccProfile()
-    : sharp(inputBuffer).rotate().keepIccProfile();
-
-  let buffer;
-  switch (finalExt) {
-    case 'jpg':
-      // 白底压平透明通道后再压缩；mozjpeg 提升压缩率与兼容性
-      buffer = await pipe.flatten({ background: '#ffffff' }).jpeg({ quality, mozjpeg: true }).toBuffer();
-      break;
-    case 'png':
-      buffer = await pipe.png({ compressionLevel: 9, palette: true }).toBuffer();
-      break;
-    case 'webp':
-      buffer = await pipe.webp({ quality }).toBuffer();
-      break;
-    case 'avif':
-      // AVIF 压缩率高但编码慢，quality 稍降即可获得极佳体积
-      buffer = await pipe.avif({ quality: Math.min(quality, 80) }).toBuffer();
-      break;
-    default:
-      // keep：保留原格式重新编码（仅完成方向转正/压平）
-      switch (ext) {
-        case 'png':
-          buffer = await pipe.png({ compressionLevel: 9, palette: true }).toBuffer();
-          break;
-        case 'webp':
-          buffer = await pipe.webp({ quality }).toBuffer();
-          break;
-        case 'gif':
-        case 'avif':
-          // gif 动图与 avif 不重编码，保留原始字节（转正对动图无意义）
-          buffer = inputBuffer;
-          break;
-        default:
-          buffer = await pipe.flatten({ background: '#ffffff' }).jpeg({ quality, mozjpeg: true }).toBuffer();
-          finalExt = 'jpg';
-      }
+  // ---- 模式一：保留原格式（keep）----
+  if (targetKey === 'keep') {
+    // orientation 存在且不为 1，说明物理像素是歪的、需按 EXIF 转正
+    const needRotate = !!meta.orientation && meta.orientation !== 1;
+    // 勾选了剥离且确实含 EXIF 时才需重编码去元数据
+    const needStrip = stripMeta && !!meta.exif;
+    // 原样保留条件：① gif/avif 恒原样（重编码会丢帧或得不偿失）
+    //              ② 既不需转正、也不需剥离元数据 → 逐字节原样输出
+    // 关键点：此时不做任何重编码，画质与体积与原文件完全一致（"真的原样保留"）
+    if (PASSTHROUGH_EXT.has(ext) || (!needRotate && !needStrip)) {
+      return {
+        buffer: inputBuffer,
+        ext,
+        width: meta.width,
+        height: meta.height,
+        animated,
+        converted: false
+      };
+    }
+    // 需转正或剥离 EXIF 时才重编码：仅 jpg/png/webp 可直接编码，其余格式兜底转 jpg
+    const outExt = ENCODABLE_EXT.has(ext) ? ext : 'jpg';
+    const { data, info } = await encode(buildPipe(inputBuffer, stripMeta), outExt, quality);
+    return {
+      buffer: data,
+      ext: outExt,
+      width: info.width,
+      height: info.height,
+      animated,
+      converted: outExt !== ext,
+      // 仅当原格式被迫改变时给出提示，否则静默完成转正/去元数据
+      notice: outExt !== ext ? `原格式 ${ext} 无法原样转正，已转为 ${outExt}` : undefined
+    };
   }
 
-  // 读取输出尺寸（rotate 后的真实宽高）
-  const outMeta = await sharp(buffer).metadata();
+  // ---- 模式二：转换为指定格式 ----
+  const targetExt = TARGETS[targetKey];
+  // 动图保护：动图转不同格式只会保留第一帧，默认放弃转换并原样返回
+  if (animated && targetExt !== ext && !opts.allowAnimatedLoss) {
+    return {
+      buffer: inputBuffer,
+      ext,
+      width: meta.width,
+      height: meta.height,
+      animated,
+      converted: false,
+      notice: '动图已保留原格式（转静态格式仅会保留第一帧）'
+    };
+  }
+  // 统一走 encode：info 内已含输出宽高，无需再解析一次 metadata
+  const { data, info } = await encode(buildPipe(inputBuffer, stripMeta), targetExt, quality);
   return {
-    buffer,
-    ext: finalExt,
-    width: outMeta.width,
-    height: outMeta.height,
+    buffer: data,
+    ext: targetExt,
+    width: info.width,
+    height: info.height,
     animated,
-    converted: finalExt !== ext,
-    notice
+    converted: targetExt !== ext
   };
 }
 
@@ -125,4 +152,4 @@ function clampQuality(q) {
   return Math.max(30, Math.min(100, Math.round(n)));
 }
 
-module.exports = { processImage, detectAnimated, TARGETS, clampQuality };
+module.exports = { processImage, TARGETS, clampQuality };

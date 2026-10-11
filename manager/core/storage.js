@@ -50,9 +50,8 @@ function listImages(index, cfg, filters = {}) {
       name: path.basename(rel),
       w: it.w, h: it.h,
       size: it.size,
-      mtime: it.mtime,
-      md5: it.md5 || '',
-      dhash: it.dhash || ''
+      mtime: it.mtime
+      // 说明：md5/dhash 仅用于服务端查重比对，前端列表用不到，故不下发以缩小响应体
     });
   }
   rows.sort((a, b) => b.mtime - a.mtime); // 最近更新在前
@@ -229,12 +228,17 @@ async function listTrash(cfg) {
 async function restoreFromTrash(cfg, batchId, flat) {
   const batchDir = path.join(cfg._paths.trashDir, batchId);
   const src = path.join(batchDir, flat);
+  // 防御：源文件必须落在该批次目录内，杜绝 flat 携带路径分隔符导致的越界读取
+  if (src !== path.join(batchDir, path.basename(flat))) throw new Error('回收站文件标识非法');
   let manifest = {};
   try {
     manifest = JSON.parse(await fsp.readFile(path.join(batchDir, 'manifest.json'), 'utf8'));
   } catch (e) { /* 无清单时退回压平规则还原 */ }
   const rel = manifest[flat] || flat.replace(/__/g, '/');
-  const dst = path.join(cfg._paths.imageRoot, rel.replace(/\//g, path.sep));
+  const dst = path.resolve(cfg._paths.imageRoot, rel.replace(/\//g, path.sep));
+  // 防御：恢复目标必须落在图库根目录内，杜绝清单被篡改导致的越界写入
+  const root = cfg._paths.imageRoot;
+  if (dst === root || !dst.startsWith(root + path.sep)) throw new Error('恢复目标路径非法');
   await fsp.mkdir(path.dirname(dst), { recursive: true });
   await fsp.rename(src, dst);
   // 同步更新清单：已恢复的条目移除，防止重复列出

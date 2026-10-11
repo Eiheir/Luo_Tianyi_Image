@@ -23,6 +23,17 @@ function run(repoRoot, args, timeoutMs) {
 }
 
 /**
+ * 校验分支名合法性：拒绝以 "-" 开头（会被 git 当成选项）、含空白或 .. ~ ^ : ? * [ \ 等
+ * 非法字符的名称，防止分支名被用于向 git 注入额外参数。
+ * @returns {string|null} 合法返回分支名，非法返回 null
+ */
+function safeBranch(name) {
+  const b = String(name || '').trim();
+  if (!b || /^-/.test(b) || /[\s~^:?*\[\\]/.test(b) || b.includes('..')) return null;
+  return b;
+}
+
+/**
  * 读取图库范围内的变更摘要（同步前预览）
  * @returns {{count:number, entries:Array<{flag:string, path:string}>}}
  */
@@ -67,8 +78,14 @@ async function sync(cfg) {
   if (!commitOk) return { ok: false, message: '提交失败，已中止（图片文件不受影响）', steps };
 
   // 第 4 步：推送（失败不影响本地文件，可稍后重试）
-  const push = await run(cfg._paths.repoRoot, ['push', 'origin', cfg.repo.branch], timeout);
-  steps.push({ step: '推送到 GitHub', ok: !push.err, detail: push.err ? (push.stderr || push.err.message) : `已推送至 origin/${cfg.repo.branch}` });
+  // 分支名先校验，并用 "--" 终止 git 的选项解析，避免分支名被当作命令参数注入
+  const branch = safeBranch(cfg.repo.branch);
+  if (!branch) {
+    steps.push({ step: '推送到 GitHub', ok: false, detail: `分支名不合法：${cfg.repo.branch}` });
+    return { ok: false, message: '分支名不合法，已跳过推送（本地已提交，可修正配置后重试）', steps };
+  }
+  const push = await run(cfg._paths.repoRoot, ['push', '--', 'origin', branch], timeout);
+  steps.push({ step: '推送到 GitHub', ok: !push.err, detail: push.err ? (push.stderr || push.err.message) : `已推送至 origin/${branch}` });
 
   const ok = !push.err;
   return {

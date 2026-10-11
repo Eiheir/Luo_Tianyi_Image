@@ -6,6 +6,7 @@
   "bin": "server.js",
   "scripts": {
     "start": "node server.js",
+    "test": "node --test",
     "build": "node tools/build-exe.js"
   },
   "engines": {

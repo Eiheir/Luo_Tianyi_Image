@@ -37,11 +37,28 @@ async function ensureDirs() {
   }
 }
 
+/** 清理上传暂存目录的残留文件（进程异常退出可能遗留），避免暂存文件长期占用磁盘 */
+async function cleanTmp() {
+  let entries;
+  try { entries = await fsp.readdir(cfg._paths.tmpDir); }
+  catch (e) { return; } // 目录不存在等情况静默跳过
+  for (const name of entries) {
+    await fsp.unlink(path.join(cfg._paths.tmpDir, name)).catch(() => {});
+  }
+}
+
+/** 错误日志单文件大小上限：超过则轮转，防止长期运行把日志写成超大文件 */
+const MAX_LOG_BYTES = 2 * 1024 * 1024; // 2MB
+
 /** 进程级错误日志（记录到模块私有目录，不影响服务运行） */
 async function logError(scope, err) {
   const line = `[${new Date().toISOString()}] [${scope}] ${err && err.stack ? err.stack : err}\n`;
+  const logFile = path.join(cfg._paths.logDir, 'error.log');
   try {
-    await fsp.appendFile(path.join(cfg._paths.logDir, 'error.log'), line, 'utf8');
+    // 轮转：超过上限就把当前日志改名为 error.log.1（覆盖旧备份，只保留一份历史）
+    const st = await fsp.stat(logFile).catch(() => null);
+    if (st && st.size > MAX_LOG_BYTES) await fsp.rename(logFile, `${logFile}.1`).catch(() => {});
+    await fsp.appendFile(logFile, line, 'utf8');
   } catch (e) { /* 日志写失败时仅打印，避免二次异常 */ }
   console.error(`[${scope}]`, err);
 }
@@ -57,8 +74,42 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' })); // JSON 请求体上限 1MB（仅承载路径列表等小数据）
 
+// 基础安全响应头：本服务虽默认仅监听本机回环，仍补齐基础防护，降低误暴露/被嵌入的风险
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff'); // 禁止浏览器对响应做 MIME 嗅探
+  res.setHeader('Referrer-Policy', 'no-referrer');    // 不外泄引用来源
+  res.setHeader('X-Frame-Options', 'DENY');           // 禁止被 iframe 嵌入
+  next();
+});
+
 /** 内存态索引：启动时加载，上传/转换/删除时增量更新 */
 let index = null;
+
+// —— 扫描缓存（消除 /api/images 与 /api/stats 并发时的重复扫库与索引竞态）——
+// 前端刷新列表时这两个接口并行调用，旧实现各自 scanLibrary → 同一时刻把整个图库 stat 两遍，
+// 且两次扫描各自赋值 index.items 存在相互覆盖风险。这里用"在途 Promise + TTL"合并：
+//  - 已有在途扫描：后续请求直接复用同一个 Promise（并发合并）
+//  - TTL 窗口内的结果：直接复用，不再触发新的全库 stat
+// 注意：promise 解析出的正是 index 对象引用，因此上传/转换/删除对内存索引的增量修改
+// 会即时反映，TTL 仅用于"省掉重复的磁盘扫描"。
+let scanCache = { at: 0, promise: null };
+const SCAN_TTL_MS = 1500; // 扫描结果复用窗口（毫秒）
+
+/** 获取最新索引：带 TTL 复用与并发合并，确保同一时刻只扫描一次图库 */
+function getIndex() {
+  const now = Date.now();
+  if (scanCache.promise && now - scanCache.at < SCAN_TTL_MS) return scanCache.promise;
+  scanCache.at = now;
+  scanCache.promise = dedup.scanLibrary(cfg, { deep: false }).then((scan) => {
+    index.items = scan.items;
+    return index;
+  }).catch((e) => {
+    // 扫描失败：清空缓存，避免把失败状态缓存住导致后续请求持续异常
+    scanCache.promise = null;
+    throw e;
+  });
+  return scanCache.promise;
+}
 
 /** 统一成功响应 */
 function ok(res, data) { res.json({ ok: true, data }); }
@@ -115,16 +166,23 @@ const uploadMiddleware = multer({
   }
 }).array('files');
 
-// 包装 multer：解析失败（超数量/超大文件）返回友好中文错误
+// 包装 multer：解析失败（超数量/超大文件）返回友好中文错误。
+// 关键修正：返回 Promise，使 handleUpload 内部的异步异常能通过 reject 冒泡到外层 wrap，
+// 由 wrap 统一记录日志并返回 500；否则异步异常会逃逸成"未处理的 Promise 拒绝"，
+// 前端会一直等不到响应直到超时（旧实现遗漏了 await/catch）。
 function uploadHandler(req, res) {
-  uploadMiddleware(req, res, (err) => {
-    if (err) {
-      const msg = /LIMIT_FILE_COUNT/.test(err.code || '') ? `单批最多 ${cfg.upload.maxBatchFiles} 个文件`
-        : /LIMIT_FILE_SIZE/.test(err.code || '') ? `单个文件不能超过 ${cfg.upload.maxFileMB} MB`
-        : err.message;
-      return fail(res, 400, msg);
-    }
-    handleUpload(req, res);
+  return new Promise((resolve, reject) => {
+    uploadMiddleware(req, res, (err) => {
+      if (err) {
+        const msg = /LIMIT_FILE_COUNT/.test(err.code || '') ? `单批最多 ${cfg.upload.maxBatchFiles} 个文件`
+          : /LIMIT_FILE_SIZE/.test(err.code || '') ? `单个文件不能超过 ${cfg.upload.maxFileMB} MB`
+          : err.message;
+        fail(res, 400, msg);
+        return resolve();
+      }
+      // 异步执行的 handleUpload：成功/失败分别交回 resolve/reject，统一由 wrap 收口
+      handleUpload(req, res).then(resolve, reject);
+    });
   });
 }
 
@@ -146,17 +204,16 @@ app.post('/api/upload', wrap(uploadHandler));
 /* ---------- 图库查询 / 统计 / 预览 ---------- */
 
 app.get('/api/images', wrap(async (req, res) => {
-  // 每次查询前做一次轻量增量扫描（mtime/size 未变的文件直接复用缓存，开销极小）
-  const scan = await dedup.scanLibrary(cfg, { deep: false });
-  index.items = scan.items;
+  // 复用带 TTL 的扫描结果：与 /api/stats 并发时只扫一次库，消除重复 stat 与索引竞态
+  await getIndex();
   ok(res, storage.listImages(index, cfg, {
     category: req.query.category, format: req.query.format, q: req.query.q
   }));
 }));
 
 app.get('/api/stats', wrap(async (req, res) => {
-  const scan = await dedup.scanLibrary(cfg, { deep: false });
-  index.items = scan.items;
+  // 与 /api/images 共用同一份扫描结果（TTL 内合并），避免重复扫库
+  await getIndex();
   ok(res, storage.buildStats(index, cfg));
 }));
 
@@ -235,14 +292,14 @@ app.post('/api/convert', wrap(async (req, res) => {
       const st = await fsp.stat(allocated.absPath);
       const md5 = dedup.md5Of(processed.buffer);
       const dhash = await dedup.dhashOf(processed.buffer).catch(() => '');
-      await dedup.indexSingle(cfg, index, newRel, {
+      dedup.setIndexItem(index, newRel, {
         mtime: st.mtimeMs, size: st.size, w: processed.width, h: processed.height, md5, dhash
       });
 
       // 替换原图：原文件移入回收站（可恢复），并从索引移除
       let trashed = false;
       if (replaceOriginal) {
-        await dedup.removeFromIndex(cfg, index, rel);
+        dedup.deleteIndexItem(index, rel);
         await storage.moveToTrash(cfg, [rel]);
         trashed = true;
       }
@@ -255,6 +312,8 @@ app.post('/api/convert', wrap(async (req, res) => {
       results.push({ rel, ok: false, error: e.message }); // 单文件失败不阻断批次
     }
   }
+  // 批末一次性持久化索引（仅当本批确有成功转换时），避免逐张写盘
+  if (results.some((r) => r.ok)) await dedup.saveIndex(cfg, index);
   ok(res, { results });
 }));
 
@@ -291,7 +350,11 @@ app.post('/api/trash', wrap(async (req, res) => {
     if (!safeJoinImage(cfg, rel)) return fail(res, 400, `非法路径：${rel}`);
   }
   const result = await storage.moveToTrash(cfg, paths);
-  for (const rel of paths) await dedup.removeFromIndex(cfg, index, rel);
+  // 仅对成功移入回收站的文件移除索引；批末统一持久化一次，避免逐张写盘
+  for (const m of result.moved) {
+    if (!m.error) dedup.deleteIndexItem(index, m.rel);
+  }
+  await dedup.saveIndex(cfg, index);
   ok(res, result);
 }));
 
@@ -300,8 +363,10 @@ app.get('/api/trash', wrap(async (req, res) => ok(res, await storage.listTrash(c
 app.post('/api/trash/restore', wrap(async (req, res) => {
   const { batchId, flat } = req.body || {};
   if (!batchId || !flat) return fail(res, 400, '缺少批次或文件标识');
-  // 标识只允许安全字符，防构造路径
-  if (!/^[\w&.-]+$/.test(flat) || !/^[\w-]+$/.test(batchId)) return fail(res, 400, '非法标识');
+  // 标识校验：只允许字母数字与 & . - _（文件名安全字符），并显式禁止 ".."。
+  // 旧正则 [\w&.-] 是字符类，"." 本身合法，导致 ".." 能被放行（路径穿越隐患）。
+  const flatOk = typeof flat === 'string' && /^[\w&.-]+$/.test(flat) && !flat.includes('..');
+  if (!flatOk || !/^[\w-]+$/.test(batchId)) return fail(res, 400, '非法标识');
   const rel = await storage.restoreFromTrash(cfg, batchId, flat);
   // 恢复后重新入索引
   const scan = await dedup.scanLibrary(cfg, { deep: false });
@@ -342,6 +407,7 @@ app.get(/^\/(?!api\/).*/, (req, res) => {
 
 (async () => {
   await ensureDirs();
+  await cleanTmp(); // 清理上次异常退出可能遗留的上传暂存文件
   index = await dedup.loadIndex(cfg);
 
   // 端口占用自愈：自动递增重试，保证服务总能启动
@@ -371,6 +437,10 @@ app.get(/^\/(?!api\/).*/, (req, res) => {
   console.log('  智能图床管理器已启动（独立模块，未改动原有图床）');
   console.log(`  管理界面：${url}`);
   console.log(`  图库目录：${cfg._paths.imageRoot}`);
+  // 安全提示：本服务无鉴权，仅应监听本机回环；若配置成其他地址会暴露到局域网
+  if (!['127.0.0.1', 'localhost', '::1'].includes(cfg.host)) {
+    console.warn(`  [安全告警] 监听地址为 ${cfg.host}（非本机回环），服务无鉴权，可能被局域网内其他设备访问`);
+  }
   console.log('  按 Ctrl+C 停止服务');
   console.log('──────────────────────────────────────────────');
 

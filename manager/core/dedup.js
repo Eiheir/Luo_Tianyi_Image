@@ -146,6 +146,17 @@ async function refreshItem(cfg, rel, cached, { needHash = true } = {}) {
 }
 
 /**
+ * 判断索引条目是否与缓存条目等价。
+ * 逐字段比较：旧实现用 JSON.stringify 比较整串，每个文件都要把对象序列化成字符串，
+ * 全库扫描时开销随文件数线性放大；这里改为 O(字段数) 的直接比较。
+ */
+function sameItem(a, b) {
+  if (!a) return false;
+  return a.mtime === b.mtime && a.size === b.size &&
+    a.w === b.w && a.h === b.h && a.md5 === b.md5 && a.dhash === b.dhash;
+}
+
+/**
  * 全量扫描图库并增量更新索引
  * @param {object} opts.deep 是否补算全部缺失哈希（查重扫描前调用）
  * @returns {{items:object, changed:boolean}}
@@ -160,7 +171,7 @@ async function scanLibrary(cfg, { deep = false } = {}) {
     const cached = index.items[rel] || null;
     const item = await refreshItem(cfg, rel, cached, { needHash: deep || !cached });
     nextItems[rel] = { mtime: item.mtime, size: item.size, w: item.w, h: item.h, md5: item.md5, dhash: item.dhash };
-    if (!cached || JSON.stringify(cached) !== JSON.stringify(nextItems[rel])) changed = true;
+    if (!sameItem(cached, nextItems[rel])) changed = true;
   }
 
   // 清理索引中已不存在的文件（图库文件被外部删除/改名后自动失效）
@@ -172,18 +183,18 @@ async function scanLibrary(cfg, { deep = false } = {}) {
   return { items: index.items, changed };
 }
 
-/** 把刚落盘的新文件直接并入索引（免重扫） */
-async function indexSingle(cfg, index, rel, { mtime, size, w, h, md5, dhash }) {
+/**
+ * 仅更新内存索引条目（不落盘）。
+ * 批量操作（上传/转换/删除）应在批次结束时统一调用一次 saveIndex 持久化：旧实现
+ * 每处理一张就写一次磁盘，多图批次会产生大量重复 IO。改为内存更新 + 批末一次落盘。
+ */
+function setIndexItem(index, rel, { mtime, size, w, h, md5, dhash }) {
   index.items[rel] = { mtime, size, w, h, md5, dhash };
-  await saveIndex(cfg, index);
 }
 
-/** 从索引中移除条目（文件被移入回收站时调用） */
-async function removeFromIndex(cfg, index, rel) {
-  if (index.items[rel]) {
-    delete index.items[rel];
-    await saveIndex(cfg, index);
-  }
+/** 仅从内存索引移除条目（不落盘）：由调用方在批次结束时统一持久化 */
+function deleteIndexItem(index, rel) {
+  if (index.items[rel]) delete index.items[rel];
 }
 
 /* ---------------------------------------------------------------
@@ -249,6 +260,6 @@ function findDuplicateGroups(index, threshold) {
 
 module.exports = {
   md5Of, dhashOf, hammingDistance,
-  loadIndex, saveIndex, scanLibrary, indexSingle, removeFromIndex, walkImages,
+  loadIndex, saveIndex, scanLibrary, setIndexItem, deleteIndexItem, walkImages,
   compareAgainstLibrary, findDuplicateGroups, extSetOf
 };

@@ -19,6 +19,7 @@ const path = require('path');
 const classify = require('./classify');
 const converter = require('./converter');
 const dedup = require('./dedup');
+const storage = require('./storage');
 const { buildLink } = require('./links');
 
 /** 单文件处理结果 */
@@ -73,7 +74,7 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
         result.status = 'duplicate';
         result.rel = dup.exact[0];
         result.assignedName = path.basename(result.rel);
-        result.category = require('./storage').categoryOf(result.rel, cfg);
+        result.category = storage.categoryOf(result.rel, cfg);
         result.url = buildLink(cfg, result.rel, cfg.linkFormat);
         result.error = `与库内 ${result.assignedName} 完全相同，已按策略跳过`;
         return result;
@@ -112,7 +113,7 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
       throw new Error(`写入图库失败：${e.message}`);
     }
 
-    // ---------- 8. 更新索引（内存 + 持久化） ----------
+    // ---------- 8. 更新索引（仅内存，批末统一持久化） ----------
     const rel = `${relDir}/${allocated.fileName}`;
     const st = await fsp.stat(allocated.absPath);
     result.rel = rel;
@@ -120,7 +121,7 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
     result.size = st.size;
     result.url = buildLink(cfg, rel, cfg.linkFormat);
     result.status = 'ok';
-    await dedup.indexSingle(cfg, index, rel, {
+    dedup.setIndexItem(index, rel, {
       mtime: st.mtimeMs, size: st.size, w: processed.width, h: processed.height, md5, dhash
     });
     return result;
@@ -150,6 +151,8 @@ async function processBatch(cfg, index, files, opts) {
     duplicate: results.filter((r) => r.status === 'duplicate').length,
     failed: results.filter((r) => r.status === 'failed').length
   };
+  // 批末一次性持久化索引：避免每张图片各写一次磁盘（仅当确有新入库文件时才写）
+  if (summary.ok > 0) await dedup.saveIndex(cfg, index);
   return { results, summary };
 }
 
