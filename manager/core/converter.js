@@ -121,7 +121,7 @@ async function processImage(inputBuffer, opts = {}) {
 /** 质量参数约束到合法区间 */
 function clampQuality(q) {
   const n = Number(q);
-  if (!Number.isFinite(n)) return 82;
+  if (!Number.isFinite(n)) return 100;
   return Math.max(30, Math.min(100, Math.round(n)));
 }
 

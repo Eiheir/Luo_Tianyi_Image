@@ -132,9 +132,12 @@ function buildStats(index, cfg) {
  * 缩略图缓存服务
  * --------------------------------------------------------------- */
 
-/** 缓存键：图相对路径 + mtime + 宽度 → sha1，保证图片更新后缓存自动失效 */
-function thumbCacheKey(rel, mtime, width) {
-  return crypto.createHash('sha1').update(`${rel}|${mtime}|${width}`).digest('hex') + '.webp';
+/** 缓存键：图相对路径 + mtime + 宽度 → sha1，保证图片更新后缓存自动失效。
+ *  动画缩略图（animated=true）额外拼入 '|a' 标志：与旧版静态缓存键隔离，
+ *  升级后 GIF 的旧静态缩略图自然失效，首次访问自动重建为动画版；
+ *  非 GIF 不传该参数，键保持与旧版一致，已有缓存零扰动。 */
+function thumbCacheKey(rel, mtime, width, animated = false) {
+  return crypto.createHash('sha1').update(`${rel}|${mtime}|${width}${animated ? '|a' : ''}`).digest('hex') + '.webp';
 }
 
 /**
@@ -144,15 +147,19 @@ function thumbCacheKey(rel, mtime, width) {
 async function makeThumbnail(cfg, rel, width = 360) {
   const abs = path.join(cfg._paths.imageRoot, rel.replace(/\//g, path.sep));
   const st = await fsp.stat(abs);
-  const cacheFile = path.join(cfg._paths.thumbDir, thumbCacheKey(rel, st.mtimeMs, width));
+  // GIF 使用带动画标志的缓存键：与旧版静态缩略图缓存隔离，确保升级后重建为动画版
+  const animated = /\.gif$/i.test(rel);
+  const cacheFile = path.join(cfg._paths.thumbDir, thumbCacheKey(rel, st.mtimeMs, width, animated));
   try {
     return await fsp.readFile(cacheFile);
   } catch (e) { /* 缓存未命中，走生成流程 */ }
 
   const buf = await fsp.readFile(abs);
-  const thumb = await sharp(buf)
-    .rotate() // 缩略图同样按 EXIF 转正
-    .resize({ width, withoutEnlargement: true }) // 小图不放大
+  // GIF 属于动画格式：开启 animated 管线逐帧缩放，缩略图仍是动画（WebP 动图），
+  // 浏览器 <img> 可直接自动播放；sharp 默认只取第一帧，会导致 GIF 预览静止
+  const thumb = await sharp(buf, { animated })
+    .rotate() // 缩略图同样按 EXIF 转正（GIF 通常无 EXIF，此处为空操作）
+    .resize({ width, withoutEnlargement: true }) // 小图不放大（逐帧缩放）
     .webp({ quality: 75 })
     .toBuffer();
 

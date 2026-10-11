@@ -35,7 +35,7 @@
   "upload": {
     "maxBatchFiles": 200,
     "maxFileMB": 60,
-    "quality": 82
+    "quality": 100
   },
   "git": {
     "enabled": true,

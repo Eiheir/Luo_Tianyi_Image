@@ -105,6 +105,7 @@ const state = {
   collapsed: new Set(),// 目录树中处于折叠状态的目录路径集合
   format: 'all',      // 当前格式筛选
   keyword: '',        // 搜索关键词
+  sort: 'numAsc',     // 排序模式：numAsc 序号升序 | numDesc 序号降序 | timeAsc 时间升序 | timeDesc 时间降序
   stats: null,        // 统计数据缓存
   catCounts: null     // 全库分类计数（来自 /api/stats，供筛选 chips 使用，不随当前筛选变化）
 };
@@ -472,7 +473,7 @@ function setDir(dir) {
   applyFilters();
 }
 
-/** 按当前目录 / 格式 / 关键词对全量列表做本地过滤，并渲染网格（纯前端，瞬时响应） */
+/** 按当前目录 / 格式 / 关键词对全量列表做本地过滤，并按所选模式排序后渲染网格（纯前端，瞬时响应） */
 function applyFilters() {
   const d = state.dir;
   const kw = state.keyword.toLowerCase();
@@ -483,6 +484,30 @@ function applyFilters() {
     if (kw && !r.name.toLowerCase().includes(kw)) return false;
     return true;
   });
+
+  /* ---------- 排序 ----------
+   * 序号排序：先按分类分组（横 → 竖 → 方 → 表情包 → 临时 → 其他），
+   * 组内按文件名中的数字序号（如 0001.png → 1）；无数字的排在组尾。
+   * 时间排序：按文件修改时间 mtime。
+   * 降序模式 = 升序结果整体反转（分类组顺序随之反转，保持「完全倒序」语义）。 */
+  const CAT_ORDER = { heng: 0, shu: 1, avatar: 2, emoticon: 3, temporary: 4, '其他': 5 };
+  // 提取文件名中的第一段连续数字作为序号；没有数字返回 NaN（视为无穷大，排组尾）
+  const numOf = (name) => { const m = String(name).match(/\d+/); return m ? Number(m[0]) : NaN; };
+  const isTime = state.sort.startsWith('time');
+  state.lib.sort((a, b) => {
+    if (isTime) return a.mtime - b.mtime; // 时间：升序 = 最早在前
+    // 序号：先比分类组序
+    const ca = CAT_ORDER[a.category] ?? 99, cb = CAT_ORDER[b.category] ?? 99;
+    if (ca !== cb) return ca - cb;
+    // 再比文件名数字序号（NaN 当 Infinity 处理，无序号的排组尾）
+    const na = numOf(a.name), nb = numOf(b.name);
+    const va = Number.isNaN(na) ? Infinity : na, vb = Number.isNaN(nb) ? Infinity : nb;
+    if (va !== vb) return va - vb;
+    // 序号相同（或都无数字）时按文件名稳定排序
+    return String(a.name).localeCompare(String(b.name));
+  });
+  if (state.sort.endsWith('Desc')) state.lib.reverse(); // 降序：整体反转
+
   state.selected.clear(); // 筛选变化后清空多选，避免操作到不可见图片
   renderGrid();
 }
@@ -545,8 +570,10 @@ $('btnSelAll').addEventListener('click', () => {
 });
 $('btnSelNone').addEventListener('click', () => { state.selected.clear(); renderGrid(); });
 
-// 筛选控件事件（格式/关键词均为本地过滤，无需重新请求服务端）
+// 筛选控件事件（格式/关键词/排序均为本地过滤，无需重新请求服务端）
 $('fmtFilter').addEventListener('change', () => { state.format = $('fmtFilter').value; applyFilters(); });
+// 排序下拉变化：记住模式后重新过滤+排序渲染
+$('sortSel').addEventListener('change', () => { state.sort = $('sortSel').value; applyFilters(); });
 let searchTimer = null;
 $('searchBox').addEventListener('input', () => {
   clearTimeout(searchTimer);
@@ -602,7 +629,7 @@ $('btnConvertSel').addEventListener('click', async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         paths: selRels(), target,
-        quality: Number($('optQuality').value) || 82,
+        quality: Number($('optQuality').value) || 100,
         replaceOriginal, allowAnimatedLoss: false
       })
     });

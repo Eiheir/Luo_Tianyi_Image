@@ -44,7 +44,7 @@ const DEFAULTS = {
     allowedExt: ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'avif']
   },
   dedup: { hammingThreshold: 5, onExactDuplicate: 'skip' },
-  upload: { maxBatchFiles: 200, maxFileMB: 60, quality: 82 },
+  upload: { maxBatchFiles: 200, maxFileMB: 60, quality: 100 },
   git: { enabled: true, timeoutMs: 120000 },
   linkFormat: 'jsdelivr'
 };

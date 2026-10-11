@@ -77,8 +77,8 @@
                 </select>
               </label>
               <label class="opt">
-                <span class="opt-label">压缩质量 <b id="qualityVal">82</b></span>
-                <input type="range" id="optQuality" min="30" max="100" value="82" />
+                <span class="opt-label">压缩质量 <b id="qualityVal">100</b></span>
+                <input type="range" id="optQuality" min="30" max="100" value="100" />
               </label>
               <label class="opt">
                 <span class="opt-label">完全重复时</span>
@@ -125,6 +125,12 @@
           <div class="card toolbar">
             <div class="chips" id="catChips"></div>
             <select id="fmtFilter" class="mini-select"><option value="all">全部格式</option></select>
+            <select id="sortSel" class="mini-select" title="排序方式">
+              <option value="numAsc">序号升序（横→竖→方→表情）</option>
+              <option value="numDesc">序号降序</option>
+              <option value="timeAsc">时间升序（最早优先）</option>
+              <option value="timeDesc">时间降序（最新优先）</option>
+            </select>
             <input type="search" id="searchBox" class="search" placeholder="搜索文件名…" />
             <span class="muted" id="libCount"></span>
             <span class="flex-sp"></span>
