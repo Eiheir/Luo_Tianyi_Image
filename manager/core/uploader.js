@@ -64,6 +64,8 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
     try { dhash = await dedup.dhashOf(processed.buffer); } catch (e) { dhash = ''; /* 指纹失败不阻断上传 */ }
 
     // ---------- 4. 查重比对 ----------
+    // 说明：手动忽略对是"库内两图"之间的记录，新上传文件不可能已有忽略记录，
+    // 故此处无需过滤——忽略只影响 /api/duplicates/scan 的全库聚类。
     const threshold = Number(cfg.dedup.hammingThreshold) || 5;
     const dup = dedup.compareAgainstLibrary(index, md5, dhash, threshold);
     result.similar = dup.similar;

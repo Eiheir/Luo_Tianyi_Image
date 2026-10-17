@@ -96,7 +96,7 @@ const CAT_NAMES = {
 
 const state = {
   cfg: null,          // /api/config 返回的配置
-  linkType: 'jsdelivr', // 链接类型：jsdelivr | raw
+  linkType: 'jsdelivr', // 链接类型：jsdelivr | fastly | testingcf | gcore | raw
   queue: [],          // 上传队列 [{file, previewUrl}]
   lib: [],            // 图片库「过滤后」列表（网格渲染用）
   libAll: [],         // 图片库全量列表（本地过滤的数据源：目录树 / chips / 网格共用）
@@ -105,7 +105,9 @@ const state = {
   collapsed: new Set(),// 目录树中处于折叠状态的目录路径集合
   format: 'all',      // 当前格式筛选
   keyword: '',        // 搜索关键词
-  sort: 'numAsc',     // 排序模式：numAsc 序号升序 | numDesc 序号降序 | timeAsc 时间升序 | timeDesc 时间降序
+  minSize: 0,         // 最小文件字节数（0 = 不过滤）
+  minWidth: 0,        // 最小像素宽度（0 = 不过滤）
+  sort: 'numAsc',     // 排序模式：numAsc 序号升序 | numDesc 序号降序 | timeAsc/Desc 时间 | sizeDesc 体积降序
   stats: null,        // 统计数据缓存
   catCounts: null     // 全库分类计数（来自 /api/stats，供筛选 chips 使用，不随当前筛选变化）
 };
@@ -151,6 +153,17 @@ fileInput.addEventListener('change', () => { addFiles(fileInput.files); fileInpu
 }));
 dz.addEventListener('drop', (e) => addFiles(e.dataTransfer.files));
 
+// 剪贴板粘贴上传：截图后 Ctrl+V 直接进队列（在整个上传视图内监听）
+document.addEventListener('paste', (e) => {
+  // 输入框获得焦点时不劫持粘贴（如主题名输入框粘贴文本）
+  if (e.target && /^(INPUT|TEXTAREA)$/.test(e.target.tagName)) return;
+  const files = [...(e.clipboardData ? e.clipboardData.files : [])];
+  if (!files.length) return;
+  addFiles(files);
+  toast(`已从剪贴板加入 ${files.length} 张图片`, 'ok');
+  document.querySelector('.tab[data-view="upload"]').click(); // 自动跳到上传视图
+});
+
 /** 把本地文件加入上传队列（过滤非图片；生成本地预览 URL） */
 function addFiles(fileList) {
   const max = (state.cfg && state.cfg.upload.maxBatchFiles) || 200;
@@ -173,8 +186,10 @@ function renderQueue() {
   $('queueActions').hidden = state.queue.length === 0;
   $('btnCopyBatch').hidden = true; // 新队列尚未上传，无链接可复制
   const pending = state.queue.filter((it) => !it.done);
+  const failed = state.queue.filter((it) => it.done && it.result && it.result.status === 'failed');
+  $('btnRetryFailed').hidden = failed.length === 0 || pending.length > 0;
   $('queueSummary').textContent = state.queue.length
-    ? `共 ${state.queue.length} 张 · 待上传 ${pending.length}`
+    ? `共 ${state.queue.length} 张 · 待上传 ${pending.length}${failed.length ? ` · 失败 ${failed.length}` : ''}`
     : '';
 
   state.queue.forEach((item, i) => {
@@ -233,44 +248,83 @@ $('optQuality').addEventListener('input', () => {
   $('qualityVal').textContent = $('optQuality').value;
 });
 
-/** 开始上传：组装 FormData（文件 + 批级选项 JSON）提交后端 */
+/** 开始上传：逐文件串行提交（服务端本就串行处理）。
+ * 相比整批一个请求：每张完成即刷新状态（真进度）、单张失败可单独重试、
+ * 中途可点"停止"放弃余下文件；网络中断不再导致整批重来。 */
+let uploadAbort = false;
+
 $('btnUpload').addEventListener('click', async () => {
   const pending = state.queue.filter((it) => !it.done);
   if (pending.length === 0) { toast('队列中没有待上传的文件', 'warn'); return; }
   const btn = $('btnUpload');
-  btn.disabled = true;
-  btn.textContent = '上传处理中…';
-  const fd = new FormData();
-  fd.append('options', JSON.stringify({
+  const opts = JSON.stringify({
     category: $('optCategory').value,
     theme: $('optTheme').value,
     convert: $('optConvert').value,
     quality: Number($('optQuality').value),
     onDuplicate: $('optDuplicate').value,
     stripMeta: $('optStripMeta').checked
-  }));
-  for (const it of pending) fd.append('files', it.file, it.file.name);
+  });
+  btn.disabled = true;
+  uploadAbort = false;
+  let stopBtn = null;
   try {
-    const { results, summary } = await api('/api/upload', { method: 'POST', body: fd });
-    // 把服务端结果写回队列项，渲染最终状态
-    let ri = 0;
-    for (const it of state.queue) {
-      if (it.done) continue;
-      it.done = true;
-      it.result = results[ri++] || { status: 'failed', error: '无结果' };
+    // 逐张提交；done 计数实时刷新按钮文案作为整体进度
+    let done = 0;
+    const setProgress = () => { btn.textContent = `上传中 ${done}/${pending.length}…`; };
+    setProgress();
+    const addStop = () => {
+      stopBtn = document.createElement('button');
+      stopBtn.className = 'btn ghost';
+      stopBtn.textContent = '停止';
+      stopBtn.addEventListener('click', () => { uploadAbort = true; stopBtn.disabled = true; });
+      btn.parentElement.insertBefore(stopBtn, btn.nextSibling);
+    };
+    addStop();
+    let okN = 0, dupN = 0, failN = 0;
+    for (const it of pending) {
+      if (uploadAbort) { toast(`已停止：余下 ${pending.length - done} 张未上传`, 'warn'); break; }
+      const fd = new FormData();
+      fd.append('options', opts);
+      fd.append('files', it.file, it.file.name);
+      try {
+        const { results } = await api('/api/upload', { method: 'POST', body: fd });
+        it.done = true;
+        it.result = results[0] || { status: 'failed', error: '无结果' };
+        if (it.result.status === 'ok') okN += 1;
+        else if (it.result.status === 'duplicate') dupN += 1;
+        else failN += 1;
+      } catch (e) {
+        it.done = true;
+        it.result = { status: 'failed', error: e.message, retryable: true };
+        failN += 1;
+      }
       if (it.previewUrl) { URL.revokeObjectURL(it.previewUrl); it.previewUrl = ''; }
+      done += 1;
+      setProgress();
+      renderQueue();
     }
-    renderQueue();
-    $('btnCopyBatch').hidden = summary.ok === 0;
-    toast(`上传完成：成功 ${summary.ok} · 重复跳过 ${summary.duplicate} · 失败 ${summary.failed}`,
-      summary.failed ? 'warn' : 'ok');
-    refreshGitStatus(); // 有新文件落盘，未同步数变化
+    $('btnCopyBatch').hidden = state.queue.every((it) => !(it.result && it.result.status === 'ok'));
+    if (done === pending.length) {
+      toast(`上传完成：成功 ${okN} · 重复跳过 ${dupN} · 失败 ${failN}`, failN ? 'warn' : 'ok');
+    }
+    refreshGitStatus();
   } catch (e) {
     toast(`上传失败：${e.message}`, 'err');
   } finally {
     btn.disabled = false;
     btn.textContent = '开始上传';
+    if (stopBtn) stopBtn.remove();
   }
+});
+
+// 队列内"重试失败项"：把 failed 且可重试的项重置为待上传
+$('btnRetryFailed').addEventListener('click', () => {
+  const failed = state.queue.filter((it) => it.done && it.result && it.result.status === 'failed');
+  if (!failed.length) { toast('没有失败的文件', 'warn'); return; }
+  for (const it of failed) { it.done = false; it.result = null; }
+  renderQueue();
+  toast(`已将 ${failed.length} 个失败文件重新加入队列`, 'ok');
 });
 
 // 清空队列（释放预览 URL）
@@ -473,7 +527,7 @@ function setDir(dir) {
   applyFilters();
 }
 
-/** 按当前目录 / 格式 / 关键词对全量列表做本地过滤，并按所选模式排序后渲染网格（纯前端，瞬时响应） */
+/** 按当前目录 / 格式 / 关键词 / 大小 / 宽度对全量列表做本地过滤，并按所选模式排序后渲染网格（纯前端，瞬时响应） */
 function applyFilters() {
   const d = state.dir;
   const kw = state.keyword.toLowerCase();
@@ -482,37 +536,43 @@ function applyFilters() {
     else if (d && !r.rel.startsWith(d + '/')) return false; // 目录前缀匹配（含子目录）
     if (state.format !== 'all' && r.format !== state.format) return false;
     if (kw && !r.name.toLowerCase().includes(kw)) return false;
+    if (state.minSize && !(r.size >= state.minSize)) return false;
+    if (state.minWidth && !((r.w || 0) >= state.minWidth)) return false;
     return true;
   });
 
   /* ---------- 排序 ----------
    * 序号排序：先按分类分组（横 → 竖 → 方 → 表情包 → 临时 → 其他），
    * 组内按文件名中的数字序号（如 0001.png → 1）；无数字的排在组尾。
-   * 时间排序：按文件修改时间 mtime。
+   * 时间排序：按文件修改时间 mtime；体积排序：按文件字节数降序。
    * 降序模式 = 升序结果整体反转（分类组顺序随之反转，保持「完全倒序」语义）。 */
   const CAT_ORDER = { heng: 0, shu: 1, avatar: 2, emoticon: 3, temporary: 4, '其他': 5 };
   // 提取文件名中的第一段连续数字作为序号；没有数字返回 NaN（视为无穷大，排组尾）
   const numOf = (name) => { const m = String(name).match(/\d+/); return m ? Number(m[0]) : NaN; };
   const isTime = state.sort.startsWith('time');
-  state.lib.sort((a, b) => {
-    if (isTime) return a.mtime - b.mtime; // 时间：升序 = 最早在前
-    // 序号：先比分类组序
-    const ca = CAT_ORDER[a.category] ?? 99, cb = CAT_ORDER[b.category] ?? 99;
-    if (ca !== cb) return ca - cb;
-    // 再比文件名数字序号（NaN 当 Infinity 处理，无序号的排组尾）
-    const na = numOf(a.name), nb = numOf(b.name);
-    const va = Number.isNaN(na) ? Infinity : na, vb = Number.isNaN(nb) ? Infinity : nb;
-    if (va !== vb) return va - vb;
-    // 序号相同（或都无数字）时按文件名稳定排序
-    return String(a.name).localeCompare(String(b.name));
-  });
-  if (state.sort.endsWith('Desc')) state.lib.reverse(); // 降序：整体反转
+  if (state.sort === 'sizeDesc') {
+    state.lib.sort((a, b) => (b.size || 0) - (a.size || 0)); // 体积降序，分组无关
+  } else {
+    state.lib.sort((a, b) => {
+      if (isTime) return a.mtime - b.mtime; // 时间：升序 = 最早在前
+      // 序号：先比分类组序
+      const ca = CAT_ORDER[a.category] ?? 99, cb = CAT_ORDER[b.category] ?? 99;
+      if (ca !== cb) return ca - cb;
+      // 再比文件名数字序号（NaN 当 Infinity 处理，无序号的排组尾）
+      const na = numOf(a.name), nb = numOf(b.name);
+      const va = Number.isNaN(na) ? Infinity : na, vb = Number.isNaN(nb) ? Infinity : nb;
+      if (va !== vb) return va - vb;
+      // 序号相同（或都无数字）时按文件名稳定排序
+      return String(a.name).localeCompare(String(b.name));
+    });
+  }
+  if (state.sort.endsWith('Desc') && state.sort !== 'sizeDesc') state.lib.reverse(); // 降序：整体反转
 
   state.selected.clear(); // 筛选变化后清空多选，避免操作到不可见图片
   renderGrid();
 }
 
-/** 渲染图片网格（缩略图懒加载；点击=选中；右上角↗=打开原图） */
+/** 渲染图片网格（缩略图懒加载；点击=选中；右上角↗=灯箱预览） */
 function renderGrid() {
   const grid = $('libGrid');
   grid.innerHTML = '';
@@ -529,7 +589,7 @@ function renderGrid() {
       <div class="cell-check">✓</div>
       <img class="cell-img" loading="lazy" alt=""
            src="/api/thumb?p=${encodeURIComponent(row.rel)}&w=360" />
-      <button class="icon-btn cell-open" title="查看原图">↗</button>
+      <button class="icon-btn cell-open" title="预览大图">↗</button>
       <div class="cell-info">
         <div class="cell-name" title="${escapeHtml(row.rel)}">${escapeHtml(row.name)}</div>
         <div class="cell-meta"><span>${CAT_NAMES[row.category] || row.category}</span><span>${dim} · ${fmtSize(row.size)}</span></div>
@@ -539,9 +599,10 @@ function renderGrid() {
       if (e.target.closest('.cell-open')) return; // ↗ 按钮单独处理
       toggleSelect(row.rel, cell);
     });
-    // ↗ 按钮 = 新标签页打开原图
-    cell.querySelector('.cell-open').addEventListener('click', () => {
-      window.open(`/api/raw?p=${encodeURIComponent(row.rel)}`, '_blank');
+    // ↗ 按钮 = 灯箱预览（←/→ 连续浏览，可直接复制/删除）
+    cell.querySelector('.cell-open').addEventListener('click', (e) => {
+      e.stopPropagation();
+      openLightbox(row.rel);
     });
     grid.appendChild(cell);
   }
@@ -570,8 +631,10 @@ $('btnSelAll').addEventListener('click', () => {
 });
 $('btnSelNone').addEventListener('click', () => { state.selected.clear(); renderGrid(); });
 
-// 筛选控件事件（格式/关键词/排序均为本地过滤，无需重新请求服务端）
+// 筛选控件事件（格式/关键词/排序/大小/宽度均为本地过滤，无需重新请求服务端）
 $('fmtFilter').addEventListener('change', () => { state.format = $('fmtFilter').value; applyFilters(); });
+$('sizeFilter').addEventListener('change', () => { state.minSize = Number($('sizeFilter').value) || 0; applyFilters(); });
+$('widthFilter').addEventListener('change', () => { state.minWidth = Number($('widthFilter').value) || 0; applyFilters(); });
 // 排序下拉变化：记住模式后重新过滤+排序渲染
 $('sortSel').addEventListener('change', () => { state.sort = $('sortSel').value; applyFilters(); });
 let searchTimer = null;
@@ -585,17 +648,19 @@ $('linkType').addEventListener('change', () => {
   state.linkType = $('linkType').value;
 });
 
-/** 批量复制链接 */
+/** 批量复制链接（格式跟随 bulkbar 中的格式选择） */
 $('btnCopySel').addEventListener('click', async () => {
   if (!state.selected.size) { toast('请先选择图片', 'warn'); return; }
+  const fmt = $('copyFmt').value;
   try {
     const { text } = await api('/api/links/export', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ paths: selRels(), linkType: state.linkType, format: 'txt' })
+      body: JSON.stringify({ paths: selRels(), linkType: state.linkType, format: fmt })
     });
     await copyText(text);
-    toast(`已复制 ${state.selected.size} 条链接（${state.linkType === 'raw' ? 'Raw' : 'CDN'}）`, 'ok');
+    const fmtNames = { txt: '纯链接', markdown: 'Markdown', html: 'HTML', bbcode: 'BBCode' };
+    toast(`已复制 ${state.selected.size} 条${fmtNames[fmt] || ''}链接`, 'ok');
   } catch (e) { toast(e.message, 'err'); }
 });
 
@@ -665,52 +730,139 @@ $('btnTrashSel').addEventListener('click', async () => {
 $('btnDupScan').addEventListener('click', async () => {
   $('dupPanel').hidden = false;
   $('dupBody').innerHTML = '<div class="empty">正在扫描（首次全量需计算全部图片指纹）…</div>';
+  $('dupIgnoredSec') && $('dupIgnoredSec').remove(); // 重扫后重建"已忽略"区块
   try {
     const r = await api('/api/duplicates/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ deep: true })
     });
-    $('dupMeta').textContent = `已扫描 ${r.scanned} 张 · 完全重复组 ${r.exactGroups.length} · 相似组 ${r.similarGroups.length}`;
+    $('dupMeta').textContent =
+      `已扫描 ${r.scanned} 张 · 完全重复组 ${r.exactGroups.length} · 相似组 ${r.similarGroups.length}` +
+      (r.ignoredPairs ? ` · 已忽略 ${r.ignoredPairs} 张` : '');
     renderDupGroups(r.exactGroups, '完全重复（字节级相同）');
-    renderDupGroups(r.similarGroups, '疑似相似（感知哈希）');
+    renderDupGroups(r.similarGroups, '疑似相似（感知哈希）', true);
     if (!r.exactGroups.length && !r.similarGroups.length) {
       $('dupBody').insertAdjacentHTML('beforeend', '<div class="empty">未发现重复或相似图片</div>');
     }
+    if (r.ignoredPairs > 0) await appendIgnoredSection();
   } catch (e) {
     $('dupBody').innerHTML = `<div class="empty">扫描失败：${escapeHtml(e.message)}</div>`;
   }
 });
 
-/** 渲染一组重复/相似图片（每组可整体勾选后移入回收站） */
-function renderDupGroups(groups, label) {
+/** 在查重面板底部追加"已忽略的图片"管理区块（取消忽略后下次扫描重新参与归组） */
+async function appendIgnoredSection() {
+  let ignored;
+  try { ignored = await api('/api/duplicates/ignored'); }
+  catch (e) { return; }
+  if (!ignored.items.length) return;
+  const sec = document.createElement('div');
+  sec.className = 'dup-group ignored-sec';
+  sec.id = 'dupIgnoredSec';
+  sec.innerHTML = `
+    <div class="dup-group-title"><span class="tag">已忽略</span> ${ignored.items.length} 张
+      <span class="muted">（不再参与相似归组；取消忽略后下次扫描生效）</span></div>
+    <div class="dup-row">
+      ${ignored.items.map((it) => `
+        <div class="dup-item">
+          <img loading="lazy" src="/api/thumb?p=${encodeURIComponent(it.rel)}&w=264" alt="" />
+          <div class="name" title="${escapeHtml(it.rel)}">${escapeHtml(it.name)}</div>
+          <div class="muted">${it.sizeText || ''}</div>
+          <button class="btn small" data-unignore="${escapeHtml(it.rel)}">取消忽略</button>
+        </div>`).join('')}
+    </div>`;
+  sec.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-unignore]');
+    if (!btn) return;
+    try {
+      await api('/api/duplicates/unignore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keys: [btn.dataset.unignore] })
+      });
+      toast('已取消忽略，下次查重扫描将重新参与归组', 'ok');
+      btn.closest('.dup-item').remove();
+      // 剩余为空时移除整个区块
+      if (!sec.querySelectorAll('.dup-item').length) sec.remove();
+    } catch (e2) { toast(e2.message, 'err'); }
+  });
+  $('dupBody').appendChild(sec);
+}
+
+/** 渲染一组重复/相似图片（每组可整体勾选后移入回收站；支持"保留最高清"一键清理；
+ *  疑似相似组额外支持"忽略本组"——确认不是重复后不再归组提示） */
+function renderDupGroups(groups, label, ignorable = false) {
   if (!groups.length) return;
   const body = $('dupBody');
   groups.forEach((g, gi) => {
     const sec = document.createElement('div');
     sec.className = 'dup-group';
+    // 预计算"保留最高清"目标：像素面积最大者（并列取靠前者）
+    let best = 0;
+    g.forEach((it, i) => {
+      if ((it.w || 0) * (it.h || 0) > (g[best].w || 0) * (g[best].h || 0)) best = i;
+    });
     sec.innerHTML = `
       <div class="dup-group-title"><span class="tag">${label}</span> 第 ${gi + 1} 组（${g.length} 张）
         <label style="margin-left:8px"><input type="checkbox" class="dup-group-sel" /> 全选本组</label>
+        <button class="btn small warn keep-best" style="margin-left:8px"
+          title="保留分辨率最高的一张，其余移入回收站">保留最高清</button>
+        ${ignorable ? `<button class="btn small ignore-group" style="margin-left:8px"
+          title="这些图只是画风相似——之后查重不再提示它们（其他图片之间的提示不受影响）">忽略本组</button>` : ''}
         <button class="btn small danger" style="margin-left:8px">删除所选</button>
       </div>
       <div class="dup-row">
-        ${g.map((it) => `
-          <div class="dup-item">
+        ${g.map((it, i) => `
+          <div class="dup-item${i === best ? ' best' : ''}">
             <img loading="lazy" src="/api/thumb?p=${encodeURIComponent(it.rel)}&w=264" alt="" />
-            <label><input type="checkbox" class="dup-item-sel" value="${escapeHtml(it.rel)}" /> 删除</label>
-            <div class="name" title="${escapeHtml(it.rel)}">${escapeHtml(it.name)}</div>
-            <div class="muted">${it.sizeText}</div>
+            <label><input type="checkbox" class="dup-item-sel" value="${escapeHtml(it.rel)}"
+              ${i === best ? 'disabled data-best="1"' : ''} /> 删除</label>
+            <div class="name" title="${escapeHtml(it.rel)}">${escapeHtml(it.name)}${i === best ? ' ⭐' : ''}</div>
+            <div class="muted">${it.w && it.h ? `${it.w}×${it.h} · ` : ''}${it.sizeText}</div>
           </div>`).join('')}
       </div>`;
-    // 组内全选/取消全选
+    // 组内全选/取消全选（"保留最高清"那张不参与勾选）
     sec.querySelector('.dup-group-sel').addEventListener('change', (e) => {
-      sec.querySelectorAll('.dup-item-sel').forEach((c) => { c.checked = e.target.checked; });
+      sec.querySelectorAll('.dup-item-sel:not([data-best])').forEach((c) => { c.checked = e.target.checked; });
     });
-    // 删除所选（第一张默认保留：未勾选任何项时提示）
+    // 一键"保留最高清"：其余全部移入回收站
+    sec.querySelector('.keep-best').addEventListener('click', async () => {
+      const rels = g.map((it) => it.rel).filter((rel) => rel !== g[best].rel);
+      if (!rels.length) { toast('本组只有一张，无需清理', 'warn'); return; }
+      if (!confirm(`保留 ${g[best].name}（${g[best].w}×${g[best].h}），其余 ${rels.length} 张移入回收站？`)) return;
+      try {
+        await api('/api/trash', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ paths: rels })
+        });
+        toast(`已保留最高清一张，${rels.length} 张移入回收站`, 'ok');
+        sec.remove();
+        refreshLibrary();
+        refreshGitStatus();
+      } catch (e) { toast(e.message, 'err'); }
+    });
+    // 忽略本组：组内图片全部静音，之后相似归组彻底跳过这些图
+    const ignoreBtn = sec.querySelector('.ignore-group');
+    if (ignoreBtn) {
+      ignoreBtn.addEventListener('click', async () => {
+        if (!confirm(`忽略本组 ${g.length} 张图片？\n它们之后不再参与相似归组（其他图片之间的相似提示不受影响），\n可随时在面板底部"已忽略"中取消。`)) return;
+        try {
+          const r = await api('/api/duplicates/ignore', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ paths: g.map((it) => it.rel) })
+          });
+          toast(`已忽略 ${r.added} 张（共 ${r.total} 张）`, 'ok');
+          sec.remove();
+        } catch (e) { toast(e.message, 'err'); }
+      });
+    }
+    // 手动删除所选
     sec.querySelector('.btn.danger').addEventListener('click', async () => {
       const rels = [...sec.querySelectorAll('.dup-item-sel:checked')].map((c) => c.value);
-      if (!rels.length) { toast('请先勾选要删除的图片（建议每组保留一张）', 'warn'); return; }
+      if (!rels.length) { toast('请先勾选要删除的图片（建议保留一张）', 'warn'); return; }
       if (!confirm(`将勾选的 ${rels.length} 张移入回收站？`)) return;
       try {
         await api('/api/trash', {
@@ -730,34 +882,312 @@ function renderDupGroups(groups, label) {
 
 /* ---------- 回收站面板 ---------- */
 
+/** 打开回收站：按批次分组展示（缩略图 / 单条恢复 / 整批恢复 / 单条彻底删除） */
 $('btnTrash').addEventListener('click', async () => {
   $('trashPanel').hidden = false;
   $('trashBody').innerHTML = '<div class="empty">加载中…</div>';
   try {
     const rows = await api('/api/trash');
+    $('btnTrashPurgeAll').hidden = rows.length === 0;
     if (!rows.length) { $('trashBody').innerHTML = '<div class="empty">回收站是空的</div>'; return; }
-    $('trashBody').innerHTML = rows.map((r) => `
-      <div class="trash-row">
-        <span class="path">${escapeHtml(r.rel)} <span class="muted">${r.sizeText} · ${fmtTime(r.trashedAt)}</span></span>
-        <button class="btn small" data-batch="${escapeHtml(r.batchId)}" data-flat="${escapeHtml(r.flat)}">恢复</button>
-      </div>`).join('');
+    // 按 batchId 分组（listTrash 已按时间倒序）
+    const byBatch = new Map();
+    for (const r of rows) {
+      if (!byBatch.has(r.batchId)) byBatch.set(r.batchId, []);
+      byBatch.get(r.batchId).push(r);
+    }
+    $('trashBody').innerHTML = '';
+    for (const [batchId, items] of byBatch) {
+      const sec = document.createElement('div');
+      sec.className = 'dup-group';
+      sec.innerHTML = `
+        <div class="dup-group-title">
+          <span class="tag">批次 ${escapeHtml(batchId)}</span> ${items.length} 项
+          <button class="btn small restore-batch" style="margin-left:8px">整批恢复</button>
+          <button class="btn small danger purge-batch" title="不可恢复">清空本批</button>
+        </div>
+        <div class="dup-row">
+          ${items.map((r) => `
+            <div class="dup-item">
+              <img loading="lazy" src="/api/trash/thumb?b=${encodeURIComponent(r.batchId)}&f=${encodeURIComponent(r.flat)}" alt="" />
+              <div class="name" title="${escapeHtml(r.rel)}">${escapeHtml(r.rel)}</div>
+              <div class="muted">${r.sizeText} · ${fmtTime(r.trashedAt)}</div>
+              <div>
+                <button class="btn small" data-batch="${escapeHtml(r.batchId)}" data-flat="${escapeHtml(r.flat)}">恢复</button>
+                <button class="btn small danger" data-purge-batch="${escapeHtml(r.batchId)}" data-purge-flat="${escapeHtml(r.flat)}"
+                  title="彻底删除，不可恢复">✕</button>
+              </div>
+            </div>`).join('')}
+        </div>`;
+      // 整批恢复
+      sec.querySelector('.restore-batch').addEventListener('click', async () => {
+        if (!confirm(`恢复批次 ${batchId} 的全部 ${items.length} 项？\n（编号已被占用时会自动改号）`)) return;
+        try {
+          const { results } = await api('/api/trash/restore-batch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ batchId })
+          });
+          const okN = results.filter((r) => !r.error).length;
+          const renN = results.filter((r) => r.renamed).length;
+          toast(`已恢复 ${okN}/${results.length} 项${renN ? `（${renN} 项因编号占用自动改号）` : ''}`, 'ok');
+          sec.remove();
+          refreshLibrary();
+          refreshGitStatus();
+        } catch (e) { toast(e.message, 'err'); }
+      });
+      // 清空本批（不可逆）
+      sec.querySelector('.purge-batch').addEventListener('click', async () => {
+        if (!confirm(`彻底删除批次 ${batchId} 的全部 ${items.length} 项？\n⚠ 此操作不可恢复！`)) return;
+        try {
+          await api('/api/trash/purge', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ batchId })
+          });
+          toast('批次已彻底删除', 'ok');
+          sec.remove();
+        } catch (e) { toast(e.message, 'err'); }
+      });
+      $('trashBody').appendChild(sec);
+    }
   } catch (e) {
     $('trashBody').innerHTML = `<div class="empty">加载失败：${escapeHtml(e.message)}</div>`;
   }
 });
 
-// 回收站恢复（事件委托）
+// 单条恢复 / 单条彻底删除（事件委托）
 $('trashBody').addEventListener('click', async (e) => {
+  const purgeBtn = e.target.closest('[data-purge-batch]');
+  if (purgeBtn) {
+    if (!confirm(`彻底删除 ${purgeBtn.dataset.purgeFlat}？\n⚠ 此操作不可恢复！`)) return;
+    try {
+      await api('/api/trash/purge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batchId: purgeBtn.dataset.purgeBatch, flats: [purgeBtn.dataset.purgeFlat] })
+      });
+      purgeBtn.closest('.dup-item').remove();
+      toast('已彻底删除', 'ok');
+    } catch (e2) { toast(e2.message, 'err'); }
+    return;
+  }
   const btn = e.target.closest('[data-batch]');
   if (!btn) return;
   try {
-    const restored = await api('/api/trash/restore', {
+    const { restored, renamed } = await api('/api/trash/restore', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ batchId: btn.dataset.batch, flat: btn.dataset.flat })
     });
-    toast(`已恢复：${restored}`, 'ok');
-    btn.closest('.trash-row').remove();
+    toast(renamed ? `目标编号已被占用，已恢复为：${restored}` : `已恢复：${restored}`, 'ok');
+    btn.closest('.dup-item').remove();
+    refreshLibrary();
+    refreshGitStatus();
+  } catch (e2) { toast(e2.message, 'err'); }
+});
+
+// 清空整个回收站（不可逆）
+$('btnTrashPurgeAll').addEventListener('click', async () => {
+  if (!confirm('⚠ 彻底清空回收站全部批次？\n此操作不可恢复！')) return;
+  try {
+    const rows = await api('/api/trash');
+    const batchIds = [...new Set(rows.map((r) => r.batchId))];
+    for (const batchId of batchIds) {
+      await api('/api/trash/purge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batchId })
+      });
+    }
+    toast(`已清空回收站（${batchIds.length} 个批次）`, 'ok');
+    $('trashBody').innerHTML = '<div class="empty">回收站是空的</div>';
+    $('btnTrashPurgeAll').hidden = true;
+  } catch (e) { toast(e.message, 'err'); }
+});
+
+/* ---------- 批量移动分类 ---------- */
+
+$('btnMoveSel').addEventListener('click', () => {
+  if (!state.selected.size) { toast('请先选择图片', 'warn'); return; }
+  const cat = prompt('目标分类：heng / shu / avatar / emoticon / temporary', 'avatar');
+  if (!cat) return;
+  if (!['heng', 'shu', 'avatar', 'emoticon', 'temporary'].includes(cat)) {
+    toast(`无效分类：${cat}`, 'err'); return;
+  }
+  let theme = '';
+  if (cat === 'emoticon') {
+    theme = prompt('表情包主题（目标文件夹名）：', '默认');
+    if (!theme) return;
+  }
+  moveSelected(cat, theme);
+});
+
+async function moveSelected(category, theme) {
+  if (!confirm(`将选中的 ${state.selected.size} 张移动到「${CAT_NAMES[category] || category}${theme ? '/' + theme : ''}」？\n（目标目录内按最大编号续排；旧链接将失效）`)) return;
+  try {
+    toast('正在移动…', 'info');
+    const { results, movedCount } = await api('/api/move', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths: selRels(), category, theme })
+    });
+    toast(movedCount === results.length
+      ? `已移动 ${movedCount} 张`
+      : `移动失败，已全部回滚（${results.find((r) => r.error) && results.find((r) => r.error).error || '未知错误'}）`,
+      movedCount === results.length ? 'ok' : 'err');
+    refreshLibrary();
+    refreshGitStatus();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+/* ---------- 整理面板（编号规整 / 主题改名） ---------- */
+
+$('btnOrganize').addEventListener('click', () => {
+  const body = $('organizeBody');
+  // 收集目录清单（标准分类目录 + 表情包主题目录）
+  const dirs = [...new Set(state.libAll.map((r) => r.rel.split('/').slice(0, -1).join('/')))]
+    .filter(Boolean).sort();
+  body.innerHTML = `
+    <h4 style="margin:6px 0 4px">编号规整</h4>
+    <p class="muted" style="margin:4px 0 8px">把目录内文件重排为 0001..N 连续编号，消除删除留下的空洞。
+      <b>注意：已发布的链接按文件名寻址，重排后旧链接会失效！</b></p>
+    <div class="opt-grid">
+      <label class="opt">
+        <span class="opt-label">选择目录</span>
+        <select id="orgDir">${dirs.map((d) => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`).join('')}</select>
+      </label>
+    </div>
+    <div class="queue-actions">
+      <button class="btn primary" id="btnRenumber">规整所选目录</button>
+    </div>
+    <h4 style="margin:16px 0 4px">表情包主题改名</h4>
+    <div class="opt-grid">
+      <label class="opt">
+        <span class="opt-label">现有主题</span>
+        <select id="orgTheme">${dirs.filter((d) => d.startsWith('emoticon/'))
+          .map((d) => `<option value="${escapeHtml(d.slice('emoticon/'.length))}">${escapeHtml(d.slice('emoticon/'.length))}</option>`).join('')}</select>
+      </label>
+      <label class="opt">
+        <span class="opt-label">新主题名</span>
+        <input type="text" id="orgNewTheme" placeholder="例如：流光2" />
+      </label>
+    </div>
+    <div class="queue-actions">
+      <button class="btn primary" id="btnRenameTheme">重命名主题</button>
+    </div>`;
+  $('organizePanel').hidden = false;
+
+  $('btnRenumber').addEventListener('click', async () => {
+    const dir = $('orgDir').value;
+    if (!confirm(`把「${dir}」内的文件重排为 0001..N 连续编号？\n⚠ 该目录内编号≥起点的文件旧链接将全部失效！`)) return;
+    try {
+      toast('正在规整…', 'info');
+      const r = await api('/api/renumber', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dir })
+      });
+      toast(`规整完成：共 ${r.total} 个文件，重命名 ${r.renumbered} 个`, 'ok');
+      $('organizePanel').hidden = true;
+      refreshLibrary();
+      refreshGitStatus();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+
+  $('btnRenameTheme').addEventListener('click', async () => {
+    const from = $('orgTheme').value;
+    const to = $('orgNewTheme').value.trim();
+    if (!from || !to) { toast('请填写新主题名', 'warn'); return; }
+    if (!confirm(`把表情包主题「${from}」改名为「${to}」？\n（目录内 ${'所有'} 文件随之迁移，旧主题链接失效）`)) return;
+    try {
+      const r = await api('/api/rename-theme', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from, to })
+      });
+      toast(`已改名：${r.oldRel} → ${r.newRel}（${r.count} 个文件）`, 'ok');
+      $('organizePanel').hidden = true;
+      refreshLibrary();
+      refreshGitStatus();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+});
+
+/* ---------- 灯箱（大图预览：←/→ 切换、Esc 关闭、就地复制/删除） ---------- */
+
+const lb = {
+  list: [],   // 当前可导航的 rel 列表（= 过滤后网格顺序）
+  pos: -1     // 当前下标
+};
+
+function openLightbox(rel) {
+  lb.list = state.lib.map((r) => r.rel);
+  lb.pos = lb.list.indexOf(rel);
+  if (lb.pos < 0) return;
+  $('lightbox').hidden = false;
+  renderLightbox();
+}
+
+function closeLightbox() { $('lightbox').hidden = true; }
+
+function lbStep(delta) {
+  if (!lb.list.length) return;
+  lb.pos = (lb.pos + delta + lb.list.length) % lb.list.length; // 循环浏览
+  renderLightbox();
+}
+
+function renderLightbox() {
+  const rel = lb.list[lb.pos];
+  const row = state.libAll.find((r) => r.rel === rel) || {};
+  $('lbImg').src = `/api/raw?p=${encodeURIComponent(rel)}`;
+  $('lbTitle').textContent = row.name || rel;
+  $('lbTitle').title = rel;
+  $('lbMeta').textContent =
+    `${lb.pos + 1}/${lb.list.length} · ${CAT_NAMES[row.category] || row.category || ''}` +
+    `${row.w ? ` · ${row.w}×${row.h}` : ''}${row.size ? ` · ${fmtSize(row.size)}` : ''}`;
+}
+
+$('lbPrev').addEventListener('click', () => lbStep(-1));
+$('lbNext').addEventListener('click', () => lbStep(1));
+$('lbClose').addEventListener('click', closeLightbox);
+// 点击遮罩空白处关闭（点图片/按钮不关）
+$('lightbox').addEventListener('click', (e) => { if (e.target === $('lightbox')) closeLightbox(); });
+
+// 键盘导航：仅在灯箱打开时生效
+document.addEventListener('keydown', (e) => {
+  if ($('lightbox').hidden) return;
+  if (e.key === 'Escape') closeLightbox();
+  else if (e.key === 'ArrowLeft') lbStep(-1);
+  else if (e.key === 'ArrowRight') lbStep(1);
+});
+
+// 灯箱内复制链接（跟随顶部链接类型）
+$('lbCopy').addEventListener('click', async () => {
+  const rel = lb.list[lb.pos];
+  if (!rel) return;
+  try {
+    const b = await api(`/api/link?p=${encodeURIComponent(rel)}&type=${state.linkType}`);
+    await copyText(b.url);
+    toast('链接已复制', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+});
+
+// 灯箱内直接移入回收站并自动跳到下一张
+$('lbTrash').addEventListener('click', async () => {
+  const rel = lb.list[lb.pos];
+  if (!rel) return;
+  if (!confirm(`将 ${rel} 移入回收站？（可恢复）`)) return;
+  try {
+    await api('/api/trash', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths: [rel] })
+    });
+    toast('已移入回收站', 'ok');
+    lb.list.splice(lb.pos, 1);
+    if (!lb.list.length) { closeLightbox(); }
+    else { lb.pos %= lb.list.length; renderLightbox(); }
     refreshLibrary();
     refreshGitStatus();
   } catch (e) { toast(e.message, 'err'); }
@@ -834,6 +1264,33 @@ function renderStats(s) {
       <span class="name" title="${escapeHtml(r.rel)}">${escapeHtml(r.rel)}</span>
       <span class="time">${fmtTime(r.mtime)}</span>
     </div>`).join('') || '<div class="empty">暂无数据</div>';
+
+  // —— 近 12 个月新增条形图（按图库全量列表的 mtime 聚合；无全量数据时跳过） ——
+  if (state.libAll.length) {
+    const now = new Date();
+    const months = []; // [{key:'YYYY-MM', label:'MM月', count, size}]
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      months.push({
+        key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`,
+        label: `${d.getMonth() + 1}月`,
+        count: 0, size: 0
+      });
+    }
+    const byKey = new Map(months.map((m) => [m.key, m]));
+    for (const r of state.libAll) {
+      const d = new Date(r.mtime);
+      const m = byKey.get(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
+      if (m) { m.count += 1; m.size += r.size || 0; }
+    }
+    const maxC = Math.max(1, ...months.map((m) => m.count));
+    $('trendBars').innerHTML = months.map((m) => `
+      <div class="bar-row" title="${m.key}：${m.count} 张 · ${fmtSize(m.size)}">
+        <span>${m.label}</span>
+        <div class="bar-track"><div class="bar-fill" style="width:${(m.count / maxC * 100).toFixed(1)}%"></div></div>
+        <span class="bar-val">${m.count} 张 · ${fmtSize(m.size)}</span>
+      </div>`).join('');
+  }
 }
 
 /* ================================================================
@@ -874,6 +1331,57 @@ $('btnGitSync').addEventListener('click', async () => {
 
 // 点击徽标 = 手动刷新状态
 $('btnGitStatus').addEventListener('click', refreshGitStatus);
+
+/* ================================================================
+ * 6.5 设置面板（读写 config.json 白名单字段）
+ * ================================================================ */
+
+/** 打开设置面板：拉取服务端当前值填充表单 */
+$('btnSettings').addEventListener('click', async () => {
+  try {
+    const view = await api('/api/settings');
+    $('setQuality').value = view['upload.quality'].value;
+    $('setQualityVal').textContent = view['upload.quality'].value;
+    $('setMaxBatch').value = view['upload.maxBatchFiles'].value;
+    $('setMaxFileMB').value = view['upload.maxFileMB'].value;
+    $('setHamming').value = view['dedup.hammingThreshold'].value;
+    $('setOnDup').value = view['dedup.onExactDuplicate'].value;
+    $('setLinkFormat').value = view['linkFormat'].value;
+    $('setPurgeCdn').checked = !!view['git.purgeCdn'].value;
+    $('settingsPanel').hidden = false;
+  } catch (e) { toast(`设置加载失败：${e.message}`, 'err'); }
+});
+
+$('setQuality').addEventListener('input', () => {
+  $('setQualityVal').textContent = $('setQuality').value;
+});
+
+/** 保存设置：提交白名单字段，成功后同步本地 UI（质量滑杆 / 批量上限 / 链接格式） */
+$('btnSaveSettings').addEventListener('click', async () => {
+  try {
+    await api('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        'upload.quality': Number($('setQuality').value),
+        'upload.maxBatchFiles': Number($('setMaxBatch').value),
+        'upload.maxFileMB': Number($('setMaxFileMB').value),
+        'dedup.hammingThreshold': Number($('setHamming').value),
+        'dedup.onExactDuplicate': $('setOnDup').value,
+        'linkFormat': $('setLinkFormat').value,
+        'git.purgeCdn': $('setPurgeCdn').checked
+      })
+    });
+    // 同步到当前界面的对应控件
+    $('optQuality').value = $('setQuality').value;
+    $('qualityVal').textContent = $('setQuality').value;
+    $('maxBatch').textContent = $('setMaxBatch').value;
+    state.linkType = $('setLinkFormat').value;
+    $('linkType').value = state.linkType;
+    $('settingsPanel').hidden = true;
+    toast('设置已保存（写入了 manager/config.json）', 'ok');
+  } catch (e) { toast(`保存失败：${e.message}`, 'err'); }
+});
 
 /* ================================================================
  * 7. 初始化

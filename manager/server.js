@@ -24,6 +24,8 @@ const links = require('./core/links');
 const gitops = require('./core/gitops');
 const uploader = require('./core/uploader');
 const converter = require('./core/converter');
+const organize = require('./core/organize');
+const settings = require('./core/settings');
 
 /* ---------------------------------------------------------------
  * 启动准备：配置、私有目录、索引
@@ -144,8 +146,9 @@ app.get('/api/config', (req, res) => ok(res, {
   naming: cfg.naming,
   dedup: { hammingThreshold: cfg.dedup.hammingThreshold },
   upload: cfg.upload,
-  git: { enabled: cfg.git.enabled },
+  git: { enabled: cfg.git.enabled, purgeCdn: !!cfg.git.purgeCdn },
   linkFormat: cfg.linkFormat,
+  linkHosts: links.JSDELIVR_HOSTS,
   categories: classify.CATEGORIES
 }));
 
@@ -207,7 +210,8 @@ app.get('/api/images', wrap(async (req, res) => {
   // 复用带 TTL 的扫描结果：与 /api/stats 并发时只扫一次库，消除重复 stat 与索引竞态
   await getIndex();
   ok(res, storage.listImages(index, cfg, {
-    category: req.query.category, format: req.query.format, q: req.query.q
+    category: req.query.category, format: req.query.format, q: req.query.q,
+    minSize: req.query.minSize, minWidth: req.query.minWidth
   }));
 }));
 
@@ -248,7 +252,9 @@ app.post('/api/duplicates/scan', wrap(async (req, res) => {
   const scan = await dedup.scanLibrary(cfg, { deep: deep || Object.values(index.items).every((i) => !i.dhash) });
   index.items = scan.items;
   const threshold = Number(cfg.dedup.hammingThreshold) || 5;
-  const groups = dedup.findDuplicateGroups(index, threshold);
+  // 手动忽略：用户确认"看着像但不是重复"的图片，相似归组时彻底跳过
+  const muted = await dedup.loadIgnoreSet(cfg);
+  const groups = dedup.findDuplicateGroups(index, threshold, muted);
   // 组内附带缩略图信息，前端直接渲染
   const decorate = (group) => group.map((rel) => {
     const it = index.items[rel] || {};
@@ -257,8 +263,35 @@ app.post('/api/duplicates/scan', wrap(async (req, res) => {
   ok(res, {
     exactGroups: groups.exactGroups.map(decorate),
     similarGroups: groups.similarGroups.map(decorate),
-    scanned: Object.keys(index.items).length
+    scanned: Object.keys(index.items).length,
+    ignoredPairs: muted.size
   });
+}));
+
+/* ---------- 查重手动忽略 ---------- */
+
+// 查看全部被忽略的图片（取消忽略管理界面用）
+app.get('/api/duplicates/ignored', wrap(async (req, res) => {
+  const muted = await dedup.loadIgnoreSet(cfg);
+  const items = [...muted].map((rel) => {
+    const it = index.items[rel] || {};
+    return { rel, name: path.basename(rel), w: it.w, h: it.h, sizeText: storage.humanSize(it.size) };
+  });
+  ok(res, { items });
+}));
+
+// 新增忽略：整组图片全部静音（按图忽略，之后相似归组彻底跳过这些图）
+app.post('/api/duplicates/ignore', wrap(async (req, res) => {
+  const { paths } = req.body || {};
+  if (!Array.isArray(paths) || paths.length === 0) return fail(res, 400, '未指定图片');
+  ok(res, await dedup.addIgnorePairs(cfg, index, paths));
+}));
+
+// 取消忽略（按图片路径），恢复参与相似归组
+app.post('/api/duplicates/unignore', wrap(async (req, res) => {
+  const { keys } = req.body || {};
+  if (!Array.isArray(keys) || keys.length === 0) return fail(res, 400, '未指定要取消的忽略项');
+  ok(res, await dedup.removeIgnorePairs(cfg, keys));
 }));
 
 /* ---------- 批量格式转换 ---------- */
@@ -360,18 +393,121 @@ app.post('/api/trash', wrap(async (req, res) => {
 
 app.get('/api/trash', wrap(async (req, res) => ok(res, await storage.listTrash(cfg))));
 
+// 回收站条目缩略图（恢复前预览）
+app.get('/api/trash/thumb', wrap(async (req, res) => {
+  const batchId = String(req.query.b || '');
+  const flat = String(req.query.f || '');
+  // 与恢复接口相同的标识校验（黑名单拒绝分隔符/非法字符/..）
+  const flatOk = typeof flat === 'string' && flat.length > 0 &&
+    !/[\\/:*?"<>|]/.test(flat) && !flat.includes('..');
+  if (!flatOk || !/^[\w-]+$/.test(batchId)) return fail(res, 400, '非法标识');
+  try {
+    const buf = await storage.makeTrashThumbnail(cfg, batchId, flat, 264);
+    res.set('Content-Type', 'image/webp');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(buf);
+  } catch (e) {
+    fail(res, 404, `无法生成缩略图：${e.message}`);
+  }
+}));
+
+// 单条恢复（防覆盖：目标编号被占时自动改号，renamed=true 提示前端）
 app.post('/api/trash/restore', wrap(async (req, res) => {
   const { batchId, flat } = req.body || {};
   if (!batchId || !flat) return fail(res, 400, '缺少批次或文件标识');
-  // 标识校验：只允许字母数字与 & . - _（文件名安全字符），并显式禁止 ".."。
-  // 旧正则 [\w&.-] 是字符类，"." 本身合法，导致 ".." 能被放行（路径穿越隐患）。
-  const flatOk = typeof flat === 'string' && /^[\w&.-]+$/.test(flat) && !flat.includes('..');
+  // 标识校验：flat 由服务端用 rel 压平生成（分隔符→"__"），此处按"黑名单"拒绝
+  // 路径分隔符与 Windows 非法文件名字符（含 ".."，防穿越）；中文等 Unicode 字符必须放行，
+  // 旧白名单正则 [\w&.-] 不匹配中文，导致中文主题目录（如 emoticon/流光/）的文件无法恢复。
+  // 分隔符/越界的最终防线在 storage.restoreFromTrash 内（path.basename 比对 + 目标路径校验）。
+  const flatOk = typeof flat === 'string' && flat.length > 0 &&
+    !/[\\/:*?"<>|]/.test(flat) && !flat.includes('..');
   if (!flatOk || !/^[\w-]+$/.test(batchId)) return fail(res, 400, '非法标识');
-  const rel = await storage.restoreFromTrash(cfg, batchId, flat);
+  const { rel, renamed } = await storage.restoreFromTrash(cfg, batchId, flat);
   // 恢复后重新入索引
   const scan = await dedup.scanLibrary(cfg, { deep: false });
   index.items = scan.items;
-  ok(res, { restored: rel });
+  ok(res, { restored: rel, renamed });
+}));
+
+// 整批恢复：遍历批次 manifest 逐条还原，单条失败不阻断
+app.post('/api/trash/restore-batch', wrap(async (req, res) => {
+  const { batchId } = req.body || {};
+  if (!batchId || !/^[\w-]+$/.test(batchId)) return fail(res, 400, '非法批次标识');
+  const result = await storage.restoreBatch(cfg, batchId);
+  const scan = await dedup.scanLibrary(cfg, { deep: false });
+  index.items = scan.items;
+  ok(res, result);
+}));
+
+// 彻底删除（不可逆）：单条或整批；仅回收站内容可被 purge
+app.post('/api/trash/purge', wrap(async (req, res) => {
+  const { batchId, flats } = req.body || {};
+  if (!batchId || !/^[\w-]+$/.test(batchId)) return fail(res, 400, '非法批次标识');
+  const result = await storage.purgeTrash(cfg, batchId, flats);
+  ok(res, result);
+}));
+
+/* ---------- 图库整理：移动分类 / 编号规整 / 主题改名 ---------- */
+
+// 移动文件到其他分类（目标内按最大编号续排；批次内任一失败则全部回滚）
+app.post('/api/move', wrap(async (req, res) => {
+  const { paths, category, theme } = req.body || {};
+  if (!Array.isArray(paths) || paths.length === 0) return fail(res, 400, '未指定图片');
+  if (!classify.CATEGORIES.includes(category) || category === 'auto') {
+    return fail(res, 400, `无效分类：${category}`);
+  }
+  if (category === 'emoticon' && !String(theme || '').trim()) {
+    return fail(res, 400, '移动到表情包需要指定主题');
+  }
+  const { results, movedCount } = await organize.moveImages(cfg, index, paths, { category, theme });
+  if (movedCount > 0) {
+    await dedup.saveIndex(cfg, index);
+    await dedup.pruneIgnorePairs(cfg, index); // 路径已变，清理含失效路径的忽略对
+  }
+  ok(res, { results, movedCount });
+}));
+
+// 目录编号规整（消除删除空洞，1..N 连续；旧链接会失效，前端负责二次确认）
+app.post('/api/renumber', wrap(async (req, res) => {
+  const { dir } = req.body || {};
+  if (!dir) return fail(res, 400, '未指定目录');
+  // 目录必须是图库内的标准归档目录，拒绝任意路径
+  const norm = String(dir).replace(/\\/g, '/');
+  const known = new Set([
+    `${cfg.classify.wallpaperDir}/heng`, `${cfg.classify.wallpaperDir}/shu`,
+    `${cfg.classify.wallpaperDir}/avatar`, cfg.classify.temporaryDir
+  ]);
+  const isTheme = norm.startsWith(`${cfg.classify.emoticonDir}/`) && !norm.includes('..');
+  if (!known.has(norm) && !isTheme) return fail(res, 400, `不支持的目录：${dir}`);
+  const result = await organize.renumberDirectory(cfg, index, norm);
+  if (result.renumbered > 0) {
+    await dedup.saveIndex(cfg, index);
+    await dedup.pruneIgnorePairs(cfg, index); // 编号已变，清理含失效路径的忽略对
+  }
+  ok(res, result);
+}));
+
+// 表情包主题目录改名
+app.post('/api/rename-theme', wrap(async (req, res) => {
+  const { from, to } = req.body || {};
+  if (!from || !to) return fail(res, 400, '缺少旧主题名或新主题名');
+  const result = await organize.renameTheme(cfg, index, from, to);
+  await dedup.saveIndex(cfg, index);
+  await dedup.pruneIgnorePairs(cfg, index); // 主题路径已变，清理含失效路径的忽略对
+  ok(res, result);
+}));
+
+/* ---------- 设置（持久化到 config.json 的白名单字段） ---------- */
+
+app.get('/api/settings', wrap(async (req, res) => {
+  ok(res, settings.publicView(cfg));
+}));
+
+app.post('/api/settings', wrap(async (req, res) => {
+  const updated = await settings.update(req.body || {});
+  // 热生效：同步到运行中的 cfg（监听地址/端口等需重启的字段不会出现在白名单里）
+  Object.assign(cfg, updated);
+  ok(res, settings.publicView(cfg));
 }));
 
 /* ---------- Git 手动同步 ---------- */
@@ -409,6 +545,16 @@ app.get(/^\/(?!api\/).*/, (req, res) => {
   await ensureDirs();
   await cleanTmp(); // 清理上次异常退出可能遗留的上传暂存文件
   index = await dedup.loadIndex(cfg);
+
+  // 缩略图缓存清理（异步、不阻塞启动）：删除超过保留期的孤儿缓存，防止 .cache 只增不减
+  storage.cleanThumbCache(cfg).then((n) => {
+    if (n > 0) console.log(`[缓存] 已清理 ${n} 个超期缩略图缓存文件`);
+  }).catch((e) => logError('cleanThumbCache', e));
+
+  // 回收站过期清理（异步、不阻塞启动）：入站超过保留期的批次连同文件一起清除
+  storage.cleanExpiredTrash(cfg).then(({ batches, freed }) => {
+    if (batches > 0) console.log(`[回收站] 已清理 ${batches} 个过期批次，释放 ${storage.humanSize(freed)}`);
+  }).catch((e) => logError('cleanExpiredTrash', e));
 
   // 端口占用自愈：自动递增重试，保证服务总能启动
   let port = Number(cfg.port) || 3210;

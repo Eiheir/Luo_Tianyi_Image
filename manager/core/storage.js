@@ -13,6 +13,7 @@ const crypto = require('crypto');
 const fsp = require('fs/promises');
 const path = require('path');
 const sharp = require('sharp');
+const classify = require('./classify');
 
 /** 从相对路径推断分类（与 classify.categoryDir 的目录约定一一对应） */
 function categoryOf(relPath, cfg) {
@@ -28,10 +29,13 @@ function categoryOf(relPath, cfg) {
 
 /**
  * 列表查询
- * @param {{category?:string, format?:string, q?:string}} filters
- *   category: 全部分类值或 '其他'；format: jpg/png/...；q: 文件名关键词
+ * @param {{category?:string, format?:string, q?:string, minSize?:*, minWidth?:*}} filters
+ *   category: 全部分类值或 '其他'；format: jpg/png/...；q: 文件名关键词；
+ *   minSize: 最小文件字节数；minWidth: 最小像素宽度（大图排查用）
  */
 function listImages(index, cfg, filters = {}) {
+  const minSize = Number(filters.minSize) || 0;
+  const minWidth = Number(filters.minWidth) || 0;
   const rows = [];
   for (const [rel, it] of Object.entries(index.items)) {
     const cat = categoryOf(rel, cfg);
@@ -43,6 +47,8 @@ function listImages(index, cfg, filters = {}) {
       const base = path.basename(rel).toLowerCase();
       if (!base.includes(kw) && !rel.toLowerCase().includes(kw)) continue;
     }
+    if (minSize && !(it.size >= minSize)) continue;
+    if (minWidth && !(it.w >= minWidth)) continue;
     rows.push({
       rel,
       category: cat,
@@ -129,15 +135,10 @@ function buildStats(index, cfg) {
 
 /* ---------------------------------------------------------------
  * 缩略图缓存服务
- * --------------------------------------------------------------- */
-
-/** 缓存键：图相对路径 + mtime + 宽度 → sha1，保证图片更新后缓存自动失效。
- *  动画缩略图（animated=true）额外拼入 '|a' 标志：与旧版静态缓存键隔离，
- *  升级后 GIF 的旧静态缩略图自然失效，首次访问自动重建为动画版；
- *  非 GIF 不传该参数，键保持与旧版一致，已有缓存零扰动。 */
-function thumbCacheKey(rel, mtime, width, animated = false) {
-  return crypto.createHash('sha1').update(`${rel}|${mtime}|${width}${animated ? '|a' : ''}`).digest('hex') + '.webp';
-}
+ * ---------------------------------------------------------------
+ * 缓存键 = sha1(源路径|mtime|宽度[|a])：源图更新后键变化，旧缓存自动失效；
+ * GIF 缩略图带 |a 动画标志，与静态缓存键隔离。
+ */
 
 /**
  * 生成/读取缩略图，返回 Buffer。
@@ -148,7 +149,33 @@ async function makeThumbnail(cfg, rel, width = 360) {
   const st = await fsp.stat(abs);
   // GIF 使用带动画标志的缓存键：与旧版静态缩略图缓存隔离，确保升级后重建为动画版
   const animated = /\.gif$/i.test(rel);
-  const cacheFile = path.join(cfg._paths.thumbDir, thumbCacheKey(rel, st.mtimeMs, width, animated));
+  return makeThumbFromAbs(cfg, abs, width, {
+    cacheKey: `${rel}|${st.mtimeMs}|${width}${animated ? '|a' : ''}`
+  });
+}
+
+/**
+ * 回收站条目缩略图（恢复前先"看一眼"再决定删/留）。
+ * 缓存键带 trash- 前缀与图库缩略图隔离；条目被恢复/删除后文件消失，缓存自然成孤儿，
+ * 由既有的 cleanThumbCache 按期回收。
+ */
+async function makeTrashThumbnail(cfg, batchId, flat, width = 264) {
+  const abs = path.join(cfg._paths.trashDir, batchId, flat);
+  // 与恢复接口相同的边界防御：杜绝 flat 携带路径分隔符的越界读取
+  if (abs !== path.join(cfg._paths.trashDir, batchId, path.basename(flat))) {
+    throw new Error('回收站文件标识非法');
+  }
+  const st = await fsp.stat(abs);
+  const animated = /\.gif$/i.test(flat);
+  return makeThumbFromAbs(cfg, abs, width, {
+    cacheKey: `trash-${batchId}|${flat}|${st.mtimeMs}|${width}${animated ? '|a' : ''}`
+  });
+}
+
+/** 缩略图公共管线：从绝对路径读源图 → sharp 缩放 → webp → 落盘缓存（键由调用方给出） */
+async function makeThumbFromAbs(cfg, abs, width, { cacheKey }) {
+  const cacheFile = path.join(cfg._paths.thumbDir,
+    crypto.createHash('sha1').update(cacheKey).digest('hex') + '.webp');
   try {
     return await fsp.readFile(cacheFile);
   } catch (e) { /* 缓存未命中，走生成流程 */ }
@@ -156,6 +183,7 @@ async function makeThumbnail(cfg, rel, width = 360) {
   const buf = await fsp.readFile(abs);
   // GIF 属于动画格式：开启 animated 管线逐帧缩放，缩略图仍是动画（WebP 动图），
   // 浏览器 <img> 可直接自动播放；sharp 默认只取第一帧，会导致 GIF 预览静止
+  const animated = /\.gif$/i.test(abs);
   const thumb = await sharp(buf, { animated })
     .rotate() // 缩略图同样按 EXIF 转正（GIF 通常无 EXIF，此处为空操作）
     .resize({ width, withoutEnlargement: true }) // 小图不放大（逐帧缩放）
@@ -169,12 +197,47 @@ async function makeThumbnail(cfg, rel, width = 360) {
 }
 
 /* ---------------------------------------------------------------
+ * 缩略图缓存清理
+ * ---------------------------------------------------------------
+ * 缓存键含 mtime：源图一旦更新，旧缩略图即成孤儿；宽度参数每换一档也会
+ * 生成一套新文件——这些残留永远不会被复用，只增不减。
+ * 策略：服务启动时异步清理一次，删除"修改时间早于保留期"的缓存文件。
+ * 缓存键含 mtime 保证仍在保留期内被访问过的条目会被重新生成，不会误伤热点。
+ */
+
+/** 缩略图缓存保留期（毫秒）：默认 30 天 */
+const THUMB_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** 清理超期缩略图缓存；失败仅记录，不影响服务启动 */
+async function cleanThumbCache(cfg, retentionMs = THUMB_RETENTION_MS) {
+  let entries;
+  try { entries = await fsp.readdir(cfg._paths.thumbDir); }
+  catch (e) { return 0; } // 缓存目录尚未创建 = 无需清理
+  const deadline = Date.now() - retentionMs;
+  let removed = 0;
+  for (const name of entries) {
+    const file = path.join(cfg._paths.thumbDir, name);
+    try {
+      const st = await fsp.stat(file);
+      if (st.isFile() && st.mtimeMs < deadline) {
+        await fsp.unlink(file);
+        removed += 1;
+      }
+    } catch (e) { /* 单个文件失败不影响其余 */ }
+  }
+  return removed;
+}
+
+/* ---------------------------------------------------------------
  * 回收站（可恢复的软删除）
  * --------------------------------------------------------------- */
 
 /** 把图库文件移动到回收站（保留批次与路径映射，方便精确恢复） */
 async function moveToTrash(cfg, rels) {
-  const batchId = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  // 批次 ID 加随机后缀：时间戳只精确到秒，同秒内两次删除会复用同一目录并覆盖 manifest，
+  // 导致第一批的"压平名→原路径"精确映射丢失（只能退化按 __ 规则还原）
+  const batchId = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) +
+    '-' + crypto.randomBytes(2).toString('hex');
   const batchDir = path.join(cfg._paths.trashDir, batchId);
   await fsp.mkdir(batchDir, { recursive: true });
   const moved = [];
@@ -224,7 +287,12 @@ async function listTrash(cfg) {
   return out.sort((a, b) => b.trashedAt - a.trashedAt);
 }
 
-/** 从回收站恢复文件到图库原位置（按 manifest 映射精确还原；原目录不存在时自动重建） */
+/**
+ * 从回收站恢复文件到图库原位置（按 manifest 映射精确还原；原目录不存在时自动重建）。
+ * 防覆盖：目标编号已被同目录其他文件占用时（删除旧 0009 后新图复用了编号，再恢复旧 0009
+ * 会把新图无提示覆盖掉），自动改用下一个可用编号，并在返回值中说明改名情况。
+ * @returns {{rel:string, renamed:boolean}}
+ */
 async function restoreFromTrash(cfg, batchId, flat) {
   const batchDir = path.join(cfg._paths.trashDir, batchId);
   const src = path.join(batchDir, flat);
@@ -240,13 +308,145 @@ async function restoreFromTrash(cfg, batchId, flat) {
   const root = cfg._paths.imageRoot;
   if (dst === root || !dst.startsWith(root + path.sep)) throw new Error('恢复目标路径非法');
   await fsp.mkdir(path.dirname(dst), { recursive: true });
-  await fsp.rename(src, dst);
+
+  let finalDst = dst;
+  let renamed = false;
+  // Windows 的 rename 会静默覆盖已存在文件；编号被占时改用下一个空闲编号
+  if (await fsp.stat(dst).then(() => true, () => false)) {
+    const dirAbs = path.dirname(dst);
+    const ext = path.extname(rel).slice(1).toLowerCase();
+    const padding = rel.startsWith(`${cfg.classify.emoticonDir}/`)
+      ? cfg.naming.emoticonPadding : cfg.naming.padding;
+    const baseName = path.basename(rel, path.extname(rel));
+    const startNo = parseInt(baseName, 10);
+    if (Number.isFinite(startNo) && /^\d+$/.test(baseName)) {
+      // 纯编号文件名：从原编号+1 起探测下一个空闲位
+      const maxNo = await classify.scanMaxNumber(dirAbs, cfg.naming.allowedExt);
+      const allocated = await classify.allocatePath(dirAbs, Math.max(startNo, maxNo), padding, ext, cfg);
+      finalDst = allocated.absPath;
+      renamed = true;
+    } else {
+      throw new Error('目标位置已被同名文件占用，无法恢复（请先处理同名文件）');
+    }
+  }
+  await fsp.rename(src, finalDst);
   // 同步更新清单：已恢复的条目移除，防止重复列出
   if (manifest[flat]) {
     delete manifest[flat];
     await fsp.writeFile(path.join(batchDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
   }
-  return rel;
+  const finalRel = path.relative(cfg._paths.imageRoot, finalDst).replace(/\\/g, '/');
+  return { rel: finalRel, renamed };
 }
 
-module.exports = { listImages, buildStats, makeThumbnail, categoryOf, humanSize, moveToTrash, listTrash, restoreFromTrash };
+/**
+ * 按批次整体恢复：遍历该批次 manifest 逐条调用单条恢复。
+ * 单条失败（如目标被同名非编号文件占用）不阻断其余条目，逐条返回结果。
+ * @returns {{batchId:string, results:Array<{rel?:string, renamed?:boolean, flat:string, error?:string}>}}
+ */
+async function restoreBatch(cfg, batchId) {
+  const batchDir = path.join(cfg._paths.trashDir, batchId);
+  let manifest = {};
+  try {
+    manifest = JSON.parse(await fsp.readFile(path.join(batchDir, 'manifest.json'), 'utf8'));
+  } catch (e) { /* 无清单 = 空批次 */ }
+  const results = [];
+  for (const flat of Object.keys(manifest)) {
+    try {
+      const r = await restoreFromTrash(cfg, batchId, flat);
+      results.push({ flat, ...r });
+    } catch (e) {
+      results.push({ flat, error: e.message });
+    }
+  }
+  return { batchId, results };
+}
+
+/**
+ * 彻底删除：物理移除回收站条目（或整批）。这是唯一的不可逆删除入口，
+ * 图库内的文件必须先经 moveToTrash 进入回收站，才可被 purge。
+ * @param {string} batchId
+ * @param {string[]=} flats 要删除的条目；缺省 = 整批清空并删除批次目录
+ * @returns {{removed:number}}
+ */
+async function purgeTrash(cfg, batchId, flats) {
+  // 批次 ID 白名单校验（与恢复接口一致），杜绝拼接越界路径
+  if (!/^[\w-]+$/.test(batchId)) throw new Error('非法批次标识');
+  const batchDir = path.join(cfg._paths.trashDir, batchId);
+  if (batchDir !== path.join(cfg._paths.trashDir, path.basename(batchId))) {
+    throw new Error('非法批次标识');
+  }
+
+  // 未指定条目 = 整批清空
+  if (!Array.isArray(flats) || flats.length === 0) {
+    await fsp.rm(batchDir, { recursive: true, force: true });
+    return { removed: -1 }; // 整批模式，调用方无需精确计数
+  }
+
+  let manifest = {};
+  try {
+    manifest = JSON.parse(await fsp.readFile(path.join(batchDir, 'manifest.json'), 'utf8'));
+  } catch (e) { /* 无清单按空处理 */ }
+  let removed = 0;
+  for (const flat of flats) {
+    // 与恢复接口相同的边界防御
+    const file = path.join(batchDir, flat);
+    if (file !== path.join(batchDir, path.basename(flat))) continue;
+    await fsp.unlink(file).catch(() => {});
+    delete manifest[flat];
+    removed += 1;
+  }
+  // 清单已空 = 批次作废，连目录一起删；否则回写清单
+  if (Object.keys(manifest).length === 0) {
+    await fsp.rm(batchDir, { recursive: true, force: true });
+  } else {
+    await fsp.writeFile(path.join(batchDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
+  }
+  return { removed };
+}
+
+/**
+ * 回收站过期清理：删除"入站时间早于保留期"的批次目录。
+ * 入站时间 = 批次目录名前缀（ISO 时间戳，moveToTrash 生成），无文件系统依赖。
+ * 服务启动时调用一次，防止 .trash 无限膨胀。
+ * @returns {{batches:number, freed:number}} 清理的批次数与释放字节数（尽力统计）
+ */
+async function cleanExpiredTrash(cfg, retentionMs = TRASH_RETENTION_MS) {
+  let batches;
+  try { batches = await fsp.readdir(cfg._paths.trashDir); }
+  catch (e) { return { batches: 0, freed: 0 }; }
+  const deadline = Date.now() - retentionMs;
+  let n = 0, freed = 0;
+  for (const b of batches) {
+    // 批次目录名 = ISO 时间戳（前 19 字符，冒号已被替换为 -）+ 随机后缀。
+    // 显式按位解析回标准 ISO 形式再 Date.parse（2026-10-17T20-45-30 → 20:45:30），
+    // 解析失败的时间戳按"未过期"跳过，绝不误删。
+    const m = b.slice(0, 19).match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})$/);
+    const ts = m ? Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`) : NaN;
+    if (!Number.isFinite(ts) || ts >= deadline) continue;
+    const dir = path.join(cfg._paths.trashDir, b);
+    freed += await dirSize(dir).catch(() => 0);
+    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+    n += 1;
+  }
+  return { batches: n, freed };
+}
+
+/** 回收站保留期（毫秒）：默认 30 天 */
+const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** 递归统计目录字节数（过期清理的报告用，统计失败不影响删除） */
+async function dirSize(dir) {
+  let total = 0;
+  let entries;
+  try { entries = await fsp.readdir(dir, { withFileTypes: true }); }
+  catch (e) { return 0; }
+  for (const ent of entries) {
+    const p = path.join(dir, ent.name);
+    if (ent.isDirectory()) total += await dirSize(p);
+    else total += (await fsp.stat(p).catch(() => ({ size: 0 }))).size;
+  }
+  return total;
+}
+
+module.exports = { listImages, buildStats, makeThumbnail, makeTrashThumbnail, cleanThumbCache, categoryOf, humanSize, moveToTrash, listTrash, restoreFromTrash, restoreBatch, purgeTrash, cleanExpiredTrash };

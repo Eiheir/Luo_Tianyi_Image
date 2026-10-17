@@ -20,13 +20,17 @@
       <button class="tab" data-view="stats">统计</button>
     </nav>
     <div class="topbar-right">
-      <!-- 链接类型切换：jsDelivr CDN / GitHub Raw -->
+      <!-- 链接类型切换：jsDelivr 主站 / 镜像 / GitHub Raw -->
       <label class="link-switch" title="生成的访问链接类型">
         <select id="linkType">
           <option value="jsdelivr">jsDelivr CDN</option>
+          <option value="fastly">jsDelivr · Fastly 镜像</option>
+          <option value="testingcf">jsDelivr · Cloudflare 镜像</option>
+          <option value="gcore">jsDelivr · Gcore 镜像</option>
           <option value="raw">GitHub Raw</option>
         </select>
       </label>
+      <button class="btn ghost" id="btnSettings" title="质量 / 查重 / 上传上限等设置">⚙ 设置</button>
       <button class="btn ghost" id="btnGitStatus">
         同步状态 <span class="badge" id="gitCount">…</span>
       </button>
@@ -104,6 +108,7 @@
             <div class="queue-actions" id="queueActions" hidden>
               <button class="btn primary" id="btnUpload">开始上传</button>
               <button class="btn ghost" id="btnClearQueue">清空队列</button>
+              <button class="btn ghost" id="btnRetryFailed" hidden>重试失败项</button>
               <button class="btn ghost" id="btnCopyBatch" hidden>复制本批全部链接</button>
             </div>
           </div>
@@ -130,11 +135,25 @@
               <option value="numDesc">序号降序</option>
               <option value="timeAsc">时间升序（最早优先）</option>
               <option value="timeDesc">时间降序（最新优先）</option>
+              <option value="sizeDesc">体积降序（大图优先）</option>
+            </select>
+            <select id="sizeFilter" class="mini-select" title="按占用空间筛选">
+              <option value="0">全部大小</option>
+              <option value="1048576">≥ 1 MB</option>
+              <option value="5242880">≥ 5 MB</option>
+              <option value="10485760">≥ 10 MB</option>
+            </select>
+            <select id="widthFilter" class="mini-select" title="按像素宽度筛选">
+              <option value="0">全部宽度</option>
+              <option value="1920">≥ 1920 px</option>
+              <option value="2560">≥ 2560 px</option>
+              <option value="3840">≥ 3840 px</option>
             </select>
             <input type="search" id="searchBox" class="search" placeholder="搜索文件名…" />
             <span class="muted" id="libCount"></span>
             <span class="flex-sp"></span>
             <button class="btn ghost" id="btnDupScan">查重扫描</button>
+            <button class="btn ghost" id="btnOrganize" title="编号规整 / 主题改名">整理…</button>
             <button class="btn ghost" id="btnTrash">回收站</button>
           </div>
 
@@ -146,8 +165,15 @@
       <!-- 多选浮动操作条 -->
       <div class="bulkbar" id="bulkbar" hidden>
         <span>已选 <b id="selCount">0</b> 张</span>
+        <select id="copyFmt" class="mini-select" title="复制格式">
+          <option value="txt">纯链接</option>
+          <option value="markdown">Markdown</option>
+          <option value="html">HTML</option>
+          <option value="bbcode">BBCode</option>
+        </select>
         <button class="btn small primary" id="btnCopySel">复制链接</button>
         <button class="btn small" id="btnExportSel">导出链接</button>
+        <button class="btn small" id="btnMoveSel">移动分类…</button>
         <button class="btn small" id="btnConvertSel">格式转换</button>
         <button class="btn small danger" id="btnTrashSel">移入回收站</button>
         <button class="btn small ghost" id="btnSelAll">全选</button>
@@ -168,8 +194,89 @@
       <!-- 回收站面板 -->
       <div class="modal" id="trashPanel" hidden>
         <div class="modal-card">
-          <div class="modal-head"><h3>回收站（可恢复）</h3><button class="icon-btn" data-close="trashPanel">✕</button></div>
+          <div class="modal-head">
+            <h3>回收站（可恢复）</h3>
+            <span class="flex-sp"></span>
+            <button class="btn small ghost" id="btnTrashPurgeAll" title="不可恢复！清空全部批次">清空回收站</button>
+            <button class="icon-btn" data-close="trashPanel">✕</button>
+          </div>
           <div class="modal-body" id="trashBody"></div>
+        </div>
+      </div>
+
+      <!-- 灯箱（大图预览，←/→ 切换，Esc 关闭） -->
+      <div class="lightbox" id="lightbox" hidden>
+        <button class="lb-nav lb-prev" id="lbPrev" title="上一张（←）">‹</button>
+        <figure class="lb-stage">
+          <img id="lbImg" alt="" />
+          <figcaption class="lb-cap">
+            <span id="lbTitle"></span>
+            <span class="muted" id="lbMeta"></span>
+            <span class="flex-sp"></span>
+            <button class="btn small" id="lbCopy">复制链接</button>
+            <button class="btn small danger" id="lbTrash">移入回收站</button>
+            <button class="icon-btn" id="lbClose" title="关闭（Esc）">✕</button>
+          </figcaption>
+        </figure>
+        <button class="lb-nav lb-next" id="lbNext" title="下一张（→）">›</button>
+      </div>
+
+      <!-- 设置面板 -->
+      <div class="modal" id="settingsPanel" hidden>
+        <div class="modal-card">
+          <div class="modal-head"><h3>设置</h3><button class="icon-btn" data-close="settingsPanel">✕</button></div>
+          <div class="modal-body" id="settingsBody">
+            <div class="opt-grid">
+              <label class="opt">
+                <span class="opt-label">默认压缩质量 <b id="setQualityVal"></b></span>
+                <input type="range" id="setQuality" min="30" max="100" />
+              </label>
+              <label class="opt">
+                <span class="opt-label">单批最多文件数</span>
+                <input type="number" id="setMaxBatch" min="1" max="1000" />
+              </label>
+              <label class="opt">
+                <span class="opt-label">单文件上限（MB）</span>
+                <input type="number" id="setMaxFileMB" min="1" max="500" />
+              </label>
+              <label class="opt">
+                <span class="opt-label">相似判定阈值（汉明距离，越小越严格）</span>
+                <input type="number" id="setHamming" min="0" max="20" />
+              </label>
+              <label class="opt">
+                <span class="opt-label">完全重复时</span>
+                <select id="setOnDup">
+                  <option value="skip">跳过</option>
+                  <option value="keep">仍然保留</option>
+                </select>
+              </label>
+              <label class="opt">
+                <span class="opt-label">默认链接格式</span>
+                <select id="setLinkFormat">
+                  <option value="jsdelivr">jsDelivr CDN</option>
+                  <option value="fastly">jsDelivr · Fastly 镜像</option>
+                  <option value="testingcf">jsDelivr · Cloudflare 镜像</option>
+                  <option value="gcore">jsDelivr · Gcore 镜像</option>
+                  <option value="raw">GitHub Raw</option>
+                </select>
+              </label>
+              <label class="opt opt-check">
+                <input type="checkbox" id="setPurgeCdn" />
+                <span>同步后主动刷新 jsDelivr 缓存（覆盖旧文件时有用，纯新增无意义）</span>
+              </label>
+            </div>
+            <div class="queue-actions">
+              <button class="btn primary" id="btnSaveSettings">保存设置</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 整理面板（编号规整 / 主题改名） -->
+      <div class="modal" id="organizePanel" hidden>
+        <div class="modal-card">
+          <div class="modal-head"><h3>图库整理</h3><button class="icon-btn" data-close="organizePanel">✕</button></div>
+          <div class="modal-body" id="organizeBody"></div>
         </div>
       </div>
     </section>
@@ -186,6 +293,10 @@
           <h3 class="card-title">格式分布</h3>
           <div class="bars" id="fmtBars"></div>
         </div>
+      </div>
+      <div class="card">
+        <h3 class="card-title">近 12 个月新增</h3>
+        <div class="bars" id="trendBars"></div>
       </div>
       <div class="stat-layout2">
         <div class="card">

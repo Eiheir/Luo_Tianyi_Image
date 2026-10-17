@@ -45,7 +45,7 @@ const DEFAULTS = {
   },
   dedup: { hammingThreshold: 5, onExactDuplicate: 'skip' },
   upload: { maxBatchFiles: 200, maxFileMB: 60, quality: 100 },
-  git: { enabled: true, timeoutMs: 120000 },
+  git: { enabled: true, timeoutMs: 120000, purgeCdn: false },
   linkFormat: 'jsdelivr'
 };
 
@@ -122,6 +122,7 @@ function loadConfig() {
     tmpDir: path.join(cacheDir, 'tmp'),        // 上传暂存
     thumbDir: path.join(cacheDir, 'thumbs'),   // 缩略图缓存
     indexFile: path.join(cacheDir, 'index.json'), // 图片索引缓存
+    ignoreFile: path.join(cacheDir, 'dedup-ignore.json'), // 查重手动忽略对（"疑似相似"但用户不想归组的图片对）
     logDir: path.join(cacheDir, 'logs'),       // 错误日志
     trashDir: path.join(DATA_ROOT, '.trash')   // 回收站（软删除，可恢复）
   };

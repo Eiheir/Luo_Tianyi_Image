@@ -201,6 +201,86 @@ function deleteIndexItem(index, rel) {
  * 查重判定
  * --------------------------------------------------------------- */
 
+/* ---------- 查重手动忽略 ----------
+ * "疑似相似"但用户确认不想再看到归组提示的图片。
+ * 语义：按【图片】忽略（muted）——被忽略的图片彻底退出 dHash 相似归组，
+ * 不再与任何图片组队（v1 曾按"两两对"忽略，但聚类会把被忽略的图继续与
+ * 其他图组队，用户视角等于"忽略了还在提示"，故升级）。
+ * MD5 字节级完全重复是客观事实，不受忽略影响。
+ * 存储：.cache/dedup-ignore.json，version 2 = { muted: [rel...] }；
+ * 读取时兼容 v1 { pairs: ["a||b"...] }——自动把旧对的两端迁移为 muted。
+ */
+
+const SEP = '||';
+const IGNORE_VERSION = 2;
+
+/** 读取被忽略图片集合（文件缺失/损坏按空集合处理，绝不因此中断查重） */
+async function loadIgnoreSet(cfg) {
+  try {
+    const raw = await fsp.readFile(cfg._paths.ignoreFile, 'utf8');
+    const obj = JSON.parse(raw);
+    const muted = new Set();
+    if (Array.isArray(obj.muted)) {
+      for (const m of obj.muted) if (typeof m === 'string' && m) muted.add(m);
+    }
+    // v1 兼容：旧"两两对"迁移为按图忽略
+    if (Array.isArray(obj.pairs)) {
+      for (const p of obj.pairs) {
+        if (typeof p !== 'string' || !p.includes(SEP)) continue;
+        const [a, b] = p.split(SEP);
+        muted.add(a); muted.add(b);
+      }
+    }
+    return muted;
+  } catch (e) { /* ENOENT 或损坏按空处理 */ }
+  return new Set();
+}
+
+/** 原子写回被忽略图片集合（排序后存储，diff 友好） */
+async function saveIgnoreSet(cfg, muted) {
+  await fsp.mkdir(path.dirname(cfg._paths.ignoreFile), { recursive: true });
+  const tmp = cfg._paths.ignoreFile + '.tmp';
+  await fsp.writeFile(tmp, JSON.stringify({ version: IGNORE_VERSION, muted: [...muted].sort() }, null, 2), 'utf8');
+  await fsp.rename(tmp, cfg._paths.ignoreFile);
+}
+
+/** 新增忽略图片；索引中不存在的路径（已删除/移动）自动跳过
+ * @returns {{added:number, skipped:number, total:number}} */
+async function addIgnorePairs(cfg, index, paths) {
+  const muted = await loadIgnoreSet(cfg);
+  let added = 0, skipped = 0;
+  for (const rel of Array.isArray(paths) ? paths : []) {
+    if (!index.items[rel]) { skipped++; continue; }
+    if (!muted.has(rel)) { muted.add(rel); added++; }
+  }
+  if (added > 0) await saveIgnoreSet(cfg, muted);
+  return { added, skipped, total: muted.size };
+}
+
+/** 取消忽略（按图片路径），该图恢复参与相似归组
+ * @returns {{removed:number, total:number}} */
+async function removeIgnorePairs(cfg, keys) {
+  const muted = await loadIgnoreSet(cfg);
+  let removed = 0;
+  for (const k of Array.isArray(keys) ? keys : []) {
+    if (muted.delete(k)) removed++;
+  }
+  if (removed > 0) await saveIgnoreSet(cfg, muted);
+  return { removed, total: muted.size };
+}
+
+/** 图库文件路径变更（移动/改名/删除）后同步清理：剔除索引中已不存在的忽略项 */
+async function pruneIgnorePairs(cfg, index) {
+  const muted = await loadIgnoreSet(cfg);
+  if (!muted.size) return { pruned: 0 };
+  let pruned = 0;
+  for (const rel of [...muted]) {
+    if (!index.items[rel]) { muted.delete(rel); pruned++; }
+  }
+  if (pruned > 0) await saveIgnoreSet(cfg, muted);
+  return { pruned };
+}
+
 /**
  * 上传前查重：将新文件的 md5/dhash 与索引内全部文件比对
  * @returns {{exact: Array<string>, similar: Array<{rel, distance}>}}
@@ -224,13 +304,14 @@ function compareAgainstLibrary(index, md5, dhash, threshold) {
 /**
  * 全库查重：返回"重复组"列表
  *  - exactGroups：MD5 相同的组
- *  - similarGroups：dHash 相似的组（组内任两两距离 ≤ 阈值，采用简单贪心聚类）
+ *  - similarGroups：dHash 相似的组（组内任两两距离 ≤ 阈值，采用简单贪心聚类）；
+ *    手动忽略（muted）的图片彻底退出相似归组
  */
-function findDuplicateGroups(index, threshold) {
+function findDuplicateGroups(index, threshold, muted = new Set()) {
   const items = index.items;
   const rels = Object.keys(items);
 
-  // —— MD5 精确分组 ——
+  // —— MD5 精确分组（不受忽略影响：字节级相同是客观事实） ——
   const byMd5 = new Map();
   for (const rel of rels) {
     const m = items[rel].md5;
@@ -240,10 +321,11 @@ function findDuplicateGroups(index, threshold) {
   }
   const exactGroups = [...byMd5.values()].filter((g) => g.length > 1);
 
-  // —— dHash 相似贪心聚类：已归组的文件不再参与后续分组，避免组爆炸 ——
+  // —— dHash 相似贪心聚类：已归组的文件不再参与后续分组，避免组爆炸；
+  //     被忽略（muted）的图片不参与相似归组 ——
   const used = new Set(exactGroups.flat());
   const similarGroups = [];
-  const order = rels.filter((r) => !used.has(r) && items[r].dhash);
+  const order = rels.filter((r) => !used.has(r) && items[r].dhash && !muted.has(r));
   for (let i = 0; i < order.length; i++) {
     if (used.has(order[i])) continue;
     const group = [order[i]];
@@ -261,5 +343,6 @@ function findDuplicateGroups(index, threshold) {
 module.exports = {
   md5Of, dhashOf, hammingDistance,
   loadIndex, saveIndex, scanLibrary, setIndexItem, deleteIndexItem, walkImages,
-  compareAgainstLibrary, findDuplicateGroups, extSetOf
+  compareAgainstLibrary, findDuplicateGroups, extSetOf,
+  loadIgnoreSet, saveIgnoreSet, addIgnorePairs, removeIgnorePairs, pruneIgnorePairs
 };

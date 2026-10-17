@@ -351,3 +351,48 @@ input[type="range"] { accent-color: var(--primary); }
 .toast.warn { border-left-color: var(--warn); }
 .toast.ok { border-left-color: var(--ok); }
 @keyframes slide { from { opacity: 0; transform: translateX(14px); } to { opacity: 1; } }
+
+/* ---------------- 灯箱（大图预览） ---------------- */
+.lightbox {
+  position: fixed; inset: 0; z-index: 90;
+  background: rgba(18, 22, 30, .86); /* 深色遮罩，突出图片 */
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+}
+.lightbox[hidden] { display: none; }
+.lb-stage { max-width: min(86vw, 1400px); max-height: 88vh; display: flex; flex-direction: column; }
+.lb-stage img {
+  max-width: 100%; max-height: 80vh; object-fit: contain;
+  border-radius: 8px; background: #0d0f14; min-width: 320px; min-height: 240px;
+}
+.lb-cap {
+  display: flex; align-items: center; gap: 10px; margin-top: 10px;
+  color: #e8eaf0; font-size: 13px; flex-wrap: wrap;
+}
+.lb-cap .muted { color: #aab0bd; }
+.lb-cap .btn { background: rgba(255,255,255,.08); border-color: rgba(255,255,255,.2); color: #e8eaf0; }
+.lb-cap .btn:hover { background: rgba(255,255,255,.16); color: #fff; }
+.lb-cap .btn.danger { border-color: rgba(217,83,79,.6); }
+.lb-cap .icon-btn { background: rgba(255,255,255,.08); color: #e8eaf0; }
+.lb-nav {
+  width: 44px; height: 64px; font-size: 30px; line-height: 1;
+  border: 1px solid rgba(255,255,255,.2); border-radius: 10px;
+  background: rgba(255,255,255,.06); color: #e8eaf0; cursor: pointer;
+  flex-shrink: 0; user-select: none;
+}
+.lb-nav:hover { background: rgba(255,255,255,.16); }
+@media (max-width: 720px) { .lb-nav { display: none; } } /* 窄屏隐藏左右箭头，靠键盘/点击图片边缘不可行，直接全屏看 */
+
+/* 查重/回收站条目中的"最高清"标记与置灰 */
+.dup-item.best img { outline: 2px solid var(--ok); outline-offset: 1px; }
+.dup-item.best .name { color: var(--ok); font-weight: 600; }
+.dup-item .btn { margin-top: 4px; }
+
+/* 查重面板：已忽略图片管理区块（条目复用 .dup-item 网格） */
+.ignored-sec { border-top: 1px solid var(--line); padding-top: 12px; }
+
+/* 设置面板微调 */
+#settingsBody .opt input[type="number"] {
+  width: 100%; padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px;
+  font: inherit; background: #fff;
+}
+#settingsBody .queue-actions { justify-content: flex-end; margin-top: 12px; }

@@ -18,7 +18,15 @@
   "naming": {
     "padding": 4,
     "emoticonPadding": 3,
-    "allowedExt": ["jpg", "jpeg", "png", "gif", "bmp", "webp", "avif"]
+    "allowedExt": [
+      "jpg",
+      "jpeg",
+      "png",
+      "gif",
+      "bmp",
+      "webp",
+      "avif"
+    ]
   },
   "dedup": {
     "hammingThreshold": 5,

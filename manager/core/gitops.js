@@ -47,13 +47,26 @@ async function status(cfg) {
 }
 
 /**
- * 执行完整同步：add（限定图库）→ commit → push
+ * 执行完整同步：pull（快进+自动暂存）→ add（限定图库）→ commit → push → CDN 缓存刷新
  * @returns {{ok:boolean, message:string, steps:Array<{step:string, ok:boolean, detail:string}>}}
  */
 async function sync(cfg) {
   const timeout = Number(cfg.git.timeoutMs) || 120000;
   const steps = [];
   const stamp = new Date().toLocaleString('zh-CN', { hour12: false });
+
+  // 第 0 步：拉取远端更新。多机使用时本地可能落后 origin（仓库历史里已有多次手动
+  // 合并记录）；先 rebase 本地未推送提交、自动暂存/恢复工作区，push 才不会被拒。
+  // 失败（如冲突）不中止流程：继续尝试提交，push 被拒时用户可命令行处理。
+  const root0 = cfg._paths.repoRoot;
+  const pull = await run(root0,
+    ['pull', '--rebase', '--autostash', '--', 'origin', safeBranch(cfg.repo.branch) || 'main'],
+    timeout);
+  steps.push({
+    step: '拉取远端更新',
+    ok: !pull.err || /up to date|already up to date/i.test(pull.stdout + pull.stderr),
+    detail: pull.err ? (pull.stderr || pull.err.message).split('\n')[0] : (pull.stdout.trim().split('\n').pop() || '已是最新')
+  });
 
   // 第 1 步：检查图库范围内是否有变更
   const st = await status(cfg);
@@ -87,12 +100,46 @@ async function sync(cfg) {
   const push = await run(cfg._paths.repoRoot, ['push', '--', 'origin', branch], timeout);
   steps.push({ step: '推送到 GitHub', ok: !push.err, detail: push.err ? (push.stderr || push.err.message) : `已推送至 origin/${branch}` });
 
-  const ok = !push.err;
-  return {
-    ok,
-    message: ok ? '同步完成：链接约 1~5 分钟内在 jsDelivr 生效（CDN 缓存刷新周期）' : '推送失败：本地已提交，可稍后重试推送',
-    steps
-  };
+  let ok = !push.err;
+  let message = ok ? '同步完成：链接约 1~5 分钟内在 jsDelivr 生效（CDN 缓存刷新周期）' : '推送失败：本地已提交，可稍后重试推送';
+
+  // 第 5 步（尽力而为）：主动刷新 jsDelivr 缓存。仅同步"覆盖旧路径"（如转换替换原图）
+  // 时有意义；纯新增文件的链接本来就是冷的，刷新无害但无用。失败不影响同步结果。
+  if (ok && cfg.git.purgeCdn) {
+    const purge = await purgeJsDelivrCache(cfg.repo.owner, cfg.repo.name, branch);
+    steps.push({ step: '刷新 CDN 缓存', ok: purge.ok, detail: purge.detail });
+  }
+
+  return { ok, message, steps };
+}
+
+/**
+ * 请求 jsDelivr 清除指定仓库/分支的文件缓存（ purge API，无需鉴权，限频 50 次/分钟）。
+ * 逐路径请求；部分失败只记录，不抛错——CDN 缓存最终也会自然过期。
+ */
+async function purgeJsDelivrCache(owner, name, branch) {
+  const files = await listChangedFiles();
+  if (!files.length) return { ok: true, detail: '无变更文件需要刷新' };
+  let okN = 0, failN = 0;
+  for (const f of files) {
+    const url = `https://purge.jsdelivr.net/gh/${owner}/${name}@${branch}/${f}`;
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      if (res.ok) okN += 1; else failN += 1;
+    } catch (e) { failN += 1; }
+  }
+  return { ok: failN === 0, detail: `已刷新 ${okN} 个文件缓存${failN ? `，失败 ${failN}（缓存稍后自动过期）` : ''}` };
+}
+
+/** 读取图库范围内本批次实际变更的文件列表（相对图库根，已含 imageRoot 前缀） */
+async function listChangedFiles() {
+  const { execFile } = require('child_process');
+  const runLocal = (args) => new Promise((resolve) => {
+    execFile('git', args, { encoding: 'utf8', timeout: 15000, windowsHide: true },
+      (err, stdout) => resolve(err ? '' : String(stdout || '')));
+  });
+  const out = await runLocal(['diff', '--name-only', 'HEAD@{1}']);
+  return out.split('\n').map((s) => s.trim()).filter(Boolean);
 }
 
 module.exports = { status, sync };
