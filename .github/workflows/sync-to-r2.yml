@@ -33,25 +33,22 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Fetch worker skeleton from blog repo
-        # 拉取博客仓库里的 Worker 目录（wrangler.toml + src/index.js）
+        # 拉取博客仓库里的 Worker 骨架（wrangler.toml + 部署辅助脚本）。
+        # GitHub API 的 tarball 接口不支持按子目录过滤（返回整仓库归档），
+        # 直接用稀疏检出只取 cloudflare/gallery-assets/。
+        # 注：首跑（2026-10-17）失败是因为当时博客仓库尚未推入该目录，
+        # 时序问题而非脚本问题；骨架目录缺失时这里会明确报错提示。
         run: |
-          curl -sfL --retry 3 -o worker-skeleton.tar.gz \
-            "https://api.github.com/repos/XinChengP/OxygenBlogPlatform/tarball/cloudflare/gallery-assets" || {
-            # 上面这种 tarball 子目录写法不被支持，改用稀疏检出
-            git clone --depth 1 --filter=blob:none --sparse \
-              https://x-access-token:${{ github.token }}@github.com/XinChengP/OxygenBlogPlatform.git blog-repo
-            cd blog-repo
-            git sparse-checkout set cloudflare/gallery-assets
-            cd ..
-            mkdir -p worker
-            cp -r blog-repo/cloudflare/gallery-assets/* worker/
-          }
-          # tarball 失败时 worker/ 已由稀疏检出填充；成功时也统一整理进 worker/
-          if [ -f worker-skeleton.tar.gz ]; then
-            # GitHub API tarball 是整仓库，稀疏方案更可靠，直接报错提示走 fallback
-            echo "tarball 方式不可用，请检查上方稀疏检出是否执行" >&2
+          mkdir -p worker
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://x-access-token:${{ github.token }}@github.com/XinChengP/OxygenBlogPlatform.git blog-repo
+          git -C blog-repo sparse-checkout set cloudflare/gallery-assets
+          if [ ! -f blog-repo/cloudflare/gallery-assets/wrangler.toml ]; then
+            echo "博客仓库未找到 cloudflare/gallery-assets/wrangler.toml，请先在 XinChengP/OxygenBlogPlatform 推入 Worker 骨架" >&2
             exit 1
           fi
+          cp -r blog-repo/cloudflare/gallery-assets/. worker/
+          rm -rf blog-repo
           ls -la worker/
 
       - name: Generate manifest and stage assets
