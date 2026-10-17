@@ -80,8 +80,11 @@ jobs:
           cp -r LTYpicture worker/assets/LTYpicture
 
       - name: Deploy Worker with assets
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          workingDirectory: worker
+        # wrangler-action@v3 在部分环境下 npx 拉包需要交互确认，改为显式安装后直接调用
+        run: |
+          cd worker
+          npm install --no-save wrangler@^4
+          npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
