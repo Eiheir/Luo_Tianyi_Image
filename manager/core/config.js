@@ -41,7 +41,9 @@ const DEFAULTS = {
   naming: {
     padding: 4,
     emoticonPadding: 3,
-    allowedExt: ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'avif']
+    // heic/heif：iPhone 等设备的原生照片格式。sharp 预编译包可解码但不可编码（缺 HEVC
+    // 编码器），入库时由 converter 兜底转 jpg 存档；avif 同属 heif 容器（可读可写）
+    allowedExt: ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'avif', 'heic', 'heif']
   },
   dedup: { hammingThreshold: 5, onExactDuplicate: 'skip' },
   upload: { maxBatchFiles: 200, maxFileMB: 60, quality: 100 },

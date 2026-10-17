@@ -25,21 +25,24 @@
       "gif",
       "bmp",
       "webp",
-      "avif"
+      "avif",
+      "heic",
+      "heif"
     ]
   },
   "dedup": {
-    "hammingThreshold": 5,
+    "hammingThreshold": 3,
     "onExactDuplicate": "skip"
   },
   "upload": {
-    "maxBatchFiles": 200,
+    "maxBatchFiles": 500,
     "maxFileMB": 60,
-    "quality": 100
+    "quality": 95
   },
   "git": {
     "enabled": true,
-    "timeoutMs": 120000
+    "timeoutMs": 120000,
+    "purgeCdn": true
   },
   "linkFormat": "jsdelivr"
 }

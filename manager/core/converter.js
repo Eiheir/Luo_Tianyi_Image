@@ -17,13 +17,25 @@
  * 但保留 ICC 色彩配置文件，避免转换后偏色。
  */
 
+const path = require('path');
 const sharp = require('sharp');
+
+/** heic/heif 解码器（内嵌 libheif-wasm，含 HEVC 解码插件；sharp 预编译包不含）。
+ *  延迟 require：仅在真正遇到 heic 上传时加载，不拖慢启动。 */
+let heicConvert = null;
+function decodeHeic(buffer) {
+  if (!heicConvert) heicConvert = require('heic-convert');
+  return heicConvert({ buffer, format: 'JPEG', quality: 0.92 }); // 返回 JPEG 编码的 Buffer
+}
 
 /** 支持的转换目标格式（键=前端传入值，值=落盘扩展名） */
 const TARGETS = { keep: null, jpg: 'jpg', png: 'png', webp: 'webp', avif: 'avif' };
 
 /** 无需像素级重编码的保留型格式：gif 重编码会丢帧、avif 重编码收益低且慢 */
 const PASSTHROUGH_EXT = new Set(['gif', 'avif']);
+
+/** HEIF 容器照片格式（iPhone HEIC 等）：可解码但浏览器/CDN 无法直出，入库时强制转 jpg */
+const HEIF_EXT = new Set(['heic', 'heif']);
 
 /** keep 模式下可直接重编码的格式白名单（不在此列的原格式一律兜底转 jpg） */
 const ENCODABLE_EXT = new Set(['jpg', 'png', 'webp']);
@@ -80,6 +92,18 @@ async function processImage(inputBuffer, opts = {}) {
   let ext = (meta.format || 'jpg').toLowerCase();
   // jpeg 统一记作 jpg，方便命名与统计
   if (ext === 'jpeg') ext = 'jpg';
+  // sharp 对整个 heif 容器（avif 与 heic）的 format 都报 "heif"；
+  // 用容器内压缩编码区分：av1 = avif（可原样保留），hevc = heic（须转 jpg）。
+  // metadata 不可靠时再看原文件扩展名兜底。
+  if (ext === 'heif') {
+    const comp = String(meta.compression || '').toLowerCase();
+    if (comp === 'av1') ext = 'avif';
+    else if (comp === 'hevc') ext = 'heic';
+    else {
+      const srcExt = path.extname(opts.sourceName || '').slice(1).toLowerCase();
+      ext = srcExt === 'avif' ? 'avif' : 'heic';
+    }
+  }
 
   const quality = clampQuality(opts.quality);
   // stripMeta 默认 true：未显式传 false 即剥离 EXIF（防 GPS/拍摄参数外泄）
@@ -87,6 +111,22 @@ async function processImage(inputBuffer, opts = {}) {
 
   // ---- 模式一：保留原格式（keep）----
   if (targetKey === 'keep') {
+    // heic/heif：浏览器与 jsDelivr 分发均不支持直出，必须转 jpg。
+    // sharp 预编译包无 HEVC 解码插件，先用 heic-convert（libheif-wasm）解成 JPEG，
+    // 再走既有 sharp 管线（EXIF 转正对 JPEG 仍生效；heic 的 irot 方向盒在解码时已应用）。
+    if (HEIF_EXT.has(ext)) {
+      const jpegBuffer = Buffer.from(await decodeHeic(inputBuffer));
+      const { data, info } = await encode(buildPipe(jpegBuffer, stripMeta), 'jpg', quality);
+      return {
+        buffer: data,
+        ext: 'jpg',
+        width: info.width,
+        height: info.height,
+        animated: false, // heic 序列（Live Photo 的视频部分）不在图片文件内，按静图处理
+        converted: true,
+        notice: `${ext.toUpperCase()} 照片已转为 JPG（浏览器/CDN 不支持直出 HEIF）`
+      };
+    }
     // orientation 存在且不为 1，说明物理像素是歪的、需按 EXIF 转正
     const needRotate = !!meta.orientation && meta.orientation !== 1;
     // 勾选了剥离且确实含 EXIF 时才需重编码去元数据
@@ -133,15 +173,18 @@ async function processImage(inputBuffer, opts = {}) {
       notice: '动图已保留原格式（转静态格式仅会保留第一帧）'
     };
   }
+  // heic 输入：sharp 无法直接解码，先经 heic-convert 落到 JPEG 再编码
+  let pipeInput = inputBuffer;
+  if (HEIF_EXT.has(ext)) pipeInput = Buffer.from(await decodeHeic(inputBuffer));
   // 统一走 encode：info 内已含输出宽高，无需再解析一次 metadata
-  const { data, info } = await encode(buildPipe(inputBuffer, stripMeta), targetExt, quality);
+  const { data, info } = await encode(buildPipe(pipeInput, stripMeta), targetExt, quality);
   return {
     buffer: data,
     ext: targetExt,
     width: info.width,
     height: info.height,
-    animated,
-    converted: targetExt !== ext
+    animated: HEIF_EXT.has(ext) ? false : animated,
+    converted: targetExt !== ext || HEIF_EXT.has(ext)
   };
 }
 

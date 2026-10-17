@@ -145,6 +145,11 @@ input[type="range"] { accent-color: var(--primary); }
   width: 52px; height: 52px; border-radius: 6px; object-fit: cover;
   background: var(--bg); border: 1px solid var(--line);
 }
+/* 无预览时的占位（div 形态）：与 img 版本同样大小，居中显示图标 */
+div.qitem-thumb-empty {
+  display: flex; align-items: center; justify-content: center;
+  color: var(--text2); font-size: 20px; flex-shrink: 0;
+}
 .qitem-name { font-size: 13px; font-weight: 500; word-break: break-all; }
 .qitem-meta { font-size: 12px; color: var(--text2); display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
 .qitem-notice { font-size: 12px; color: var(--warn); margin-top: 2px; }

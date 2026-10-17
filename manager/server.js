@@ -146,7 +146,7 @@ app.get('/api/config', (req, res) => ok(res, {
   naming: cfg.naming,
   dedup: { hammingThreshold: cfg.dedup.hammingThreshold },
   upload: cfg.upload,
-  git: { enabled: cfg.git.enabled, purgeCdn: !!cfg.git.purgeCdn },
+  git: { enabled: cfg.git.enabled !== false, purgeCdn: !!cfg.git.purgeCdn },
   linkFormat: cfg.linkFormat,
   linkHosts: links.JSDELIVR_HOSTS,
   categories: classify.CATEGORIES
@@ -307,7 +307,8 @@ app.post('/api/convert', wrap(async (req, res) => {
     try {
       const input = await fsp.readFile(abs);
       const processed = await converter.processImage(input, {
-        target, quality, stripMeta: true, allowAnimatedLoss: !!allowAnimatedLoss
+        target, quality, stripMeta: true, allowAnimatedLoss: !!allowAnimatedLoss,
+        sourceName: rel // heif 容器歧义（avif vs heic）时的扩展名兜底
       });
       const cat = storage.categoryOf(rel, cfg);
       const relDir = cat === 'emoticon'
@@ -505,20 +506,35 @@ app.get('/api/settings', wrap(async (req, res) => {
 
 app.post('/api/settings', wrap(async (req, res) => {
   const updated = await settings.update(req.body || {});
-  // 热生效：同步到运行中的 cfg（监听地址/端口等需重启的字段不会出现在白名单里）
-  Object.assign(cfg, updated);
+  // 热生效：深合并到运行中的 cfg。runtime 片段是嵌套对象（如 {git:{purgeCdn}}），
+  // 浅 Object.assign 会用片段整体替换 cfg.git，把 enabled/timeoutMs 等未编辑字段丢掉，
+  // 导致"同步功能已在配置中关闭"——必须逐键深合并（与 config.deepMerge 同语义）。
+  deepMergeInto(cfg, updated);
   ok(res, settings.publicView(cfg));
 }));
+
+/** 把更新片段深合并进目标对象（仅覆盖片段中出现的键，目标其余键原样保留） */
+function deepMergeInto(target, patch) {
+  for (const k of Object.keys(patch)) {
+    const pv = patch[k];
+    if (pv && typeof pv === 'object' && !Array.isArray(pv) &&
+        target[k] && typeof target[k] === 'object' && !Array.isArray(target[k])) {
+      deepMergeInto(target[k], pv);
+    } else {
+      target[k] = pv;
+    }
+  }
+}
 
 /* ---------- Git 手动同步 ---------- */
 
 app.get('/api/git/status', wrap(async (req, res) => {
-  if (!cfg.git.enabled) return ok(res, { enabled: false, count: 0, entries: [] });
+  if (cfg.git.enabled === false) return ok(res, { enabled: false, count: 0, entries: [] });
   ok(res, { enabled: true, ...(await gitops.status(cfg)) });
 }));
 
 app.post('/api/git/sync', wrap(async (req, res) => {
-  if (!cfg.git.enabled) return fail(res, 403, '同步功能已在配置中关闭');
+  if (cfg.git.enabled === false) return fail(res, 403, '同步功能已在配置中关闭');
   ok(res, await gitops.sync(cfg));
 }));
 

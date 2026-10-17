@@ -50,7 +50,8 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
       target: opts.convert || 'keep',
       quality: opts.quality ?? cfg.upload.quality,
       stripMeta: opts.stripMeta !== false,
-      allowAnimatedLoss: !!opts.allowAnimatedLoss
+      allowAnimatedLoss: !!opts.allowAnimatedLoss,
+      sourceName: originalName // heif 容器歧义（avif vs heic）时的扩展名兜底
     });
     result.ext = processed.ext;
     result.w = processed.width;

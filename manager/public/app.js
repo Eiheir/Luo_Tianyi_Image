@@ -168,7 +168,7 @@ document.addEventListener('paste', (e) => {
 function addFiles(fileList) {
   const max = (state.cfg && state.cfg.upload.maxBatchFiles) || 200;
   for (const f of fileList) {
-    if (!/^image\//.test(f.type) && !/\.(jpe?g|png|webp|gif|bmp|avif)$/i.test(f.name)) {
+    if (!/^image\//.test(f.type) && !/\.(jpe?g|png|webp|gif|bmp|avif|heic|heif)$/i.test(f.name)) {
       toast(`已跳过非图片文件：${f.name}`, 'warn');
       continue;
     }
@@ -178,7 +178,9 @@ function addFiles(fileList) {
   renderQueue();
 }
 
-/** 渲染上传队列 */
+/** 渲染上传队列。
+ * 缩略图来源：待上传/失败项用本地 Blob 预览；已入库项（成功/重复跳过）用服务端
+ * 缩略图接口——上传成功即释放本地预览，src 若还指着旧 Blob 会成破图。 */
 function renderQueue() {
   const list = $('queueList');
   list.innerHTML = '';
@@ -209,8 +211,15 @@ function renderQueue() {
     const err = item.result && item.result.error ? `<div class="qitem-err">${escapeHtml(item.result.error)}</div>` : '';
     const copyBtn = item.result && item.result.status === 'ok' && item.result.url
       ? `<button class="btn small" data-copy-url="${escapeHtml(item.result.url)}">复制链接</button>` : '';
+    // 已入库（ok/duplicate 的 result.rel）→ 服务端缩略图（优先）；失败/待上传 → 本地预览
+    const serverThumb = item.result && (item.result.status === 'ok' || item.result.status === 'duplicate') && item.result.rel
+      ? `/api/thumb?p=${encodeURIComponent(item.result.rel)}&w=120` : '';
+    const thumbSrc = serverThumb || item.previewUrl;
+    const thumb = thumbSrc
+      ? `<img class="qitem-thumb" src="${thumbSrc}" alt="" />`
+      : '<div class="qitem-thumb qitem-thumb-empty">⇪</div>';
     row.innerHTML = `
-      <img class="qitem-thumb" src="${item.previewUrl}" alt="" />
+      ${thumb}
       <div>
         <div class="qitem-name">${escapeHtml(item.file.name)}</div>
         <div class="qitem-meta">${statusTag} ${catTag} <span>${fmtSize(item.file.size)}${dim}</span></div>
