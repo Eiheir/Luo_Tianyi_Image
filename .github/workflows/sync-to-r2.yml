@@ -1,0 +1,87 @@
+name: Deploy images to Workers
+
+# 图床图片 → Cloudflare Workers Static Assets 自动部署
+#
+# 只处理 LTYpicture/** 下的图片文件；manager/（图床管理软件）、README、
+# config.json 等仓库代码不参与部署。
+#
+# Worker 骨架（wrangler.toml + src/index.js）维护在博客仓库
+# XinChengP/OxygenBlogPlatform 的 cloudflare/gallery-assets/，
+# 本工作流每次部署时拉取最新骨架，单一事实来源。
+#
+# 首次启用前需在仓库 Settings → Secrets and variables → Actions 配置：
+#   CLOUDFLARE_API_TOKEN  : API Token（模板 "Edit Cloudflare Workers"，限定本账号/zone）
+#   CLOUDFLARE_ACCOUNT_ID : Cloudflare 账号 ID（仪表盘右栏）
+#   BLOG_REPO_TOKEN（可选）: 默认 GITHUB_TOKEN 即可读公开仓库；博客仓库转私后才需要
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'LTYpicture/**' # 只有图片目录变化才跑，改 manager 等代码不触发
+  workflow_dispatch: # 保留手动触发入口，用于补部署
+
+concurrency:
+  group: workers-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout image repo
+        uses: actions/checkout@v4
+
+      - name: Fetch worker skeleton from blog repo
+        # 拉取博客仓库里的 Worker 目录（wrangler.toml + src/index.js）
+        run: |
+          curl -sfL --retry 3 -o worker-skeleton.tar.gz \
+            "https://api.github.com/repos/XinChengP/OxygenBlogPlatform/tarball/cloudflare/gallery-assets" || {
+            # 上面这种 tarball 子目录写法不被支持，改用稀疏检出
+            git clone --depth 1 --filter=blob:none --sparse \
+              https://x-access-token:${{ github.token }}@github.com/XinChengP/OxygenBlogPlatform.git blog-repo
+            cd blog-repo
+            git sparse-checkout set cloudflare/gallery-assets
+            cd ..
+            mkdir -p worker
+            cp -r blog-repo/cloudflare/gallery-assets/* worker/
+          }
+          # tarball 失败时 worker/ 已由稀疏检出填充；成功时也统一整理进 worker/
+          if [ -f worker-skeleton.tar.gz ]; then
+            # GitHub API tarball 是整仓库，稀疏方案更可靠，直接报错提示走 fallback
+            echo "tarball 方式不可用，请检查上方稀疏检出是否执行" >&2
+            exit 1
+          fi
+          ls -la worker/
+
+      - name: Generate manifest and stage assets
+        # 从 checkout 的 LTYpicture 目录生成图片清单（画廊浏览器端数据源），
+        # 并把图片平铺进 Worker 的 assets 目录
+        run: |
+          mkdir -p worker/assets
+          node -e '
+            const fs = require("fs"), path = require("path");
+            const exts = [".jpg",".jpeg",".png",".gif",".webp",".avif"];
+            const images = [];
+            const walk = (dir) => {
+              for (const name of fs.readdirSync(dir)) {
+                const full = path.join(dir, name);
+                if (fs.statSync(full).isDirectory()) walk(full);
+                else if (exts.includes(path.extname(name).toLowerCase()))
+                  images.push({ path: "LTYpicture/" + path.relative("LTYpicture", full).split(path.sep).join("/"), size: fs.statSync(full).size });
+              }
+            };
+            walk("LTYpicture");
+            fs.writeFileSync("worker/assets/manifest.json", JSON.stringify({
+              generatedAt: new Date().toISOString(), count: images.length, images
+            }));
+            console.log("manifest:", images.length, "images");
+          '
+          cp -r LTYpicture worker/assets/LTYpicture
+
+      - name: Deploy Worker with assets
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker
