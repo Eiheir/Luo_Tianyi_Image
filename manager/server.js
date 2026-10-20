@@ -149,7 +149,8 @@ app.get('/api/config', (req, res) => ok(res, {
   git: { enabled: cfg.git.enabled !== false, purgeCdn: !!cfg.git.purgeCdn },
   linkFormat: cfg.linkFormat,
   linkHosts: links.JSDELIVR_HOSTS,
-  categories: classify.CATEGORIES
+  categories: classify.CATEGORIES,
+  trashRetentionDays: Math.round(storage.TRASH_RETENTION_MS / 86400000)
 }));
 
 /* ---------- 上传（批量） ---------- */
@@ -226,7 +227,7 @@ app.get('/api/thumb', wrap(async (req, res) => {
   const abs = requireSafePath(req, res);
   if (!abs) return;
   const rel = path.relative(cfg._paths.imageRoot, abs).replace(/\\/g, '/');
-  const width = Math.max(64, Math.min(800, parseInt(req.query.w, 10) || 360));
+  const width = Math.max(64, Math.min(2400, parseInt(req.query.w, 10) || 360));
   try {
     const buf = await storage.makeThumbnail(cfg, rel, width);
     res.set('Content-Type', 'image/webp');
@@ -297,9 +298,10 @@ app.post('/api/duplicates/unignore', wrap(async (req, res) => {
 /* ---------- 批量格式转换 ---------- */
 
 app.post('/api/convert', wrap(async (req, res) => {
-  const { paths, target, quality, replaceOriginal, allowAnimatedLoss } = req.body || {};
+  const { paths, target, quality, replaceOriginal, allowAnimatedLoss, linkType } = req.body || {};
   if (!Array.isArray(paths) || paths.length === 0) return fail(res, 400, '未指定要转换的图片');
   if (!converter.TARGETS[target] || target === 'keep') return fail(res, 400, '无效的目标格式');
+  const chosenLinkType = linkType || cfg.linkFormat;
   const results = [];
   for (const rel of paths) {
     const abs = safeJoinImage(cfg, rel);
@@ -310,6 +312,15 @@ app.post('/api/convert', wrap(async (req, res) => {
         target, quality, stripMeta: true, allowAnimatedLoss: !!allowAnimatedLoss,
         sourceName: rel // heif 容器歧义（avif vs heic）时的扩展名兜底
       });
+      // 动图保护：格式未变时不落盘、不动原图，只回报跳过原因
+      if (processed.skipped) {
+        results.push({
+          rel, ok: true, skipped: true, converted: false,
+          notice: processed.notice || '已跳过',
+          url: links.buildLink(cfg, rel, chosenLinkType)
+        });
+        continue;
+      }
       const cat = storage.categoryOf(rel, cfg);
       const relDir = cat === 'emoticon'
         ? `${cfg.classify.emoticonDir}/${path.basename(path.dirname(rel))}` // 表情包保持原主题目录
@@ -340,7 +351,7 @@ app.post('/api/convert', wrap(async (req, res) => {
       results.push({
         rel, ok: true, newRel, converted: processed.converted,
         notice: processed.notice || '', trashed,
-        url: links.buildLink(cfg, newRel, cfg.linkFormat)
+        url: links.buildLink(cfg, newRel, chosenLinkType)
       });
     } catch (e) {
       results.push({ rel, ok: false, error: e.message }); // 单文件失败不阻断批次
@@ -539,12 +550,12 @@ app.get('/api/settings', wrap(async (req, res) => {
 }));
 
 app.post('/api/settings', wrap(async (req, res) => {
-  const updated = await settings.update(req.body || {});
+  const { runtime, applied, invalid } = await settings.update(req.body || {});
   // 热生效：深合并到运行中的 cfg。runtime 片段是嵌套对象（如 {git:{purgeCdn}}），
   // 浅 Object.assign 会用片段整体替换 cfg.git，把 enabled/timeoutMs 等未编辑字段丢掉，
   // 导致"同步功能已在配置中关闭"——必须逐键深合并（与 config.deepMerge 同语义）。
-  deepMergeInto(cfg, updated);
-  ok(res, settings.publicView(cfg));
+  deepMergeInto(cfg, runtime);
+  ok(res, { settings: settings.publicView(cfg), applied, invalid });
 }));
 
 /** 把更新片段深合并进目标对象（仅覆盖片段中出现的键，目标其余键原样保留） */

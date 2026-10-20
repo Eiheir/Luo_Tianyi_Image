@@ -84,25 +84,26 @@ function setPath(obj, dotKey, value) {
 
 /**
  * 应用设置更新：校验 → 写 config.json → 返回热生效用的运行配置片段。
- * 全部值非法时抛错；部分非法时跳过非法项（前端 toast 逐项可见）。
- * @returns {object} 与 DEFAULTS 同构的更新片段（调用方 Object.assign 到运行 cfg）
+ * 全部值非法时抛错；部分非法时跳过非法项，并在 invalid 中列明，前端据此提示。
+ * @returns {{runtime:object, applied:object, invalid:string[]}}
  */
 function update(patch) {
   if (!patch || typeof patch !== 'object') throw new Error('无效的设置数据');
   const user = readUserConfig();
   const runtime = {}; // 热生效片段
   const applied = {};
+  const invalid = [];
   for (const [key, validate] of Object.entries(SETTABLE)) {
     if (!(key in patch)) continue;
     const value = validate(patch[key]);
-    if (value === null) continue; // 非法值跳过，不中断其他设置
+    if (value === null) { invalid.push(key); continue; }
     setPath(user, key, value);
     setPath(runtime, key, value);
     applied[key] = value;
   }
   if (Object.keys(applied).length === 0) throw new Error('没有可应用的合法设置项');
   writeUserConfig(user);
-  return runtime;
+  return { runtime, applied, invalid };
 }
 
 /** 设置界面的只读视图：当前值 + 默认值 + 是否需重启 */

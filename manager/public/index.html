@@ -4,25 +4,61 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>智能图床管理器 · 洛佬の美图</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%233b5bdb'/%3E%3Cpath d='M6 16l3.5-4 2.5 2.5L15.5 10 18 16z' fill='%23fff'/%3E%3Ccircle cx='9' cy='8.5' r='1.5' fill='%23fff'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <!-- ============ 顶部栏：标识 / 视图切换 / 同步状态 ============ -->
+  <!-- ============================================================
+       SVG 图标精灵：统一线性图标，避免 emoji 在不同系统上风格不一
+       ============================================================ -->
+  <svg class="svg-sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4m0 0L7 9m5-5 5 5"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V10a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
+    <symbol id="i-sync" viewBox="0 0 24 24"><path d="M20 12a8 8 0 0 1-13.7 5.7M4 12a8 8 0 0 1 13.7-5.7"/><path d="M20 4v5h-5M4 20v-5h5"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M10 11v6M14 11v6"/><path d="M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v12m0 0l-4-4m4 4 4-4"/><path d="M4 20h16"/></symbol>
+    <symbol id="i-zoom-in" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21M10.5 7.5v6M7.5 10.5h6"/></symbol>
+    <symbol id="i-zoom-out" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21M7.5 10.5h6"/></symbol>
+    <symbol id="i-reset" viewBox="0 0 24 24"><path d="M4 4v5h5"/><path d="M4.6 9A8 8 0 1 1 4 12"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l4 4L19 6"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21"/></symbol>
+    <symbol id="i-move" viewBox="0 0 24 24"><path d="M5 9l-3 3 3 3M9 5l3-3 3 3M15 19l-3 3-3-3M19 15l3-3-3-3M2 12h20M12 2v20"/></symbol>
+    <symbol id="i-convert" viewBox="0 0 24 24"><path d="M4 7h13l-3-3M20 17H7l3 3"/><path d="M4 7l3 3M20 17l-3-3"/></symbol>
+    <symbol id="i-stats" viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></symbol>
+    <symbol id="i-warning" viewBox="0 0 24 24"><path d="M12 3l10 18H2z"/><path d="M12 9v5M12 17.5v.5"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z"/><circle cx="12" cy="12" r="2.5"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+    <symbol id="i-expand" viewBox="0 0 24 24"><path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5"/></symbol>
+    <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 7L4 12l5 5"/><path d="M4 12h9a6 6 0 0 1 0 12h-1"/></symbol>
+    <symbol id="i-filter" viewBox="0 0 24 24"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></symbol>
+    <symbol id="i-retry" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 6.3"/><path d="M20 4v7h-7"/></symbol>
+  </svg>
+
+  <!-- ============ 顶部栏 ============ -->
   <header class="topbar">
     <div class="brand">
-      <span class="brand-dot"></span>
-      <span class="brand-name">智能图床管理器</span>
-      <span class="brand-sub" id="repoLabel"></span>
+      <span class="brand-mark"><svg class="icon" aria-hidden="true"><use href="#i-image"></use></svg></span>
+      <span class="brand-text">
+        <span class="brand-name">智能图床管理器</span>
+        <span class="brand-sub" id="repoLabel"></span>
+      </span>
     </div>
-    <nav class="tabs" id="tabs">
-      <button class="tab active" data-view="upload">上传</button>
-      <button class="tab" data-view="library">图片库</button>
-      <button class="tab" data-view="stats">统计</button>
+    <nav class="tabs" id="tabs" aria-label="主视图">
+      <button class="tab active" data-view="upload" type="button">上传</button>
+      <button class="tab" data-view="library" type="button">图片库</button>
+      <button class="tab" data-view="stats" type="button">统计</button>
     </nav>
     <div class="topbar-right">
-      <!-- 链接类型切换：jsDelivr 主站 / 镜像 / GitHub Raw -->
-      <label class="link-switch" title="生成的访问链接类型">
-        <select id="linkType">
+      <label class="link-switch" title="复制/导出链接时使用的访问地址">
+        <span class="link-switch-label">链接</span>
+        <select id="linkType" aria-label="访问链接类型">
           <option value="jsdelivr">jsDelivr CDN</option>
           <option value="fastly">jsDelivr · Fastly 镜像</option>
           <option value="testingcf">jsDelivr · Cloudflare 镜像</option>
@@ -30,25 +66,36 @@
           <option value="raw">GitHub Raw</option>
         </select>
       </label>
-      <button class="btn ghost" id="btnSettings" title="质量 / 查重 / 上传上限等设置">⚙ 设置</button>
-      <button class="btn ghost" id="btnGitStatus">
-        同步状态 <span class="badge" id="gitCount">…</span>
+      <button class="btn ghost" id="btnSettings" type="button" title="质量 / 查重 / 上传上限等设置">
+        <svg class="icon" aria-hidden="true"><use href="#i-settings"></use></svg><span>设置</span>
       </button>
-      <button class="btn primary" id="btnGitSync">同步到 GitHub</button>
+      <button class="btn ghost" id="btnGitStatus" type="button" title="点击刷新同步状态">
+        <svg class="icon" aria-hidden="true"><use href="#i-sync"></use></svg>
+        <span>同步状态</span> <span class="badge" id="gitCount">…</span>
+      </button>
+      <button class="btn primary" id="btnGitSync" type="button">
+        <svg class="icon" aria-hidden="true"><use href="#i-sync"></use></svg><span id="gitSyncLabel">同步到 GitHub</span>
+      </button>
     </div>
   </header>
 
   <main class="main">
     <!-- ============ 视图一：上传 ============ -->
-    <section class="view active" id="view-upload">
+    <section class="view active" id="view-upload" aria-label="上传">
       <div class="upload-layout">
-        <!-- 左列：拖拽区 + 上传选项 -->
         <div class="col">
-          <div class="card dropzone" id="dropzone" tabindex="0" role="button" aria-label="点击或拖拽选择图片">
-            <div class="dz-icon">⇪</div>
-            <div class="dz-title">拖拽图片到此处，或点击选择</div>
-            <div class="dz-sub">支持 JPG / PNG / WebP / GIF / BMP / AVIF / HEIC（iPhone 照片自动转 JPG）· 单批最多 <b id="maxBatch"></b> 张</div>
+          <div class="card dropzone" id="dropzone" tabindex="0" role="button" aria-label="点击选择图片或拖拽文件到此处">
+            <div class="dz-icon"><svg class="icon lg" aria-hidden="true"><use href="#i-upload"></use></svg></div>
+            <div class="dz-title">拖拽图片或文件夹到此处</div>
+            <div class="dz-sub">支持 JPG / PNG / WebP / GIF / BMP / AVIF / HEIC（iPhone 照片自动转 JPG）<br>
+              单文件 ≤ <b id="maxFileMB">60</b> MB · 单批最多 <b id="maxBatch">500</b> 张</div>
+            <div class="dz-actions">
+              <button class="btn small primary" id="btnPickFiles" type="button">选择图片</button>
+              <button class="btn small ghost" id="btnPickFolder" type="button">选择文件夹</button>
+            </div>
             <input type="file" id="fileInput" multiple hidden
+                   accept="image/*,.jpg,.jpeg,.png,.webp,.gif,.bmp,.avif,.heic,.heif" />
+            <input type="file" id="folderInput" webkitdirectory directory multiple hidden
                    accept="image/*,.jpg,.jpeg,.png,.webp,.gif,.bmp,.avif,.heic,.heif" />
           </div>
 
@@ -68,7 +115,8 @@
               </label>
               <label class="opt" id="optThemeWrap" hidden>
                 <span class="opt-label">表情包主题（文件夹名）</span>
-                <input type="text" id="optTheme" placeholder="例如：辟浪" />
+                <input type="text" id="optTheme" list="themeList" placeholder="例如：辟浪（留空归入「默认」）" />
+                <datalist id="themeList"></datalist>
               </label>
               <label class="opt">
                 <span class="opt-label">格式转换</span>
@@ -81,8 +129,8 @@
                 </select>
               </label>
               <label class="opt">
-                <span class="opt-label">压缩质量 <b id="qualityVal">100</b></span>
-                <input type="range" id="optQuality" min="30" max="100" value="100" />
+                <span class="opt-label">压缩质量 <b id="qualityVal">95</b></span>
+                <input type="range" id="optQuality" min="30" max="100" value="95" />
               </label>
               <label class="opt">
                 <span class="opt-label">完全重复时</span>
@@ -99,190 +147,149 @@
           </div>
         </div>
 
-        <!-- 右列：上传队列 -->
         <div class="col wide">
           <div class="card queue">
             <h3 class="card-title">上传队列 <span class="muted" id="queueSummary"></span></h3>
-            <div class="queue-empty" id="queueEmpty">队列为空——选择或拖入图片后开始</div>
+            <div class="queue-progress" id="queueProgress" hidden>
+              <div class="progress-track"><div class="progress-fill" id="uploadProgressFill"></div></div>
+              <div class="progress-meta">
+                <span id="uploadProgressText">0 / 0</span>
+                <span id="uploadProgressStats"></span>
+              </div>
+            </div>
+            <div class="queue-empty" id="queueEmpty">队列为空——选择、拖入或粘贴图片后开始</div>
             <div class="queue-list" id="queueList"></div>
             <div class="queue-actions" id="queueActions" hidden>
-              <button class="btn primary" id="btnUpload">开始上传</button>
-              <button class="btn ghost" id="btnClearQueue">清空队列</button>
-              <button class="btn ghost" id="btnRetryFailed" hidden>重试失败项</button>
-              <button class="btn ghost" id="btnCopyBatch" hidden>复制本批全部链接</button>
+              <button class="btn primary" id="btnUpload" type="button">开始上传</button>
+              <button class="btn ghost" id="btnStop" type="button" hidden>停止</button>
+              <button class="btn ghost" id="btnClearQueue" type="button">清空队列</button>
+              <button class="btn ghost" id="btnRetryFailed" type="button" hidden>重试失败项</button>
+              <button class="btn ghost" id="btnCopyBatch" type="button" hidden>复制本批链接</button>
+              <span class="flex-sp"></span>
+              <label class="opt-check inline">
+                <input type="checkbox" id="optAutoSync" />
+                <span>完成后自动同步</span>
+              </label>
             </div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- ============ 视图二：图片库（左右布局：左侧目录树 + 右侧网格） ============ -->
-    <section class="view" id="view-library">
+    <!-- ============ 视图二：图片库 ============ -->
+    <section class="view" id="view-library" aria-label="图片库">
       <div class="lib-layout">
-        <!-- 左栏：实际文件夹结构树 -->
         <aside class="card lib-side">
-          <div class="lib-side-title">目录</div>
+          <div class="lib-side-head">
+            <span class="lib-side-title">目录</span>
+            <button class="icon-btn" id="btnTreeToggle" type="button" title="全部展开 / 收起">
+              <svg class="icon sm" aria-hidden="true"><use href="#i-expand"></use></svg>
+            </button>
+          </div>
           <div class="dir-tree" id="dirTree"></div>
         </aside>
 
-        <!-- 右栏：筛选工具条 + 图片网格 -->
         <div class="lib-main">
           <div class="card toolbar">
-            <div class="chips" id="catChips"></div>
-            <select id="fmtFilter" class="mini-select"><option value="all">全部格式</option></select>
-            <select id="sortSel" class="mini-select" title="排序方式">
-              <option value="numAsc">序号升序（横→竖→方→表情）</option>
-              <option value="numDesc">序号降序</option>
-              <option value="timeAsc">时间升序（最早优先）</option>
-              <option value="timeDesc">时间降序（最新优先）</option>
-              <option value="sizeDesc">体积降序（大图优先）</option>
-            </select>
-            <select id="sizeFilter" class="mini-select" title="按占用空间筛选">
-              <option value="0">全部大小</option>
-              <option value="1048576">≥ 1 MB</option>
-              <option value="5242880">≥ 5 MB</option>
-              <option value="10485760">≥ 10 MB</option>
-            </select>
-            <select id="widthFilter" class="mini-select" title="按像素宽度筛选">
-              <option value="0">全部宽度</option>
-              <option value="1920">≥ 1920 px</option>
-              <option value="2560">≥ 2560 px</option>
-              <option value="3840">≥ 3840 px</option>
-            </select>
-            <input type="search" id="searchBox" class="search" placeholder="搜索文件名…" />
-            <span class="muted" id="libCount"></span>
-            <span class="flex-sp"></span>
-            <button class="btn ghost" id="btnDupScan">查重扫描</button>
-            <button class="btn ghost" id="btnOrganize" title="编号规整 / 主题改名">整理…</button>
-            <button class="btn ghost" id="btnTrash">回收站</button>
+            <div class="toolbar-row">
+              <div class="chips" id="catChips"></div>
+              <span class="flex-sp"></span>
+              <button class="btn small ghost" id="btnSelectAllTop" type="button" title="全选当前筛选结果">全选</button>
+              <button class="btn small ghost" id="btnGroup" type="button" aria-pressed="false" title="按目录/主题分组显示">
+                <svg class="icon sm" aria-hidden="true"><use href="#i-grid"></use></svg><span>分组</span>
+              </button>
+              <button class="btn small ghost" id="btnViewMode" type="button" title="切换缩略图裁剪方式">
+                <svg class="icon sm" aria-hidden="true"><use href="#i-expand"></use></svg><span>完整显示</span>
+              </button>
+              <button class="btn ghost" id="btnDupScan" type="button">
+                <svg class="icon sm" aria-hidden="true"><use href="#i-search"></use></svg><span>查重扫描</span>
+              </button>
+              <button class="btn ghost" id="btnOrganize" type="button" title="编号规整 / 主题改名">
+                <svg class="icon sm" aria-hidden="true"><use href="#i-settings"></use></svg><span>整理…</span>
+              </button>
+              <button class="btn ghost" id="btnTrash" type="button">
+                <svg class="icon sm" aria-hidden="true"><use href="#i-trash"></use></svg><span>回收站</span>
+              </button>
+            </div>
+            <div class="toolbar-row">
+              <select id="fmtFilter" class="mini-select" aria-label="按格式筛选"><option value="all">全部格式</option></select>
+              <select id="sortSel" class="mini-select" aria-label="排序方式">
+                <option value="numAsc">序号升序（按目录/主题）</option>
+                <option value="numDesc">序号降序</option>
+                <option value="timeAsc">时间升序（最早优先）</option>
+                <option value="timeDesc">时间降序（最新优先）</option>
+                <option value="sizeDesc">体积降序（大图优先）</option>
+              </select>
+              <select id="sizeFilter" class="mini-select" aria-label="按占用空间筛选">
+                <option value="0">全部大小</option>
+                <option value="1048576">≥ 1 MB</option>
+                <option value="5242880">≥ 5 MB</option>
+                <option value="10485760">≥ 10 MB</option>
+              </select>
+              <select id="widthFilter" class="mini-select" aria-label="按像素宽度筛选">
+                <option value="0">全部宽度</option>
+                <option value="1920">≥ 1920 px</option>
+                <option value="2560">≥ 2560 px</option>
+                <option value="3840">≥ 3840 px</option>
+              </select>
+              <label class="search-wrap">
+                <svg class="icon sm" aria-hidden="true"><use href="#i-search"></use></svg>
+                <input type="search" id="searchBox" class="search" placeholder="搜索文件名或目录…" aria-label="搜索文件名或目录" />
+              </label>
+              <button class="btn small ghost" id="btnClearFilters" type="button" hidden>
+                <svg class="icon sm" aria-hidden="true"><use href="#i-close"></use></svg><span>清除筛选</span>
+              </button>
+              <span class="muted" id="libCount"></span>
+              <span class="flex-sp"></span>
+            </div>
           </div>
 
-          <div class="grid" id="libGrid"></div>
-          <div class="empty" id="libEmpty" hidden>没有符合条件的图片</div>
+          <div class="lib-hint muted" id="libHint">点击图片预览；勾选左上角复选框可多选，Shift 连续选择，Ctrl+A 全选</div>
+          <div class="lib-grid" id="libGrid" aria-live="polite"></div>
+          <div class="grid-more" id="libMore" hidden>
+            <button class="btn ghost" id="btnLoadMore" type="button">加载更多</button>
+          </div>
+          <div class="empty" id="libEmpty" hidden>
+            <div>没有符合条件的图片</div>
+            <button class="btn small ghost" id="btnEmptyClear" type="button">清除筛选</button>
+          </div>
         </div>
       </div>
 
       <!-- 多选浮动操作条 -->
-      <div class="bulkbar" id="bulkbar" hidden>
-        <span>已选 <b id="selCount">0</b> 张</span>
-        <select id="copyFmt" class="mini-select" title="复制格式">
+      <div class="bulkbar" id="bulkbar" hidden role="toolbar" aria-label="批量操作">
+        <span class="bulk-count">已选 <b id="selCount">0</b> 张</span>
+        <span class="bulk-divider"></span>
+        <select id="copyFmt" class="mini-select" aria-label="复制格式">
           <option value="txt">纯链接</option>
           <option value="markdown">Markdown</option>
           <option value="html">HTML</option>
           <option value="bbcode">BBCode</option>
         </select>
-        <button class="btn small primary" id="btnCopySel">复制链接</button>
-        <button class="btn small" id="btnExportSel">导出链接</button>
-        <button class="btn small" id="btnMoveSel">移动分类…</button>
-        <button class="btn small" id="btnConvertSel">格式转换</button>
-        <button class="btn small danger" id="btnTrashSel">移入回收站</button>
-        <button class="btn small ghost" id="btnSelAll">全选</button>
-        <button class="btn small ghost" id="btnSelNone">取消</button>
-      </div>
-
-      <!-- 查重结果面板 -->
-      <div class="modal" id="dupPanel" hidden>
-        <div class="modal-card">
-          <div class="modal-head">
-            <h3>重复图片检测结果 <span class="muted" id="dupMeta"></span></h3>
-            <button class="icon-btn" data-close="dupPanel">✕</button>
-          </div>
-          <div class="modal-body" id="dupBody"></div>
-        </div>
-      </div>
-
-      <!-- 回收站面板 -->
-      <div class="modal" id="trashPanel" hidden>
-        <div class="modal-card">
-          <div class="modal-head">
-            <h3>回收站（可恢复）</h3>
-            <span class="flex-sp"></span>
-            <button class="btn small ghost" id="btnTrashPurgeAll" title="不可恢复！清空全部批次">清空回收站</button>
-            <button class="icon-btn" data-close="trashPanel">✕</button>
-          </div>
-          <div class="modal-body" id="trashBody"></div>
-        </div>
-      </div>
-
-      <!-- 灯箱（大图预览，←/→ 切换，Esc 关闭） -->
-      <div class="lightbox" id="lightbox" hidden>
-        <button class="lb-nav lb-prev" id="lbPrev" title="上一张（←）">‹</button>
-        <figure class="lb-stage">
-          <img id="lbImg" alt="" />
-          <figcaption class="lb-cap">
-            <span id="lbTitle"></span>
-            <span class="muted" id="lbMeta"></span>
-            <span class="flex-sp"></span>
-            <button class="btn small" id="lbCopy">复制链接</button>
-            <button class="btn small danger" id="lbTrash">移入回收站</button>
-            <button class="icon-btn" id="lbClose" title="关闭（Esc）">✕</button>
-          </figcaption>
-        </figure>
-        <button class="lb-nav lb-next" id="lbNext" title="下一张（→）">›</button>
-      </div>
-
-      <!-- 设置面板 -->
-      <div class="modal" id="settingsPanel" hidden>
-        <div class="modal-card">
-          <div class="modal-head"><h3>设置</h3><button class="icon-btn" data-close="settingsPanel">✕</button></div>
-          <div class="modal-body" id="settingsBody">
-            <div class="opt-grid">
-              <label class="opt">
-                <span class="opt-label">默认压缩质量 <b id="setQualityVal"></b></span>
-                <input type="range" id="setQuality" min="30" max="100" />
-              </label>
-              <label class="opt">
-                <span class="opt-label">单批最多文件数</span>
-                <input type="number" id="setMaxBatch" min="1" max="1000" />
-              </label>
-              <label class="opt">
-                <span class="opt-label">单文件上限（MB）</span>
-                <input type="number" id="setMaxFileMB" min="1" max="500" />
-              </label>
-              <label class="opt">
-                <span class="opt-label">相似判定阈值（汉明距离，越小越严格）</span>
-                <input type="number" id="setHamming" min="0" max="20" />
-              </label>
-              <label class="opt">
-                <span class="opt-label">完全重复时</span>
-                <select id="setOnDup">
-                  <option value="skip">跳过</option>
-                  <option value="keep">仍然保留</option>
-                </select>
-              </label>
-              <label class="opt">
-                <span class="opt-label">默认链接格式</span>
-                <select id="setLinkFormat">
-                  <option value="jsdelivr">jsDelivr CDN</option>
-                  <option value="fastly">jsDelivr · Fastly 镜像</option>
-                  <option value="testingcf">jsDelivr · Cloudflare 镜像</option>
-                  <option value="gcore">jsDelivr · Gcore 镜像</option>
-                  <option value="raw">GitHub Raw</option>
-                </select>
-              </label>
-              <label class="opt opt-check">
-                <input type="checkbox" id="setPurgeCdn" />
-                <span>同步后主动刷新 jsDelivr 缓存（覆盖旧文件时有用，纯新增无意义）</span>
-              </label>
-            </div>
-            <div class="queue-actions">
-              <button class="btn primary" id="btnSaveSettings">保存设置</button>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- 整理面板（编号规整 / 主题改名） -->
-      <div class="modal" id="organizePanel" hidden>
-        <div class="modal-card">
-          <div class="modal-head"><h3>图库整理</h3><button class="icon-btn" data-close="organizePanel">✕</button></div>
-          <div class="modal-body" id="organizeBody"></div>
-        </div>
+        <button class="btn small primary" id="btnCopySel" type="button">
+          <svg class="icon sm" aria-hidden="true"><use href="#i-copy"></use></svg><span>复制</span>
+        </button>
+        <button class="btn small" id="btnExportSel" type="button">
+          <svg class="icon sm" aria-hidden="true"><use href="#i-download"></use></svg><span>导出</span>
+        </button>
+        <span class="bulk-divider"></span>
+        <button class="btn small" id="btnMoveSel" type="button">
+          <svg class="icon sm" aria-hidden="true"><use href="#i-move"></use></svg><span>移动分类</span>
+        </button>
+        <button class="btn small" id="btnConvertSel" type="button">
+          <svg class="icon sm" aria-hidden="true"><use href="#i-convert"></use></svg><span>格式转换</span>
+        </button>
+        <button class="btn small danger" id="btnTrashSel" type="button">
+          <svg class="icon sm" aria-hidden="true"><use href="#i-trash"></use></svg><span>移入回收站</span>
+        </button>
+        <span class="flex-sp"></span>
+        <button class="btn small ghost" id="btnSelAll" type="button">全选</button>
+        <button class="btn small ghost" id="btnSelNone" type="button">取消选择</button>
       </div>
     </section>
 
     <!-- ============ 视图三：统计 ============ -->
-    <section class="view" id="view-stats">
+    <section class="view" id="view-stats" aria-label="统计">
       <div class="stat-cards" id="statCards"></div>
       <div class="stat-layout">
         <div class="card">
@@ -295,24 +302,316 @@
         </div>
       </div>
       <div class="card">
-        <h3 class="card-title">近 12 个月新增</h3>
+        <h3 class="card-title">近 12 个月新增 <span class="muted">按文件修改时间统计</span></h3>
         <div class="bars" id="trendBars"></div>
       </div>
       <div class="stat-layout2">
         <div class="card">
-          <h3 class="card-title">分类明细</h3>
+          <h3 class="card-title">分类明细 <span class="muted">点击可筛选图片库</span></h3>
           <div id="catDetail"></div>
         </div>
         <div class="card">
-          <h3 class="card-title">最近更新</h3>
+          <h3 class="card-title">最近更新 <span class="muted">点击可查看大图</span></h3>
           <div id="recentList"></div>
         </div>
       </div>
     </section>
   </main>
 
-  <!-- 全局提示（toast） -->
-  <div class="toasts" id="toasts"></div>
+  <!-- 全页拖拽提示 -->
+  <div class="drop-overlay" id="dropOverlay" hidden>
+    <div class="drop-overlay-card">
+      <svg class="icon lg" aria-hidden="true"><use href="#i-upload"></use></svg>
+      <div>松开鼠标，把图片加入上传队列</div>
+    </div>
+  </div>
+
+  <!-- ============ 弹窗：查重 ============ -->
+  <div class="modal" id="dupPanel" hidden>
+    <div class="modal-card wide" role="dialog" aria-modal="true" aria-labelledby="dupTitle">
+      <div class="modal-head">
+        <h3 id="dupTitle">重复图片检测结果 <span class="muted" id="dupMeta"></span></h3>
+        <button class="icon-btn" data-close="dupPanel" type="button" aria-label="关闭">
+          <svg class="icon"><use href="#i-close"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body" id="dupBody"></div>
+    </div>
+  </div>
+
+  <!-- ============ 弹窗：回收站 ============ -->
+  <div class="modal" id="trashPanel" hidden>
+    <div class="modal-card wide" role="dialog" aria-modal="true" aria-labelledby="trashTitle">
+      <div class="modal-head">
+        <h3 id="trashTitle">回收站（可恢复）</h3>
+        <span class="muted" id="trashRetention"></span>
+        <span class="flex-sp"></span>
+        <button class="btn small danger" id="btnTrashPurgeAll" type="button" title="不可恢复，清空全部批次">清空回收站</button>
+        <button class="icon-btn" data-close="trashPanel" type="button" aria-label="关闭">
+          <svg class="icon"><use href="#i-close"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body" id="trashBody"></div>
+    </div>
+  </div>
+
+  <!-- ============ 弹窗：设置 ============ -->
+  <div class="modal" id="settingsPanel" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <div class="modal-head">
+        <h3 id="settingsTitle">设置</h3>
+        <button class="icon-btn" data-close="settingsPanel" type="button" aria-label="关闭">
+          <svg class="icon"><use href="#i-close"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="opt-grid">
+          <label class="opt">
+            <span class="opt-label">默认压缩质量 <b id="setQualityVal"></b></span>
+            <input type="range" id="setQuality" min="30" max="100" />
+          </label>
+          <label class="opt">
+            <span class="opt-label">单批最多文件数（1–1000）</span>
+            <input type="number" id="setMaxBatch" min="1" max="1000" />
+          </label>
+          <label class="opt">
+            <span class="opt-label">单文件上限（MB，1–500）</span>
+            <input type="number" id="setMaxFileMB" min="1" max="500" />
+          </label>
+          <label class="opt">
+            <span class="opt-label">相似判定阈值（汉明距离，0–20）</span>
+            <input type="number" id="setHamming" min="0" max="20" />
+          </label>
+          <label class="opt">
+            <span class="opt-label">完全重复时默认策略</span>
+            <select id="setOnDup">
+              <option value="skip">跳过</option>
+              <option value="keep">仍然保留</option>
+            </select>
+          </label>
+          <label class="opt">
+            <span class="opt-label">默认链接格式</span>
+            <select id="setLinkFormat">
+              <option value="jsdelivr">jsDelivr CDN</option>
+              <option value="fastly">jsDelivr · Fastly 镜像</option>
+              <option value="testingcf">jsDelivr · Cloudflare 镜像</option>
+              <option value="gcore">jsDelivr · Gcore 镜像</option>
+              <option value="raw">GitHub Raw</option>
+            </select>
+          </label>
+          <label class="opt opt-check">
+            <input type="checkbox" id="setPurgeCdn" />
+            <span>同步后主动刷新 jsDelivr 缓存（覆盖旧文件时有用，纯新增无意义）</span>
+          </label>
+        </div>
+        <div class="form-msg" id="settingsMsg" hidden></div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn ghost" data-close="settingsPanel" type="button">取消</button>
+        <button class="btn primary" id="btnSaveSettings" type="button">保存设置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 弹窗：整理 ============ -->
+  <div class="modal" id="organizePanel" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="organizeTitle">
+      <div class="modal-head">
+        <h3 id="organizeTitle">图库整理</h3>
+        <button class="icon-btn" data-close="organizePanel" type="button" aria-label="关闭">
+          <svg class="icon"><use href="#i-close"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body" id="organizeBody"></div>
+    </div>
+  </div>
+
+  <!-- ============ 弹窗：移动分类 ============ -->
+  <div class="modal" id="movePanel" hidden>
+    <div class="modal-card narrow" role="dialog" aria-modal="true" aria-labelledby="moveTitle">
+      <div class="modal-head">
+        <h3 id="moveTitle">移动分类</h3>
+        <button class="icon-btn" data-close="movePanel" type="button" aria-label="关闭">
+          <svg class="icon"><use href="#i-close"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <p class="muted" id="moveInfo"></p>
+        <div class="opt-grid">
+          <label class="opt">
+            <span class="opt-label">目标分类</span>
+            <select id="moveCategory">
+              <option value="heng">横图 heng</option>
+              <option value="shu">竖图 shu</option>
+              <option value="avatar">方形 avatar</option>
+              <option value="emoticon">表情包 emoticon</option>
+              <option value="temporary">临时 temporary</option>
+            </select>
+          </label>
+          <label class="opt" id="moveThemeWrap" hidden>
+            <span class="opt-label">表情包主题</span>
+            <input type="text" id="moveTheme" list="themeList" placeholder="例如：辟浪" />
+          </label>
+        </div>
+        <div class="callout" id="movePreview"></div>
+        <div class="callout warn">
+          <svg class="icon sm" aria-hidden="true"><use href="#i-warning"></use></svg>
+          移动后文件编号会重排，已发布的旧链接将失效。
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn ghost" data-close="movePanel" type="button">取消</button>
+        <button class="btn primary" id="btnMoveConfirm" type="button">移动</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 弹窗：格式转换 ============ -->
+  <div class="modal" id="convertPanel" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="convertTitle">
+      <div class="modal-head">
+        <h3 id="convertTitle">批量格式转换</h3>
+        <button class="icon-btn" data-close="convertPanel" type="button" aria-label="关闭">
+          <svg class="icon"><use href="#i-close"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <p class="muted" id="convertInfo"></p>
+        <div class="opt-grid">
+          <label class="opt">
+            <span class="opt-label">目标格式</span>
+            <select id="convertTarget">
+              <option value="jpg">JPG</option>
+              <option value="png">PNG</option>
+              <option value="webp" selected>WebP</option>
+              <option value="avif">AVIF</option>
+            </select>
+          </label>
+          <label class="opt">
+            <span class="opt-label">压缩质量 <b id="convertQualityVal">95</b></span>
+            <input type="range" id="convertQuality" min="30" max="100" value="95" />
+          </label>
+          <label class="opt opt-check">
+            <input type="checkbox" id="convertReplace" />
+            <span>转换后把原图移入回收站</span>
+          </label>
+          <label class="opt opt-check">
+            <input type="checkbox" id="convertAnimated" />
+            <span>允许动图只保留第一帧（默认跳过动图）</span>
+          </label>
+        </div>
+        <div class="queue-progress" id="convertProgress" hidden>
+          <div class="progress-track"><div class="progress-fill" id="convertProgressFill"></div></div>
+          <div class="progress-meta">
+            <span id="convertProgressText">0 / 0</span>
+            <span id="convertProgressStats"></span>
+          </div>
+        </div>
+        <div class="result-list" id="convertResults"></div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn ghost" data-close="convertPanel" type="button">关闭</button>
+        <button class="btn ghost" id="btnConvertStop" type="button" hidden>停止</button>
+        <button class="btn primary" id="btnConvertStart" type="button">开始转换</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 弹窗：导出链接 ============ -->
+  <div class="modal" id="exportPanel" hidden>
+    <div class="modal-card narrow" role="dialog" aria-modal="true" aria-labelledby="exportTitle">
+      <div class="modal-head">
+        <h3 id="exportTitle">导出链接</h3>
+        <button class="icon-btn" data-close="exportPanel" type="button" aria-label="关闭">
+          <svg class="icon"><use href="#i-close"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <p class="muted" id="exportInfo"></p>
+        <div class="opt-grid">
+          <label class="opt">
+            <span class="opt-label">文件格式</span>
+            <select id="exportFormat">
+              <option value="txt">纯链接（.txt）</option>
+              <option value="json">JSON（.json）</option>
+              <option value="csv">CSV（.csv，Excel 友好）</option>
+              <option value="markdown">Markdown（.md）</option>
+            </select>
+          </label>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn ghost" data-close="exportPanel" type="button">取消</button>
+        <button class="btn primary" id="btnExportConfirm" type="button">导出文件</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 通用：结果面板 ============ -->
+  <div class="modal" id="resultPanel" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="resultTitle">
+      <div class="modal-head">
+        <h3 id="resultTitle">操作结果</h3>
+        <button class="icon-btn" data-close="resultPanel" type="button" aria-label="关闭">
+          <svg class="icon"><use href="#i-close"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body" id="resultBody"></div>
+      <div class="modal-foot">
+        <button class="btn ghost" data-close="resultPanel" type="button">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 通用：确认面板 ============ -->
+  <div class="modal" id="confirmPanel" hidden>
+    <div class="modal-card narrow" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+      <div class="modal-head">
+        <h3 id="confirmTitle">确认操作</h3>
+        <button class="icon-btn" data-close="confirmPanel" type="button" aria-label="关闭">
+          <svg class="icon"><use href="#i-close"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body" id="confirmBody"></div>
+      <div class="modal-foot">
+        <button class="btn ghost" data-close="confirmPanel" type="button">取消</button>
+        <button class="btn danger" id="confirmOk" type="button">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 灯箱 ============ -->
+  <div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true" aria-label="图片预览">
+    <div class="lb-toolbar">
+      <span class="lb-counter" id="lbMeta"></span>
+      <span class="flex-sp"></span>
+      <button class="lb-btn" id="lbZoomOut" type="button" title="缩小（-）"><svg class="icon"><use href="#i-zoom-out"></use></svg></button>
+      <button class="lb-btn" id="lbZoomReset" type="button" title="恢复原始大小（0）">100%</button>
+      <button class="lb-btn" id="lbZoomIn" type="button" title="放大（+）"><svg class="icon"><use href="#i-zoom-in"></use></svg></button>
+      <button class="lb-btn" id="lbDownload" type="button" title="下载原图"><svg class="icon"><use href="#i-download"></use></svg></button>
+      <button class="lb-btn" id="lbOpen" type="button" title="在新标签打开原图"><svg class="icon"><use href="#i-external"></use></svg></button>
+      <button class="lb-btn" id="lbClose" type="button" title="关闭（Esc）"><svg class="icon"><use href="#i-close"></use></svg></button>
+    </div>
+    <button class="lb-nav lb-prev" id="lbPrev" type="button" title="上一张（←）">‹</button>
+    <div class="lb-stage" id="lbStage">
+      <img id="lbImg" alt="" draggable="false" />
+    </div>
+    <button class="lb-nav lb-next" id="lbNext" type="button" title="下一张（→）">›</button>
+    <div class="lb-cap">
+      <span class="lb-title" id="lbTitle"></span>
+      <span class="lb-path muted" id="lbPath"></span>
+      <span class="flex-sp"></span>
+      <button class="btn small" id="lbCopy" type="button">
+        <svg class="icon sm" aria-hidden="true"><use href="#i-copy"></use></svg><span>复制链接</span>
+      </button>
+      <button class="btn small danger" id="lbTrash" type="button">
+        <svg class="icon sm" aria-hidden="true"><use href="#i-trash"></use></svg><span>移入回收站</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- 全局提示 -->
+  <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
 
   <script src="app.js"></script>
 </body>

@@ -15,7 +15,14 @@
  * 产出（写入 --out 目录）：
  *  - <out>/manifest.json   清单，条目为 { path, size, width, height, hash, thumb, large? }
  *  - <out>/thumbs/<path>-<hash>.webp  缩略图（文件名带内容哈希，图库重排/换图不会复用旧文件）
- *  - <out>/large/<path>-<hash>.webp   可选高清预览图（传 --large-width 时生成，如 1600）
+ *  - <out>/thumbs/<path>-<hash>-anim.webp  动图缩略图（GIF/APNG 等多帧源，保留动画）
+ *  - <out>/large/<path>-<hash>.webp   可选高清预览图（传 --large-width 时生成，如 1600；
+ *                                      动图源不生成，灯箱回退原 GIF 以保留动画）
+ *
+ * 动图处理：
+ *   sharp 默认只读 GIF 第一帧，直接转 WebP 会“不动”。这里用 animated: true
+ *   读取所有帧并输出动态 WebP 作为网格缩略图；灯箱的 large 对动图留空，
+ *   前端会回退到原始 GIF，既保留动画也避免再生成一份大体积动态 large。
  *
  * 为什么变体文件名要带内容哈希：
  *   图库管理器会做“编号规整/去重后重排”，同一序号路径可能从 A 图换成 B 图。
@@ -141,6 +148,7 @@ export const buildGalleryAssets = async (options) => {
   let skipped = 0;
   let largeCreated = 0;
   let largeSkipped = 0;
+  let animatedCount = 0;
 
   // 队列式并发：避免一次性把 559 张图全部丢给 sharp 造成内存峰值
   const queue = [...files];
@@ -158,13 +166,20 @@ export const buildGalleryAssets = async (options) => {
         const buffer = readFileSync(srcFile);
         const hash = createHash('sha1').update(buffer).digest('hex').slice(0, 8);
         const extless = key.replace(/\.[^.]+$/, '');
-        const thumbKey = `thumbs/${extless}-${hash}.webp`;
-        const thumbFile = join(out, thumbKey);
 
-        // 读取原图真实宽高（清单里给前端用；超过 8000px 的横幅需放开像素上限）
+        // 读取原图真实宽高（清单里给前端用；超过 8000px 的横幅需放开像素上限）。
+        // 同时用 pages 判断是否多帧：GIF/APNG/动态 WebP 必须走 animated 管道，
+        // 否则 sharp 只取第一帧，转出来的 WebP 不会动。
         const meta = await sharp(buffer, { limitInputPixels: false }).metadata();
         const imgWidth = meta.width || 0;
         const imgHeight = meta.height || 0;
+        const isAnimated = (meta.pages ?? 1) > 1;
+        if (isAnimated) animatedCount += 1;
+
+        // 动图使用独立文件名，确保旧的静态首帧缩略图会被孤儿清理删除，
+        // 也避免 CDN 继续命中旧缓存。
+        const thumbKey = `thumbs/${extless}-${hash}${isAnimated ? '-anim' : ''}.webp`;
+        const thumbFile = join(out, thumbKey);
 
         // 内容哈希已在文件名里：文件存在就意味着内容一致，直接跳过编码
         let needBuild = true;
@@ -176,17 +191,20 @@ export const buildGalleryAssets = async (options) => {
         if (needBuild) {
           // 缩略图目录层级与原图一致，写入前必须递归创建父目录
           mkdirSync(dirname(thumbFile), { recursive: true });
-          // 等比缩放到目标宽度（不放大），统一转 WebP
-          await sharp(buffer, { limitInputPixels: false })
+          // 等比缩放到目标宽度（不放大），统一转 WebP。
+          // 动图必须传 animated: true，WebP 编码器才会写入全部帧和帧延迟。
+          await sharp(buffer, { limitInputPixels: false, animated: isAnimated })
             .resize({ width, withoutEnlargement: true })
             .webp({ quality, effort: 4 })
             .toFile(thumbFile);
           created++;
         }
 
-        // 可选：生成灯箱用的高清预览图，避免前端直接加载十几 MB 原图
+        // 可选：生成灯箱用的高清预览图，避免前端直接加载十几 MB 原图。
+        // 动图跳过：动态大图体积不可控，灯箱的 large 留空后前端会回退原 GIF，
+        // 动画仍然保留，且只在点开单张时下载。
         let largeKey;
-        if (largeEnabled) {
+        if (largeEnabled && !isAnimated) {
           largeKey = `large/${extless}-${hash}.webp`;
           const largeFile = join(out, largeKey);
           let needLarge = true;
@@ -212,6 +230,7 @@ export const buildGalleryAssets = async (options) => {
           hash,
           thumb: thumbKey,
           ...(largeKey ? { large: largeKey } : {}),
+          ...(isAnimated ? { animated: true } : {}),
         });
 
         if ((created + skipped) % 50 === 0) {
@@ -241,6 +260,9 @@ export const buildGalleryAssets = async (options) => {
 
   console.log(`✔ 清单已写入：${join(out, 'manifest.json')}（${images.length} 张）`);
   console.log(`✔ 缩略图：新建 ${created} 张，跳过（已是最新）${skipped} 张，清理孤儿 ${orphanRemoved} 张`);
+  if (animatedCount > 0) {
+    console.log(`✔ 动图缩略图：${animatedCount} 张（动态 WebP；灯箱回退原 GIF）`);
+  }
   if (largeEnabled) {
     console.log(`✔ 高清预览图：新建 ${largeCreated} 张，跳过 ${largeSkipped} 张，清理孤儿 ${largeOrphanRemoved} 张`);
   }

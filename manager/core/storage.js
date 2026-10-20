@@ -15,6 +15,12 @@ const path = require('path');
 const sharp = require('sharp');
 const classify = require('./classify');
 
+/** 展示/筛选统一格式别名：jpeg 归并为 jpg（现有图库两者并存，分开统计会误导） */
+function normalizeFormat(ext) {
+  const e = String(ext || '').toLowerCase();
+  return e === 'jpeg' ? 'jpg' : e;
+}
+
 /** 从相对路径推断分类（与 classify.categoryDir 的目录约定一一对应） */
 function categoryOf(relPath, cfg) {
   const c = cfg.classify;
@@ -41,7 +47,8 @@ function listImages(index, cfg, filters = {}) {
     const cat = categoryOf(rel, cfg);
     if (filters.category && filters.category !== 'all' && cat !== filters.category) continue;
     const ext = path.extname(rel).slice(1).toLowerCase();
-    if (filters.format && filters.format !== 'all' && ext !== filters.format.toLowerCase()) continue;
+    const fmt = normalizeFormat(ext);
+    if (filters.format && filters.format !== 'all' && fmt !== normalizeFormat(filters.format)) continue;
     if (filters.q) {
       const kw = String(filters.q).toLowerCase();
       const base = path.basename(rel).toLowerCase();
@@ -52,7 +59,7 @@ function listImages(index, cfg, filters = {}) {
     rows.push({
       rel,
       category: cat,
-      format: ext,
+      format: fmt,
       name: path.basename(rel),
       w: it.w, h: it.h,
       size: it.size,
@@ -88,9 +95,23 @@ function buildStats(index, cfg) {
   const capMain = Math.pow(10, cfg.naming.padding) - 1;    // 主图编号上限 9999
   const capEmo = Math.pow(10, cfg.naming.emoticonPadding) - 1; // 表情包上限 999
 
+  // 近 12 个月新增趋势（按文件修改时间聚合；在服务端算，避免前端依赖图片列表是否已加载）
+  const now = new Date();
+  const monthly = [];
+  for (let i = 11; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    monthly.push({
+      key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`,
+      label: `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}`,
+      count: 0,
+      size: 0
+    });
+  }
+  const monthMap = new Map(monthly.map((m) => [m.key, m]));
+
   for (const [rel, it] of Object.entries(index.items)) {
     const cat = categoryOf(rel, cfg);
-    const ext = path.extname(rel).slice(1).toLowerCase();
+    const ext = normalizeFormat(path.extname(rel).slice(1).toLowerCase());
 
     if (!byCategory[cat]) byCategory[cat] = { count: 0, size: 0, maxNumber: 0 };
     byCategory[cat].count += 1;
@@ -111,6 +132,11 @@ function buildStats(index, cfg) {
     total.size += it.size;
 
     latest.push({ rel, category: cat, mtime: it.mtime, size: it.size });
+
+    const md = new Date(it.mtime);
+    const mk = `${md.getFullYear()}-${String(md.getMonth() + 1).padStart(2, '0')}`;
+    const bucket = monthMap.get(mk);
+    if (bucket) { bucket.count += 1; bucket.size += it.size; }
   }
 
   // 附加编号上限与进度
@@ -127,6 +153,7 @@ function buildStats(index, cfg) {
     total: { ...total, sizeText: humanSize(total.size) },
     byCategory,
     byFormat,
+    monthly: monthly.map((m) => ({ ...m, sizeText: humanSize(m.size) })),
     latest,
     categoryCount: Object.keys(byCategory).length,
     generatedAt: Date.now()
@@ -449,4 +476,4 @@ async function dirSize(dir) {
   return total;
 }
 
-module.exports = { listImages, buildStats, makeThumbnail, makeTrashThumbnail, cleanThumbCache, categoryOf, humanSize, moveToTrash, listTrash, restoreFromTrash, restoreBatch, purgeTrash, cleanExpiredTrash };
+module.exports = { listImages, buildStats, makeThumbnail, makeTrashThumbnail, cleanThumbCache, categoryOf, humanSize, moveToTrash, listTrash, restoreFromTrash, restoreBatch, purgeTrash, cleanExpiredTrash, normalizeFormat, TRASH_RETENTION_MS };

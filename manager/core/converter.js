@@ -170,7 +170,8 @@ async function processImage(inputBuffer, opts = {}) {
       height: meta.height,
       animated,
       converted: false,
-      notice: '动图已保留原格式（转静态格式仅会保留第一帧）'
+      skipped: true, // 调用方据此跳过落盘，避免"转换"出一份同格式副本
+      notice: '动图已保留原格式（转静态格式仅会保留第一帧），本次未转换'
     };
   }
   // heic 输入：sharp 无法直接解码，先经 heic-convert 落到 JPEG 再编码

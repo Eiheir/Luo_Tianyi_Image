@@ -78,7 +78,9 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
         result.rel = dup.exact[0];
         result.assignedName = path.basename(result.rel);
         result.category = storage.categoryOf(result.rel, cfg);
-        result.url = buildLink(cfg, result.rel, cfg.linkFormat);
+        result.url = buildLink(cfg, result.rel, opts.linkType || cfg.linkFormat);
+        const existing = index.items[result.rel];
+        result.mtime = existing ? existing.mtime : 0;
         result.error = `与库内 ${result.assignedName} 完全相同，已按策略跳过`;
         return result;
       }
@@ -122,7 +124,8 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
     result.rel = rel;
     result.assignedName = allocated.fileName;
     result.size = st.size;
-    result.url = buildLink(cfg, rel, cfg.linkFormat);
+    result.mtime = st.mtimeMs;
+    result.url = buildLink(cfg, rel, opts.linkType || cfg.linkFormat);
     result.status = 'ok';
     dedup.setIndexItem(index, rel, {
       mtime: st.mtimeMs, size: st.size, w: processed.width, h: processed.height, md5, dhash
