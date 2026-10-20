@@ -1,0 +1,23 @@
+# 静态资产响应头（Workers Assets 原生支持 _headers 规则，最多 100 条）
+#
+# manifest.json：浏览器端画廊跨域拉取清单，必须带 CORS 头；
+# 短缓存让部署新版本后新图尽快可见
+/manifest.json
+  Access-Control-Allow-Origin: *
+  Access-Control-Allow-Methods: GET, HEAD, OPTIONS
+  Cache-Control: public, max-age=120
+
+# 图片：不可变资源，边缘/浏览器各缓存 1 天
+/LTYpicture/*
+  Access-Control-Allow-Origin: *
+  Cache-Control: public, max-age=86400
+
+# 缩略图：由 build-manifest.mjs 生成、内容随原图变化，可长缓存（7 天）
+/thumbs/*
+  Access-Control-Allow-Origin: *
+  Cache-Control: public, max-age=604800
+
+# 高清预览图（可选，--large-width 生成）：灯箱使用，内容随原图变化，长缓存
+/large/*
+  Access-Control-Allow-Origin: *
+  Cache-Control: public, max-age=604800

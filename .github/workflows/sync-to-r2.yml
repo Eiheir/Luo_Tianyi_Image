@@ -5,14 +5,17 @@ name: Deploy images to Workers
 # 只处理 LTYpicture/** 下的图片文件；manager/（图床管理软件）、README、
 # config.json 等仓库代码不参与部署。
 #
-# Worker 骨架（wrangler.toml + src/index.js）维护在博客仓库
-# XinChengP/OxygenBlogPlatform 的 cloudflare/gallery-assets/，
-# 本工作流每次部署时拉取最新骨架，单一事实来源。
+# Worker 配置（wrangler.toml）维护在博客仓库 XinChengP/OxygenBlogPlatform 的
+# cloudflare/gallery-assets/，本工作流每次部署时拉取，单一事实来源。
+#
+# 缩略图/高清预览图构建脚本与 _headers 在 scripts/gallery-assets/ 留了一份
+# CI 副本：博客仓库的 assets/ 被 gitignore（_headers 无法进入 CI 检出），
+# 且 Action 需要固定的 --large-width 行为，不能依赖博客仓库工作区的未提交改动。
+# 博客仓库的 cloudflare/gallery-assets/build-manifest.mjs 变更后，请同步本副本。
 #
 # 首次启用前需在仓库 Settings → Secrets and variables → Actions 配置：
 #   CLOUDFLARE_API_TOKEN  : API Token（模板 "Edit Cloudflare Workers"，限定本账号/zone）
 #   CLOUDFLARE_ACCOUNT_ID : Cloudflare 账号 ID（仪表盘右栏）
-#   BLOG_REPO_TOKEN（可选）: 默认 GITHUB_TOKEN 即可读公开仓库；博客仓库转私后才需要
 
 on:
   push:
@@ -32,12 +35,18 @@ jobs:
       - name: Checkout image repo
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install sharp
+        # build-manifest.mjs 生成缩略图/高清预览图依赖 sharp
+        run: npm install --no-save --no-package-lock sharp
+
       - name: Fetch worker skeleton from blog repo
-        # 拉取博客仓库里的 Worker 骨架（wrangler.toml + 部署辅助脚本）。
-        # GitHub API 的 tarball 接口不支持按子目录过滤（返回整仓库归档），
-        # 直接用稀疏检出只取 cloudflare/gallery-assets/。
-        # 注：首跑（2026-10-17）失败是因为当时博客仓库尚未推入该目录，
-        # 时序问题而非脚本问题；骨架目录缺失时这里会明确报错提示。
+        # 拉取博客仓库里的 Worker 配置；GitHub API 的 tarball 接口不支持按子目录
+        # 过滤，直接用稀疏检出只取 cloudflare/gallery-assets/。
         run: |
           mkdir -p worker
           git clone --depth 1 --filter=blob:none --sparse \
@@ -51,30 +60,48 @@ jobs:
           rm -rf blog-repo
           ls -la worker/
 
-      - name: Generate manifest and stage assets
-        # 从 checkout 的 LTYpicture 目录生成图片清单（画廊浏览器端数据源），
-        # 并把图片平铺进 Worker 的 assets 目录
+      - name: Generate thumbs, large previews and manifest
+        # 原图平铺进 Worker assets，再用 build-manifest.mjs 生成：
+        #   thumbs/**  640 宽 WebP（网格卡片）
+        #   large/**   1600 宽 WebP（灯箱高清，避免直接拉十几 MB 原图）
+        #   manifest.json（含 path/size/width/height/thumb/large）
+        #
+        # 优先使用博客骨架里的脚本/_headers（单一事实来源）；骨架版本还不支持
+        # --large-width 或缺少 _headers 时，退回本仓库 scripts/gallery-assets/ 的副本。
         run: |
-          mkdir -p worker/assets
+          BUILD_SCRIPT=scripts/gallery-assets/build-manifest.mjs
+          if grep -q -- '--large-width' worker/build-manifest.mjs 2>/dev/null; then
+            BUILD_SCRIPT=worker/build-manifest.mjs
+            echo "使用博客仓库骨架中的 build-manifest.mjs"
+          else
+            echo "博客骨架版本不支持 --large-width，使用本仓库 CI 副本"
+          fi
+
+          mkdir -p worker/assets/LTYpicture
+          cp -r LTYpicture/. worker/assets/LTYpicture/
+          node "$BUILD_SCRIPT" \
+            --root worker/assets \
+            --out worker/assets \
+            --large-width 1600
+
+          if [ ! -f worker/assets/_headers ] || ! grep -q '/large/' worker/assets/_headers; then
+            cp scripts/gallery-assets/_headers worker/assets/_headers
+          fi
+
+      - name: Validate manifest completeness
+        # 画廊卡片只认 thumb，灯箱优先 large；缺字段会让前端退回原图，这里直接拦下
+        run: |
           node -e '
-            const fs = require("fs"), path = require("path");
-            const exts = [".jpg",".jpeg",".png",".gif",".webp",".avif"];
-            const images = [];
-            const walk = (dir) => {
-              for (const name of fs.readdirSync(dir)) {
-                const full = path.join(dir, name);
-                if (fs.statSync(full).isDirectory()) walk(full);
-                else if (exts.includes(path.extname(name).toLowerCase()))
-                  images.push({ path: "LTYpicture/" + path.relative("LTYpicture", full).split(path.sep).join("/"), size: fs.statSync(full).size });
-              }
-            };
-            walk("LTYpicture");
-            fs.writeFileSync("worker/assets/manifest.json", JSON.stringify({
-              generatedAt: new Date().toISOString(), count: images.length, images
-            }));
-            console.log("manifest:", images.length, "images");
+            const m = require("./worker/assets/manifest.json");
+            const noThumb = m.images.filter((x) => !x.thumb).length;
+            const noLarge = m.images.filter((x) => !x.large).length;
+            const noSize = m.images.filter((x) => !x.width || !x.height).length;
+            console.log({ count: m.count, noThumb, noLarge, noSize });
+            if (!m.count || noThumb || noLarge || noSize) {
+              console.error("manifest 字段不完整，中止部署");
+              process.exit(1);
+            }
           '
-          cp -r LTYpicture worker/assets/LTYpicture
 
       - name: Deploy Worker with assets
         # wrangler-action@v3 在部分环境下 npx 拉包需要交互确认，改为显式安装后直接调用
