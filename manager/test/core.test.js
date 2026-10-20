@@ -596,3 +596,38 @@ test('忽略：pruneIgnorePairs 清理索引中已失效的路径', async () => 
     await fsp.rm(root, { recursive: true, force: true });
   }
 });
+
+test('organize：去重保留图自动压缩到组内最小序号，目标被占用时保持原名', async () => {
+  const { root, cfg, index } = await makeOrgEnv();
+  try {
+    const dir = path.join(cfg._paths.imageRoot, 'wallpapers&illustration', 'heng');
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, '0007.png'), 'keep');
+
+    const group = [
+      'wallpapers&illustration/heng/0003.jpg',
+      'wallpapers&illustration/heng/0007.png',
+      'wallpapers&illustration/heng/0011.jpg',
+    ];
+    dedup.setIndexItem(index, group[1], { mtime: 1, size: 4, w: 100, h: 100, md5: 'm', dhash: 'd' });
+
+    const r = await organize.compactKeptSequence(cfg, index, group, group[1]);
+    assert.strictEqual(r.renamed, true);
+    assert.strictEqual(r.keptRel, 'wallpapers&illustration/heng/0003.png');
+    assert.ok(await fsp.stat(path.join(dir, '0003.png')).then(() => true, () => false));
+    assert.ok(index.items['wallpapers&illustration/heng/0003.png'], '索引应更新到新序号');
+    assert.strictEqual(index.items[group[1]], undefined, '旧序号索引应移除');
+
+    // 目标序号被同目录其他文件占用：不覆盖、保持原名
+    await fsp.writeFile(path.join(dir, '0007.png'), 'keep2');
+    await fsp.writeFile(path.join(dir, '0003.png'), 'occupied');
+    const index2 = { version: 1, items: {} };
+    dedup.setIndexItem(index2, group[1], { mtime: 1, size: 4, w: 100, h: 100, md5: 'm', dhash: 'd' });
+    const blocked = await organize.compactKeptSequence(cfg, index2, group, group[1]);
+    assert.strictEqual(blocked.renamed, false);
+    assert.strictEqual(blocked.reason, 'target-occupied');
+    assert.ok(await fsp.stat(path.join(dir, '0007.png')).then(() => true, () => false));
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});

@@ -13,9 +13,15 @@
  *     → 本脚本用 sharp 读出真实宽高写进清单，前端首帧即可算出正确比例，零重排。
  *
  * 产出（写入 --out 目录）：
- *  - <out>/manifest.json   清单，条目为 { path, size, width, height, thumb, large? }
- *  - <out>/thumbs/<path>.webp  缩略图（相对路径与图片一一对应，扩展名统一 .webp）
- *  - <out>/large/<path>.webp   可选高清预览图（传 --large-width 时生成，如 1600）
+ *  - <out>/manifest.json   清单，条目为 { path, size, width, height, hash, thumb, large? }
+ *  - <out>/thumbs/<path>-<hash>.webp  缩略图（文件名带内容哈希，图库重排/换图不会复用旧文件）
+ *  - <out>/large/<path>-<hash>.webp   可选高清预览图（传 --large-width 时生成，如 1600）
+ *
+ * 为什么变体文件名要带内容哈希：
+ *   图库管理器会做“编号规整/去重后重排”，同一序号路径可能从 A 图换成 B 图。
+ *   旧实现按 mtime 跳过已有缩略图，且 CDN 对固定路径缓存 7 天，
+ *   会导致网格缩略图仍是 A、灯箱原图已是 B 的错位。文件名带源内容哈希后，
+ *   换图必然产生新 URL，旧变体由孤儿清理删除，缓存天然失效。
  *
  * 用法：
  *  node build-manifest.mjs --root <含图片前缀目录的根目录> --out <资产输出目录>
@@ -29,7 +35,8 @@
  * 依赖：sharp（本机复用博客项目 node_modules；CI 中需 npm install sharp）
  */
 
-import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, unlinkSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join, dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -145,30 +152,32 @@ export const buildGalleryAssets = async (options) => {
 
         // 清单 key：相对 root 的路径（统一为 / 分隔），与部署后的访问路径一致
         const key = relative(root, srcFile).split('\\').join('/');
-        // 缩略图相对路径：thumbs/ + 原路径去掉扩展名 + .webp
-        const thumbKey = `thumbs/${key.replace(/\.[^.]+$/, '.webp')}`;
-        // 缩略图写入输出目录（本机部署场景 out === root，本地图片与缩略图同目录）
+        // 读一次源文件，同时用于内容指纹和 sharp 编码。
+        // 文件名带内容哈希：图库“整体 -1”重排后，同一序号路径换了图，
+        // 也不会复用/命中旧缩略图，彻底避免“缩略图与灯箱原图对不上”。
+        const buffer = readFileSync(srcFile);
+        const hash = createHash('sha1').update(buffer).digest('hex').slice(0, 8);
+        const extless = key.replace(/\.[^.]+$/, '');
+        const thumbKey = `thumbs/${extless}-${hash}.webp`;
         const thumbFile = join(out, thumbKey);
 
         // 读取原图真实宽高（清单里给前端用；超过 8000px 的横幅需放开像素上限）
-        const meta = await sharp(srcFile, { limitInputPixels: false }).metadata();
+        const meta = await sharp(buffer, { limitInputPixels: false }).metadata();
         const imgWidth = meta.width || 0;
         const imgHeight = meta.height || 0;
 
-        // 增量策略：缩略图已存在且比原图新 → 跳过，省去重复编码开销
+        // 内容哈希已在文件名里：文件存在就意味着内容一致，直接跳过编码
         let needBuild = true;
         if (existsSync(thumbFile)) {
-          if (statSync(thumbFile).mtimeMs >= statSync(srcFile).mtimeMs) {
-            needBuild = false;
-            skipped++;
-          }
+          needBuild = false;
+          skipped++;
         }
 
         if (needBuild) {
           // 缩略图目录层级与原图一致，写入前必须递归创建父目录
           mkdirSync(dirname(thumbFile), { recursive: true });
           // 等比缩放到目标宽度（不放大），统一转 WebP
-          await sharp(srcFile, { limitInputPixels: false })
+          await sharp(buffer, { limitInputPixels: false })
             .resize({ width, withoutEnlargement: true })
             .webp({ quality, effort: 4 })
             .toFile(thumbFile);
@@ -178,18 +187,16 @@ export const buildGalleryAssets = async (options) => {
         // 可选：生成灯箱用的高清预览图，避免前端直接加载十几 MB 原图
         let largeKey;
         if (largeEnabled) {
-          largeKey = `large/${key.replace(/\.[^.]+$/, '.webp')}`;
+          largeKey = `large/${extless}-${hash}.webp`;
           const largeFile = join(out, largeKey);
           let needLarge = true;
           if (existsSync(largeFile)) {
-            if (statSync(largeFile).mtimeMs >= statSync(srcFile).mtimeMs) {
-              needLarge = false;
-              largeSkipped++;
-            }
+            needLarge = false;
+            largeSkipped++;
           }
           if (needLarge) {
             mkdirSync(dirname(largeFile), { recursive: true });
-            await sharp(srcFile, { limitInputPixels: false })
+            await sharp(buffer, { limitInputPixels: false })
               .resize({ width: largeWidth, withoutEnlargement: true })
               .webp({ quality: Math.max(quality, 78), effort: 4 })
               .toFile(largeFile);
@@ -202,6 +209,7 @@ export const buildGalleryAssets = async (options) => {
           size: statSync(srcFile).size,
           width: imgWidth,
           height: imgHeight,
+          hash,
           thumb: thumbKey,
           ...(largeKey ? { large: largeKey } : {}),
         });
@@ -218,9 +226,9 @@ export const buildGalleryAssets = async (options) => {
 
   // 清理孤儿缩略图：原图被删除或改名后，对应的 .webp 会滞留在 thumbs 目录里，
   // 既不会被清单引用，又会白白占用部署体积（Workers 每版本有文件数上限）
-  const orphanRemoved = removeOrphanVariants(thumbsDir, images);
+  const orphanRemoved = removeOrphanVariants(thumbsDir, images, 'thumb');
   const largeOrphanRemoved = largeEnabled
-    ? removeOrphanVariants(largeDir, images)
+    ? removeOrphanVariants(largeDir, images, 'large')
     : 0;
 
   const manifest = {
@@ -241,21 +249,27 @@ export const buildGalleryAssets = async (options) => {
 };
 
 /**
- * 删除没有对应原图的孤儿缩略图 / 高清预览图
+ * 删除没有被当前 manifest 引用的孤儿缩略图 / 高清预览图
  *
- * 判定方式：变体相对路径去掉 `.webp` 后缀后得到「无扩展名的资源基名」，
- * 与清单里原图路径去掉扩展名后的基名做精确比对（如 001.jpg 与 001.png 都对应 001.webp），
- * 基名不在清单里即视为孤儿并删除。
+ * 变体文件名现在是 `<原路径去扩展名>-<内容哈希>.webp`，因此直接按
+ * manifest 里的 `thumb` / `large` 相对路径做集合比对即可；路径换了或内容
+ * 变了都会产生新文件名，旧文件在这里清理，不会继续占用 Worker 文件数。
  *
  * @param variantsDir - thumbs/ 或 large/ 目录
- * @param images - 已构建的清单条目（含原图相对路径）
+ * @param images - 已构建的清单条目
+ * @param {'thumb'|'large'} field - 对应字段
  * @returns 删除的文件数量
  */
-const removeOrphanVariants = (variantsDir, images) => {
+const removeOrphanVariants = (variantsDir, images, field) => {
   if (!existsSync(variantsDir)) return 0;
 
-  // 有效基名集合：把清单里的原图路径去掉扩展名
-  const validBaseNames = new Set(images.map(item => item.path.replace(/\.[^.]+$/, '')));
+  const prefix = field === 'thumb' ? 'thumbs/' : 'large/';
+  const valid = new Set(
+    images
+      .map(item => item[field])
+      .filter(Boolean)
+      .map(value => value.slice(prefix.length))
+  );
 
   let removed = 0;
   const walkVariants = (dir) => {
@@ -267,12 +281,8 @@ const removeOrphanVariants = (variantsDir, images) => {
       }
       if (!name.toLowerCase().endsWith('.webp')) continue;
 
-      // 相对变体目录的路径 → 拼回资源基名（与清单 path 同构，便于比对）
-      const baseName = relative(variantsDir, full)
-        .split('\\')
-        .join('/')
-        .replace(/\.webp$/i, '');
-      if (!validBaseNames.has(baseName)) {
+      const rel = relative(variantsDir, full).split('\\').join('/');
+      if (!valid.has(rel)) {
         unlinkSync(full);
         removed++;
       }

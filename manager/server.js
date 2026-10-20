@@ -394,6 +394,40 @@ app.post('/api/trash', wrap(async (req, res) => {
 
 app.get('/api/trash', wrap(async (req, res) => ok(res, await storage.listTrash(cfg))));
 
+/* ---------- 查重清理：保留最高清 + 序号压到组内最小值 ---------- */
+
+app.post('/api/duplicates/keep-best', wrap(async (req, res) => {
+  const { group, keep } = req.body || {};
+  if (!Array.isArray(group) || group.length < 2 || !keep || !group.includes(keep)) {
+    return fail(res, 400, '参数不完整：需要 group 数组和其中的 keep');
+  }
+  for (const rel of group) {
+    if (!safeJoinImage(cfg, rel)) return fail(res, 400, `非法路径：${rel}`);
+  }
+  if (!index.items[keep]) return fail(res, 400, '保留的图片不在索引中');
+
+  // 先把同组其他图片移入回收站
+  const result = await storage.moveToTrash(cfg, group.filter((rel) => rel !== keep));
+  const failed = result.moved.filter((m) => m.error);
+  for (const m of result.moved) {
+    if (!m.error) dedup.deleteIndexItem(index, m.rel);
+  }
+
+  // 全部移入成功才改名；否则保留图仍留在原序号，避免半成功状态
+  let compact = { keptRel: keep, renamed: false, reason: 'trash-failed' };
+  if (failed.length === 0) {
+    try {
+      compact = await organize.compactKeptSequence(cfg, index, group, keep);
+    } catch (e) {
+      compact = { keptRel: keep, renamed: false, reason: e.message };
+    }
+  }
+
+  await dedup.saveIndex(cfg, index);
+  await dedup.pruneIgnorePairs(cfg, index);
+  ok(res, { trash: result, compact });
+}));
+
 // 回收站条目缩略图（恢复前预览）
 app.get('/api/trash/thumb', wrap(async (req, res) => {
   const batchId = String(req.query.b || '');

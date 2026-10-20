@@ -201,4 +201,70 @@ async function renameTheme(cfg, index, oldTheme, newTheme) {
   return { oldRel: `${cfg.classify.emoticonDir}/${safeOld}`, newRel: `${cfg.classify.emoticonDir}/${safeNew}`, count: movedNames.length, movedNames };
 }
 
-module.exports = { moveImages, renumberDirectory, renameTheme };
+/**
+ * 去重清理后把保留下来的图片序号压缩到组内最小序号。
+ *
+ * 只处理“与保留图同目录”的组内图片：不同目录的编号彼此独立，跨目录比大小没有意义。
+ * 例如 heng 目录相似组 0003/0007/0011，保留 0007，其余移入回收站后，
+ * 0007 会改名为 0003（最小序号）；若 0003 已被同目录非组内文件占用，则不改名并说明原因。
+ *
+ * @param {object} cfg
+ * @param {object} index 内存索引（本函数只改内存，调用方负责 saveIndex）
+ * @param {string[]} groupRels 相似/重复组的全部相对路径
+ * @param {string} keepRel 保留图片的相对路径
+ * @returns {{oldRel?:string, keptRel:string, renamed:boolean, reason:string}}
+ */
+async function compactKeptSequence(cfg, index, groupRels, keepRel) {
+  const keepDir = path.posix.dirname(keepRel);
+  const sameDir = groupRels.filter((rel) => path.posix.dirname(rel) === keepDir);
+  if (sameDir.length < 2) {
+    return { keptRel: keepRel, renamed: false, reason: 'no-same-dir-group' };
+  }
+
+  const baseNameOf = (rel) => path.posix.basename(rel, path.posix.extname(rel));
+  const numberOf = (rel) => {
+    const base = baseNameOf(rel);
+    return /^\d+$/.test(base) ? parseInt(base, 10) : null;
+  };
+
+  const keepNo = numberOf(keepRel);
+  if (keepNo === null) {
+    return { keptRel: keepRel, renamed: false, reason: 'keep-not-numbered' };
+  }
+
+  const numbers = sameDir.map(numberOf).filter((n) => Number.isFinite(n));
+  if (numbers.length === 0) {
+    return { keptRel: keepRel, renamed: false, reason: 'group-not-numbered' };
+  }
+
+  const minNo = Math.min(...numbers);
+  if (keepNo <= minNo) {
+    return { keptRel: keepRel, renamed: false, reason: 'already-min' };
+  }
+
+  const padding = keepDir.startsWith(`${cfg.classify.emoticonDir}/`)
+    ? cfg.naming.emoticonPadding
+    : cfg.naming.padding;
+  const ext = path.posix.extname(keepRel).slice(1).toLowerCase();
+  const targetName = `${String(minNo).padStart(padding, '0')}.${ext}`;
+  const targetRel = `${keepDir}/${targetName}`;
+  const keepAbs = path.join(cfg._paths.imageRoot, keepRel.replace(/\//g, path.sep));
+  const targetAbs = path.join(cfg._paths.imageRoot, targetRel.replace(/\//g, path.sep));
+
+  // 目标序号可能被同目录、不同扩展名的非组内文件占用；不覆盖，直接放弃改名
+  if (await fsp.stat(targetAbs).then(() => true, () => false)) {
+    return { keptRel: keepRel, renamed: false, reason: 'target-occupied' };
+  }
+
+  await fsp.rename(keepAbs, targetAbs);
+  const st = await fsp.stat(targetAbs);
+  const item = index.items[keepRel];
+  if (item) {
+    dedup.deleteIndexItem(index, keepRel);
+    dedup.setIndexItem(index, targetRel, { ...item, mtime: st.mtimeMs });
+  }
+
+  return { oldRel: keepRel, keptRel: targetRel, renamed: true, reason: '' };
+}
+
+module.exports = { moveImages, renumberDirectory, renameTheme, compactKeptSequence };

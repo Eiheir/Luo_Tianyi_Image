@@ -816,7 +816,7 @@ function renderDupGroups(groups, label, ignorable = false) {
       <div class="dup-group-title"><span class="tag">${label}</span> 第 ${gi + 1} 组（${g.length} 张）
         <label style="margin-left:8px"><input type="checkbox" class="dup-group-sel" /> 全选本组</label>
         <button class="btn small warn keep-best" style="margin-left:8px"
-          title="保留分辨率最高的一张，其余移入回收站">保留最高清</button>
+          title="保留分辨率最高的一张，其余移入回收站；保留图会自动改为组内最小序号（同目录且目标未被占用时）">保留最高清</button>
         ${ignorable ? `<button class="btn small ignore-group" style="margin-left:8px"
           title="这些图只是画风相似——之后查重不再提示它们（其他图片之间的提示不受影响）">忽略本组</button>` : ''}
         <button class="btn small danger" style="margin-left:8px">删除所选</button>
@@ -839,14 +839,23 @@ function renderDupGroups(groups, label, ignorable = false) {
     sec.querySelector('.keep-best').addEventListener('click', async () => {
       const rels = g.map((it) => it.rel).filter((rel) => rel !== g[best].rel);
       if (!rels.length) { toast('本组只有一张，无需清理', 'warn'); return; }
-      if (!confirm(`保留 ${g[best].name}（${g[best].w}×${g[best].h}），其余 ${rels.length} 张移入回收站？`)) return;
+      if (!confirm(`保留 ${g[best].name}（${g[best].w}×${g[best].h}），其余 ${rels.length} 张移入回收站？\n\n保留图会自动改为同目录组内最小序号（目标序号被占用时保持原名）。`)) return;
       try {
-        await api('/api/trash', {
+        const r = await api('/api/duplicates/keep-best', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ paths: rels })
+          body: JSON.stringify({ group: g.map((it) => it.rel), keep: g[best].rel })
         });
-        toast(`已保留最高清一张，${rels.length} 张移入回收站`, 'ok');
+        const failed = (r.trash && r.trash.moved ? r.trash.moved : []).filter((m) => m.error);
+        const compact = r.compact || {};
+        let msg = `已保留最高清一张，${rels.length} 张移入回收站`;
+        if (compact.renamed) {
+          msg += `；保留图序号已改为 ${compact.keptRel.split('/').pop()}`;
+        } else if (compact.reason === 'target-occupied') {
+          msg += '；最小序号已被占用，保留图未改名';
+        }
+        if (failed.length) msg += `；${failed.length} 张移入失败`;
+        toast(msg, failed.length ? 'warn' : 'ok');
         sec.remove();
         refreshLibrary();
         refreshGitStatus();
