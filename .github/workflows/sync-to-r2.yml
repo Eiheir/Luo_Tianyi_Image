@@ -79,6 +79,8 @@ jobs:
 
           mkdir -p worker/assets/LTYpicture
           cp -r LTYpicture/. worker/assets/LTYpicture/
+          # Workers 单文件上限 25MiB：现场压缩超限原图，否则 wrangler 会拒绝部署
+          node scripts/gallery-assets/compress-oversized-ci.mjs --root worker/assets
           node "$BUILD_SCRIPT" \
             --root worker/assets \
             --out worker/assets \
