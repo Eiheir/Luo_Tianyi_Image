@@ -211,6 +211,139 @@ async function renumberDirectory(cfg, index, dirRel) {
 }
 
 /**
+ * 手动调整目录内图片顺序：按 orderedNames 的先后重新分配编号。
+ *
+ * 目标编号沿用目录当前已有的编号集合（升序），不主动填补空洞：
+ *   原编号 0001/0003/0005，新顺序 C/A/B → C→0001、A→0003、B→0005。
+ * 位置未变的文件保持原名（不强制补零/改大小写），只重命名真正移动的文件。
+ * 改名采用两阶段临时名，支持任意交换/循环；任一步失败都会全部回滚。
+ *
+ * @param {string} dirRel 相对图库根的目录
+ * @param {string[]} orderedNames 目录内全部编号图片文件名的新顺序（必须完整、无重复）
+ * @returns {{dirRel:string, total:number, renumbered:number, unchanged:number,
+ *   mapping:Array<[string,string]>}}
+ */
+async function reorderDirectory(cfg, index, dirRel, orderedNames) {
+  if (!Array.isArray(orderedNames) || orderedNames.length === 0) {
+    throw new Error('排序列表为空');
+  }
+  const dirAbs = path.join(cfg._paths.imageRoot, dirRel.replace(/\//g, path.sep));
+  const exts = new Set(cfg.naming.allowedExt.map((e) => e.toLowerCase()));
+  const stat = await fsp.stat(dirAbs).catch(() => null);
+  if (!stat || !stat.isDirectory()) throw new Error(`目录不存在：${dirRel}`);
+
+  // 目录内全部“纯数字编号”的图片文件（不含同名目录/非编号文件）
+  const entries = await fsp.readdir(dirAbs, { withFileTypes: true });
+  const numbered = new Map();
+  for (const ent of entries) {
+    if (!ent.isFile()) continue;
+    const m = ent.name.match(/^(\d+)\.(\w+)$/);
+    if (!m || !exts.has(m[2].toLowerCase())) continue;
+    numbered.set(ent.name, { name: ent.name, no: parseInt(m[1], 10), ext: m[2].toLowerCase() });
+  }
+  if (numbered.size === 0) throw new Error('目录内没有可排序的编号图片');
+
+  // 排序列表必须恰好覆盖目录内全部编号图片，且无重复/未知文件
+  const seen = new Set();
+  for (const name of orderedNames) {
+    if (typeof name !== 'string' || !numbered.has(name) || seen.has(name)) {
+      throw new Error(`排序列表包含无效或重复文件：${name}`);
+    }
+    seen.add(name);
+  }
+  if (seen.size !== numbered.size) {
+    throw new Error('排序列表必须包含目录内全部编号图片');
+  }
+
+  // 目标编号 = 当前已有编号升序集合；重复编号无法形成唯一顺序，先让用户整理
+  const numbers = [...numbered.values()].map((it) => it.no).sort((a, b) => a - b);
+  if (new Set(numbers).size !== numbers.length) {
+    throw new Error('目录内存在重复编号，请先使用“填补空位”整理编号');
+  }
+
+  const padLen = dirRel.startsWith(`${cfg.classify.emoticonDir}/`)
+    ? cfg.naming.emoticonPadding : cfg.naming.padding;
+  const pad = (n) => String(n).padStart(padLen, '0');
+
+  const moves = [];
+  let unchanged = 0;
+  orderedNames.forEach((name, i) => {
+    const src = numbered.get(name);
+    const targetNo = numbers[i];
+    if (targetNo === src.no) { // 位置没变：保持原名，哪怕位数/大小写不标准
+      unchanged += 1;
+      return;
+    }
+    moves.push({ src, targetNo, targetName: `${pad(targetNo)}.${src.ext}` });
+  });
+
+  if (moves.length === 0) {
+    return { dirRel, total: numbered.size, renumbered: 0, unchanged, mapping: [] };
+  }
+
+  // 目标名可能与另一个“将要移动”的文件当前名相同（交换/循环），这些不算冲突；
+  // 若被其余文件/目录占用，则中止且不做任何修改。
+  const movingNames = new Set(moves.map((m) => m.src.name));
+  for (const m of moves) {
+    const targetAbs = path.join(dirAbs, m.targetName);
+    const exists = await fsp.stat(targetAbs).then(() => true, () => false);
+    if (exists && !movingNames.has(m.targetName)) {
+      throw new Error(`目标文件名已被占用：${m.targetName}，未做任何修改`);
+    }
+  }
+
+  // 两阶段改名：先全部改成唯一临时名，再落到目标名，避免交换时互相覆盖
+  const stamp = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  for (let i = 0; i < moves.length; i++) {
+    let tmpName = `${moves[i].src.name}.order-${stamp}-${i}.tmp`;
+    while (await fsp.stat(path.join(dirAbs, tmpName)).then(() => true, () => false)) {
+      tmpName = `${moves[i].src.name}.order-${stamp}-${i}-${Math.random().toString(36).slice(2, 6)}.tmp`;
+    }
+    moves[i].tmpName = tmpName;
+  }
+
+  const done1 = [];
+  try {
+    for (const m of moves) {
+      const fromAbs = path.join(dirAbs, m.src.name);
+      const tmpAbs = path.join(dirAbs, m.tmpName);
+      await fsp.rename(fromAbs, tmpAbs);
+      done1.push({ ...m, fromAbs, tmpAbs });
+    }
+  } catch (e) {
+    for (const d of done1.reverse()) await fsp.rename(d.tmpAbs, d.fromAbs).catch(() => {});
+    throw new Error(`保存顺序失败，已回滚：${e.message}`);
+  }
+
+  const done2 = [];
+  try {
+    for (const d of done1) {
+      const toAbs = path.join(dirAbs, d.targetName);
+      await fsp.rename(d.tmpAbs, toAbs);
+      done2.push({ ...d, toAbs });
+    }
+  } catch (e) {
+    for (const d of done2.reverse()) await fsp.rename(d.toAbs, d.tmpAbs).catch(() => {});
+    for (const d of done1.reverse()) await fsp.rename(d.tmpAbs, d.fromAbs).catch(() => {});
+    throw new Error(`保存顺序失败，已回滚：${e.message}`);
+  }
+
+  // 索引键随文件迁移（位置未变的文件不动）。
+  // 交换/循环时旧键可能同时是另一个文件的新键，必须"先取出并删除全部旧键，再写新键"。
+  const oldKeys = done2.map((d) => `${dirRel}/${d.src.name}`);
+  const oldItems = oldKeys.map((k) => index.items[k]);
+  for (const k of oldKeys) dedup.deleteIndexItem(index, k);
+  const mapping = [];
+  done2.forEach((d, i) => {
+    const newRel = `${dirRel}/${d.targetName}`;
+    if (oldItems[i]) dedup.setIndexItem(index, newRel, oldItems[i]);
+    mapping.push([oldKeys[i], newRel]);
+  });
+
+  return { dirRel, total: numbered.size, renumbered: moves.length, unchanged, mapping };
+}
+
+/**
  * 表情包主题目录改名（emoticon/<旧名> → emoticon/<新名>，目录内文件不变）。
  * @returns {{oldRel:string, newRel:string, count:number, movedNames:string[]}}
  */
@@ -310,4 +443,4 @@ async function compactKeptSequence(cfg, index, groupRels, keepRel) {
   return { oldRel: keepRel, keptRel: targetRel, renamed: true, reason: '' };
 }
 
-module.exports = { moveImages, renumberDirectory, renameTheme, compactKeptSequence };
+module.exports = { moveImages, renumberDirectory, reorderDirectory, renameTheme, compactKeptSequence };

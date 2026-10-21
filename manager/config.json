@@ -31,7 +31,7 @@
     ]
   },
   "dedup": {
-    "hammingThreshold": 3,
+    "hammingThreshold": 7,
     "cropThreshold": 5,
     "onExactDuplicate": "skip",
     "keepPriority": [

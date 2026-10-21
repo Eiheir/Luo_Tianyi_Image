@@ -228,6 +228,9 @@
               <button class="btn ghost" id="btnOrganize" type="button" title="编号规整 / 主题改名">
                 <svg class="icon sm" aria-hidden="true"><use href="#i-settings"></use></svg><span>整理…</span>
               </button>
+              <button class="btn ghost" id="btnOrder" type="button" title="手动调整图片顺序">
+                <svg class="icon sm" aria-hidden="true"><use href="#i-move"></use></svg><span>顺序…</span>
+              </button>
               <button class="btn ghost" id="btnTrash" type="button">
                 <svg class="icon sm" aria-hidden="true"><use href="#i-trash"></use></svg><span>回收站</span>
               </button>
@@ -465,6 +468,19 @@
         </button>
       </div>
       <div class="modal-body" id="organizeBody"></div>
+    </div>
+  </div>
+
+  <!-- ============ 弹窗：图片顺序管理 ============ -->
+  <div class="modal" id="orderPanel" hidden>
+    <div class="modal-card wide" role="dialog" aria-modal="true" aria-labelledby="orderTitle">
+      <div class="modal-head">
+        <h3 id="orderTitle">图片顺序管理</h3>
+        <button class="icon-btn" data-close="orderPanel" type="button" aria-label="关闭">
+          <svg class="icon"><use href="#i-close"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body" id="orderBody"></div>
     </div>
   </div>
 

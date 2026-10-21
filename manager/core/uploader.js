@@ -72,6 +72,8 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
     }
     if (!classify.CATEGORIES.includes(category)) throw new Error(`无效分类：${category}`);
     result.category = category;
+    // 目标目录提前算出：查重需要用它限定表情包的同主题作用域
+    const relDir = classify.categoryDir(category, opts.theme, cfg);
 
     // 壁纸类补充局部裁切指纹：上传时即可识别"竖图是横图的局部截取"
     let cropData = null;
@@ -86,6 +88,8 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
     const cropThreshold = Number(cfg.dedup.cropThreshold) || 5;
     const dup = dedup.compareAgainstLibrary(index, md5, dhash, threshold, {
       item: {
+        // 预计落点：表情包据此只与本主题目录比对，不跨文件夹
+        rel: `${relDir}/__incoming__`,
         w: processed.width, h: processed.height,
         chash: cropData && cropData.chash,
         crops: cropData && cropData.crops,
@@ -123,7 +127,6 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
     }
 
     // ---------- 6. 编号分配（目录扫描 + 占位探测双保险） ----------
-    const relDir = classify.categoryDir(category, opts.theme, cfg);
     const dirAbs = path.join(cfg._paths.imageRoot, relDir.replace(/\//g, path.sep));
     const padding = category === 'emoticon' ? cfg.naming.emoticonPadding : cfg.naming.padding;
     const maxNo = await classify.scanMaxNumber(dirAbs, cfg.naming.allowedExt);

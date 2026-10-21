@@ -758,6 +758,30 @@ app.post('/api/renumber', wrap(async (req, res) => {
   ok(res, result);
 }));
 
+// 手动调整目录内图片顺序（按新顺序改写编号）
+app.post('/api/reorder', wrap(async (req, res) => {
+  const { dir, order } = req.body || {};
+  if (!dir) return fail(res, 400, '未指定目录');
+  if (!Array.isArray(order) || order.length === 0) return fail(res, 400, '未指定排序列表');
+  const norm = String(dir).replace(/\\/g, '/');
+  const known = new Set([
+    `${cfg.classify.wallpaperDir}/heng`, `${cfg.classify.wallpaperDir}/shu`,
+    `${cfg.classify.wallpaperDir}/avatar`, cfg.classify.temporaryDir
+  ]);
+  const isTheme = norm.startsWith(`${cfg.classify.emoticonDir}/`) && !norm.includes('..');
+  if (!known.has(norm) && !isTheme) return fail(res, 400, `不支持的目录：${dir}`);
+
+  // 与上传/转换共用编号互斥锁：避免排序改名期间有并发编号分配
+  const result = await withProcessLock(() => organize.reorderDirectory(cfg, index, norm, order));
+  if (result.renumbered > 0) {
+    await dedup.saveIndex(cfg, index);
+    await dedup.pruneIgnorePairs(cfg, index); // 旧路径已变，清理失效的忽略记录
+    await history.record(cfg, 'reorder',
+      `手动排序 ${norm}：重命名 ${result.renumbered} 张（共 ${result.total} 张，${result.unchanged} 张保持原名）`);
+  }
+  ok(res, result);
+}));
+
 // 表情包主题目录改名
 app.post('/api/rename-theme', wrap(async (req, res) => {
   const { from, to } = req.body || {};

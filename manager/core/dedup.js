@@ -7,8 +7,13 @@
  *  2. dHash 感知哈希  ：将图片缩放为 9×8 灰度格，比较每行相邻像素明暗梯度，
  *     得到 64 位指纹；两张图指纹的"汉明距离"≤ 阈值（默认 5）判定"疑似相似"
  *
- * 归组范围：不按目录/分类过滤，横图(heng)、方图(avatar)、竖图(shu)、表情包
- * 统一参与比对，同一张作品的不同方向版本若指纹相近会进入同一组。
+ * 归组范围：壁纸三分类（横图/方图/竖图）跨目录统一比对；表情包只在各自
+ * 主题目录（emoticon/<主题>/）内比对，不跨主题、不跨分类。同一张作品的不同
+ * 方向版本若指纹相近会进入同一组。
+ *
+ * 局部裁切识别：跨方向（竖图是横图的一部分截取）和同方向（横图被二次裁切后
+ * 宽高比明显变化，如 4800×2620 → 1852×1080）都会在整图 dHash 不命中时，
+ * 用多位置裁切指纹 / 缩略图滑窗 NCC 兜底。
  *
  * 保留规则（清理相似/重复组时的默认决策）：
  *  - 跨方向局部裁切组：智能识别哪张是被截取的图，保留完整原图、去除截取版本，
@@ -92,7 +97,8 @@ function hammingDistance(a, b) {
  * 平均值 O(1) 可得，因此 9×8 指纹的计算非常快，且整图与裁切指纹使用完全相同的
  * 采样方式，跨方向比较不会因重采样差异产生假距离。
  *
- * 比较：只在不同方向（横/方/竖）之间启用，同方向仍由整图 dHash 负责，避免放大误报。
+ * 比较：固定位置裁切指纹用于跨方向快速命中；滑窗 NCC 跨方向始终启用，
+ * 同方向则在宽高比明显不同时启用（见 sameOrientationCropCandidate）。
  */
 
 const CROP_VERSION = 2; // v2 = 增加缩略图 + 行列投影（滑窗 NCC）
@@ -117,15 +123,36 @@ const CROP_AR_TOLERANCE = 0.3;
  */
 const CROP_THUMB_MAX = 72;
 const CROP_PROFILE_SAMPLES = 32;
+/* 预筛阈值：实测同方向 11.2 万对中 0.9 只放行 1.5%，真命中全部在其中；
+ * 放宽到 0.8 会把候选放大 4 倍、全库扫描多花约 3 秒，却不会多出任何命中。 */
 const CROP_PROFILE_MIN = 0.9;
+/** 同方向也做局部裁切复核的最小宽高比相对差异：低于该值构图窗口基本一致，交给整图 dHash */
+const CROP_SAME_AR_DIFF_MIN = 0.02;
 const CROP_NCC_SIZE = 48;
 const CROP_NCC_MIN = 0.9;
+/* 灰区缩放复核：同一作品如果被缩放后再裁切，固定 48px 归一化的 NCC 会掉到 0.82~0.90。
+ * 对灰区候选再做 ±6% 的小范围缩放搜索即可把真命中拉回 0.92+，而无关图仍 <0.81。
+ * 只对灰区候选执行，全库通常只有十几对，开销可忽略。 */
+const CROP_NCC_REFINE_MIN = 0.75;
+const CROP_REFINE_SCALES = [0.94, 0.97, 1.03, 1.06];
 
 /** 索引条目的宽高比；尺寸缺失返回 0 */
 function arOf(item) {
   const w = Number(item && item.w) || 0;
   const h = Number(item && item.h) || 0;
   return w > 0 && h > 0 ? w / h : 0;
+}
+
+/**
+ * 同方向是否值得做局部裁切复核。
+ * 宽高比差异小说明两张图的构图窗口基本一致，整图 dHash 足够；差异明显
+ * （如 1.832 vs 1.715）往往是二次裁切/重新构图，dHash 会因内容窗口不同而失真。
+ */
+function sameOrientationCropCandidate(a, b) {
+  const arA = arOf(a);
+  const arB = arOf(b);
+  if (!arA || !arB) return false;
+  return Math.abs(arA - arB) / Math.max(arA, arB) >= CROP_SAME_AR_DIFF_MIN;
 }
 
 /** 壁纸目录正则（按配置缓存，避免逐文件重复构造；支持自定义 wallpaperDir） */
@@ -142,6 +169,34 @@ function wallpaperDirRe(cfg) {
 /** 裁切指纹只对壁纸三分类有意义：表情包/临时目录不参与跨方向裁切匹配 */
 function isWallpaperRel(rel, cfg) {
   return wallpaperDirRe(cfg).test(String(rel || ''));
+}
+
+/**
+ * 表情包主题目录：
+ *  - 非表情包路径返回 null
+ *  - emoticon/<主题>/... 返回主题名（同一主题下的子目录视为同一作用域）
+ *  - 直接位于 emoticon/ 根目录返回 ''
+ */
+function emoticonThemeOf(rel, cfg) {
+  const base = String((cfg && cfg.classify && cfg.classify.emoticonDir) || 'emoticon')
+    .replace(/\\/g, '/').replace(/\/+$/, '');
+  const p = String(rel || '').replace(/\\/g, '/');
+  if (!p.startsWith(`${base}/`)) return null;
+  const rest = p.slice(base.length + 1);
+  const slash = rest.indexOf('/');
+  return slash < 0 ? '' : rest.slice(0, slash);
+}
+
+/**
+ * 表情包只在各自主题目录内比对，不跨文件夹：
+ *  - 双方都不是表情包 → 允许（壁纸仍按横/方/竖跨目录比对）
+ *  - 任一方是表情包 → 必须双方同属一个主题目录
+ */
+function emoticonPairAllowed(aRel, bRel, cfg) {
+  const ta = emoticonThemeOf(aRel, cfg);
+  const tb = emoticonThemeOf(bRel, cfg);
+  if (ta === null && tb === null) return true;
+  return ta !== null && ta === tb;
 }
 
 /** 灰度图积分图：任意矩形像素和可 O(1) 求出 */
@@ -304,8 +359,9 @@ function bestCropMatch(chash, crops, targetAR) {
 }
 
 /**
- * 跨方向裁切相似度：仅当两张图方向不同时启用。
+ * 跨方向裁切相似度：仅当两张图方向不同时启用（固定位置裁切指纹只为跨方向生成）。
  * 双向比较——A 的整图可能对应 B 的某个部位，反之亦然。
+ * 同方向的二次裁切没有对应宽高比的裁切指纹，由 nccCropMatch 兜底。
  * @returns {number|null} 命中返回最小距离，未命中返回 null
  */
 function cropDistanceOf(a, b, cropThreshold, cfg) {
@@ -332,10 +388,11 @@ function cropDistanceOf(a, b, cropThreshold, cfg) {
  * ---------------------------------------------------------------
  * 固定位置的裁切指纹对"刚好对齐"的截图有效，但真实截取位置是任意的。
  * 这里用最长边 72px 的缩略图做逐像素滑动，位置连续覆盖：
- *  1. 行列投影预筛：裁剪图沿未裁切轴的投影与原图高度相关（先把 99% 的组合挡掉）
+ *  1. 行列投影预筛：裁剪图沿未裁切轴的投影与原图高度相关（先把 90%+ 的组合挡掉）
  *  2. 同宽纵向 / 同高横向两种归一化，各自滑动求最大 NCC
- *  3. NCC ≥ 0.9 判定为同一作品的局部截取
- * 该阶段只在不同方向（横/方/竖）之间启用，且只对壁纸三分类生效。
+ *  3. NCC ≥ 0.9 判定为同一作品的局部截取；0.75~0.9 的灰区再做 ±6% 小幅缩放复核，
+ *     覆盖"先缩放再裁切"的版本（真实案例从 0.82 提升到 0.93，无关图仍 <0.81）
+ * 跨方向始终启用；同方向仅在宽高比差异 ≥ 2% 时启用。且只对壁纸三分类生效。
  */
 
 /** 两个已归一化投影的相关系数（点积均值） */
@@ -466,7 +523,64 @@ function nccScore(a, b, cache) {
 }
 
 /**
- * 任意位置裁切匹配：投影预筛 → 滑窗 NCC。
+ * 灰区缩放复核：把 48px 缩略图再按给定比例缩放后重复滑窗。
+ * 只缩放任一方向作为"裁切图"的一侧，覆盖"缩放后再裁切"的组合；
+ * 结果按 rel|mode|scale 缓存，避免同一张图在多个图对里重复重采样。
+ */
+function nccScaledBest(a, b, cache) {
+  let best = { score: -1, cropRel: '', fullRel: '', mode: '' };
+  const scaleVariant = (v, rel, mode, scale) => {
+    if (scale === 1) return v;
+    const key = `${rel}|${mode}|${CROP_NCC_SIZE}|s${scale}`;
+    if (cache && cache.has(key)) return cache.get(key);
+    const w = Math.max(1, Math.round(v.w * scale));
+    const h = Math.max(1, Math.round(v.h * scale));
+    const out = { data: resizeGray(v.data, v.w, v.h, w, h), w, h };
+    if (cache) cache.set(key, out);
+    return out;
+  };
+  for (const mode of ['w', 'h']) {
+    const va = thumbVariant(a, mode, cache);
+    const vb = thumbVariant(b, mode, cache);
+    if (!va || !vb) continue;
+    for (const scale of CROP_REFINE_SCALES) {
+      for (const [baseFull, baseCrop, fullRel, cropRel] of [
+        [va, vb, a.rel, b.rel],
+        [vb, va, b.rel, a.rel]
+      ]) {
+        const crop = scaleVariant(baseCrop, cropRel, mode, scale);
+        if (crop.w > baseFull.w || crop.h > baseFull.h) continue;
+        if (mode === 'w') {
+          for (let oy = 0; oy <= baseFull.h - crop.h; oy++) {
+            const v = nccAt(baseFull, crop, 0, oy);
+            if (v > best.score) best = { score: v, cropRel, fullRel, mode };
+          }
+        } else {
+          for (let ox = 0; ox <= baseFull.w - crop.w; ox++) {
+            const v = nccAt(baseFull, crop, ox, 0);
+            if (v > best.score) best = { score: v, cropRel, fullRel, mode };
+          }
+        }
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * 先固定尺度求 NCC；若落在灰区（0.75~0.9），再做小幅缩放复核。
+ * 返回最优的方向与分数，供归组（只关心分数）和保留决策（关心方向）共用。
+ */
+function nccBestRefined(a, b, cache) {
+  const best = nccBest(a, b, cache);
+  if (best.score >= CROP_NCC_MIN || best.score < CROP_NCC_REFINE_MIN) return best;
+  const refined = nccScaledBest(a, b, cache);
+  return refined.score > best.score ? refined : best;
+}
+
+/**
+ * 任意位置裁切匹配：投影预筛 → 滑窗 NCC → 灰区缩放复核。
+ * 跨方向始终复核；同方向在宽高比差异明显时复核（同方向二次裁切）。
  * @returns {number|null} 命中返回 NCC 分数，未命中返回 null
  */
 function nccCropMatch(a, b, cache, cfg) {
@@ -476,15 +590,16 @@ function nccCropMatch(a, b, cache, cfg) {
   if ((a.rel && !isWallpaperRel(a.rel, cfg)) || (b.rel && !isWallpaperRel(b.rel, cfg))) return null;
   const orientA = orientationOfItem(a, cfg);
   const orientB = orientationOfItem(b, cfg);
-  if (!orientA || !orientB || orientA === orientB) return null;
+  if (!orientA || !orientB) return null;
+  if (orientA === orientB && !sameOrientationCropCandidate(a, b)) return null;
 
   const profile = Math.max(
     profileCorr(a.rowProf, b.rowProf),
     profileCorr(a.colProf, b.colProf)
   );
   if (profile < CROP_PROFILE_MIN) return null;
-  const score = nccScore(a, b, cache);
-  return score >= CROP_NCC_MIN ? score : null;
+  const best = nccBestRefined(a, b, cache);
+  return best.score >= CROP_NCC_MIN ? best.score : null;
 }
 
 /**
@@ -516,7 +631,7 @@ function cropRelationOf(a, b, cropThreshold, cfg, cache) {
     }
   }
 
-  const best = nccBest(a, b, cache || new Map());
+  const best = nccBestRefined(a, b, cache || new Map());
   if (best.score < CROP_NCC_MIN) return null;
   return {
     cropRel: best.cropRel,
@@ -530,6 +645,8 @@ function cropRelationOf(a, b, cropThreshold, cfg, cache) {
 /**
  * 跨方向裁切组的保留决策：智能识别完整原图，保留它并去掉被截取的图。
  * 与方向优先级（横>方>竖）无关——完整图可能是竖图，也可能横图。
+ * 同方向组不参与方向判断（构图窗口相同，谁更完整无法可靠判断），
+ * 返回 null，由调用方回退 pickKeep() 按面积保留更高清的一张。
  *
  * @returns {{keepRel:string, cropRels:string[], via:string}|null}
  *   非裁切组（同方向/无裁切关系/方向成环）返回 null，调用方回退 pickKeep()
@@ -861,9 +978,11 @@ async function pruneIgnorePairs(cfg, index) {
 
 /**
  * 上传前查重：将新文件的 md5/dhash（以及可选的裁切指纹）与索引内全部文件比对
- * @param {object} opts.item 新文件的 { w, h, chash, crops }（壁纸类才有裁切指纹）
- * @param {object} opts.cfg 运行配置（方向判定用）
- * @param {number} opts.cropThreshold 跨方向局部裁切相似阈值
+ * @param {object} opts.item 新文件的 { rel, w, h, chash, crops }
+ *   rel 为预计落点（如 emoticon/<主题>/__incoming__），用于表情包同目录比对；
+ *   省略时不做目录限定（兼容旧调用）
+ * @param {object} opts.cfg 运行配置（方向判定/目录作用域用）
+ * @param {number} opts.cropThreshold 局部裁切相似阈值
  * @returns {{exact: Array<string>, similar: Array<{rel, distance, via}>}}
  *   exact   —— MD5 完全相同的库内文件（相对路径）
  *   similar —— 整图 dHash 或局部裁切命中（升序，最相似在前）；via='crop' 表示裁切命中
@@ -871,12 +990,15 @@ async function pruneIgnorePairs(cfg, index) {
 function compareAgainstLibrary(index, md5, dhash, threshold, opts = {}) {
   const cfg = opts.cfg || null;
   const incoming = opts.item || null;
+  const incomingRel = incoming && incoming.rel;
   const cropThreshold = Number.isFinite(Number(opts.cropThreshold)) ? Number(opts.cropThreshold) : 5;
   const exact = [];
   const similar = [];
   const nccCache = new Map();
 
   for (const [rel, item] of Object.entries(index.items)) {
+    // 表情包只与本主题目录内的文件比对；壁纸/临时目录不受影响
+    if (incomingRel && !emoticonPairAllowed(incomingRel, rel, cfg)) continue;
     if (md5 && item.md5 === md5) { exact.push(rel); continue; }
 
     let distance = 64;
@@ -886,8 +1008,8 @@ function compareAgainstLibrary(index, md5, dhash, threshold, opts = {}) {
       const d = hammingDistance(dhash, item.dhash);
       if (d <= threshold) { distance = d; via = 'dhash'; }
     }
-    // 整图不像时，检查新图是否为库内某图的局部裁切（仅跨方向）：
-    // 固定位置裁切指纹 → 任意位置滑窗 NCC
+    // 整图不像时，检查新图是否为库内某图的局部裁切：
+    // 跨方向先试固定位置裁切指纹，再试任意位置滑窗 NCC；同方向直接走 NCC。
     if (!via && incoming) {
       const inItem = { rel: '', ...incoming };
       const libItem = { rel, ...item };
@@ -1006,13 +1128,13 @@ function pickKeep(items, cfg) {
 /**
  * 全库查重：返回"重复组"列表
  *  - exactGroups：MD5 相同的组
- *  - similarGroups：整图 dHash 相近，或跨方向局部裁切指纹匹配的组
+ *  - similarGroups：整图 dHash 相近，或跨方向/同方向局部裁切指纹与 NCC 匹配的组
  *    （贪心聚类，已归组的文件不再参与后续分组，避免组爆炸）；
- *    不按分类过滤，横图/方图/竖图/表情包可以进入同一组；
+ *    壁纸三分类不限目录；表情包只在同一主题目录内比对，不跨文件夹；
  *    手动忽略（muted）的图片彻底退出相似归组
  *
  * @param {object} opts.cfg 运行配置（用于方向判定，可省略）
- * @param {number} opts.cropThreshold 跨方向局部裁切相似阈值（默认 5）
+ * @param {number} opts.cropThreshold 局部裁切相似阈值（默认 5）
  */
 function findDuplicateGroups(index, threshold, muted = new Set(), opts = {}) {
   const items = index.items;
@@ -1020,17 +1142,31 @@ function findDuplicateGroups(index, threshold, muted = new Set(), opts = {}) {
   const cfg = opts.cfg || null;
   const cropThreshold = Number.isFinite(Number(opts.cropThreshold)) ? Number(opts.cropThreshold) : 5;
 
+  // 表情包作用域预计算：全库按图对比对时避免重复解析路径
+  const emoticonTheme = new Map();
+  for (const rel of rels) emoticonTheme.set(rel, emoticonThemeOf(rel, cfg));
+  const sameEmoticonScope = (a, b) => {
+    const ta = emoticonTheme.get(a);
+    const tb = emoticonTheme.get(b);
+    if (ta === null && tb === null) return true;
+    return ta !== null && ta === tb;
+  };
+
   // —— MD5 精确分组（不受忽略影响：字节级相同是客观事实） ——
+  //     表情包按主题目录隔离：同 md5 也不跨主题、不跨分类归组 ——
   const byMd5 = new Map();
   for (const rel of rels) {
     const m = items[rel].md5;
     if (!m) continue;
-    if (!byMd5.has(m)) byMd5.set(m, []);
-    byMd5.get(m).push(rel);
+    const theme = emoticonTheme.get(rel);
+    const key = theme === null ? m : `${m}#emoticon:${theme}`;
+    if (!byMd5.has(key)) byMd5.set(key, []);
+    byMd5.get(key).push(rel);
   }
   const exactGroups = [...byMd5.values()].filter((g) => g.length > 1);
 
-  // —— 相似贪心聚类：整图 dHash 优先；跨方向时追加局部裁切比对 ——
+  // —— 相似贪心聚类：整图 dHash 优先；不命中时追加局部裁切比对 ——
+  //     跨方向走固定裁切指纹 + NCC，同方向（宽高比差异明显）走 NCC ——
   //     被忽略（muted）的图片不参与相似归组 ——
   const used = new Set(exactGroups.flat());
   const similarGroups = [];
@@ -1053,10 +1189,13 @@ function findDuplicateGroups(index, threshold, muted = new Set(), opts = {}) {
     for (let j = i + 1; j < order.length; j++) {
       if (used.has(order[j])) continue;
       const other = itemOf(order[j]);
+      // 表情包只与本主题目录内的文件比对，避免跨主题/跨分类误报
+      if (!sameEmoticonScope(pivot.rel, other.rel)) continue;
       let d = pivot.dhash && other.dhash ? hammingDistance(pivot.dhash, other.dhash) : 64;
       if (d > threshold) {
-        // 整图不像时，再看"一张图是否为另一张图的局部裁切"（仅跨方向）：
-        // 先试固定位置裁切指纹（快），未命中再用投影预筛 + 滑窗 NCC（覆盖任意位置）
+        // 整图不像时，再看"一张图是否为另一张图的局部裁切"：
+        // 跨方向先试固定位置裁切指纹（快），未命中再用投影预筛 + 滑窗 NCC；
+        // 同方向没有对应宽高比的裁切指纹，直接走 NCC（仅宽高比差异明显时）
         const cropD = cropDistanceOf(pivot, other, cropThreshold, cfg);
         if (cropD !== null) {
           d = cropD;

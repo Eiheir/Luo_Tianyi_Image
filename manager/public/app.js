@@ -348,6 +348,7 @@ const state = {
   themeLoaded: false,
   trashRows: [],
   lb: { list: [], pos: -1, zoom: 1, x: 0, y: 0, drag: null, rows: null },
+  order: { dir: '', items: [], original: [], dragging: '', duplicate: false },
   gitSyncing: false,
   convert: { running: false, stop: false },
   dragRels: null // 网格拖拽移动中的图片路径集合
@@ -882,6 +883,21 @@ function categoryOfRel(rel) {
   if (dir === CHIP_DIR.temporary) return 'temporary';
   if (dir === CHIP_DIR.emoticon || dir.startsWith(`${CHIP_DIR.emoticon}/`)) return 'emoticon';
   return '其他';
+}
+
+/** 文件夹选择顺序：横图 → 竖图 → 方形 → 表情包主题 → 其他（如临时目录） */
+function sortDirsForSelect(dirs) {
+  const c = (state.cfg && state.cfg.classify) || {};
+  const wp = c.wallpaperDir || 'wallpapers&illustration';
+  const em = c.emoticonDir || 'emoticon';
+  const fixed = [`${wp}/heng`, `${wp}/shu`, `${wp}/avatar`];
+  const rank = (d) => {
+    const i = fixed.indexOf(d);
+    if (i >= 0) return i;
+    if (d === em || d.startsWith(`${em}/`)) return 3;
+    return 4;
+  };
+  return [...dirs].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
 }
 
 function groupKeyOf(row) {
@@ -2117,7 +2133,7 @@ function renderDupGroups(groups, label, ignorable = false) {
       <div class="dup-group-title">
         <span class="tag">${escapeHtml(label)}</span> 第 ${gi + 1} 组（${g.length} 张）
         ${cross ? '<span class="tag ok" title="组内含横/方/竖不同方向，可能是同一作品的局部裁切">跨方向</span>' : ''}
-        <label><input type="checkbox" class="dup-group-sel" /> 全选本组</label>
+        <label title="包含推荐保留图；可只勾选要删除的图片"><input type="checkbox" class="dup-group-sel" /> 全选本组</label>
         <button class="btn small warn keep-best" type="button"
           title="${cropGroup
             ? '已识别出被截取的图：保留完整原图，其余移入回收站；保留图会自动改为组内最小序号（同目录且目标未被占用时）'
@@ -2132,9 +2148,13 @@ function renderDupGroups(groups, label, ignorable = false) {
             <img loading="lazy" src="/api/thumb?p=${encodeURIComponent(it.rel)}&w=264"
               alt="${escapeHtml(it.name)}" tabindex="0" role="button"
               title="点击预览大图" aria-label="预览 ${escapeHtml(it.name)}" />
-            ${i === best
-              ? `<div><span class="tag ok">${cropGroup ? '保留原图' : '保留'}${!cropGroup && it.orientation ? ' · ' + (ORIENTATION_LABELS[it.orientation] || '') : ''}</span></div>`
-              : `<label><input type="checkbox" class="dup-item-sel" value="${escapeHtml(it.rel)}" /> 删除</label>${it.isCrop ? ' <span class="tag dup" title="识别为从完整原图截取出的局部图">截取</span>' : ''}`}
+            <div class="dup-item-actions">
+              <label title="勾选后可与其他图片一起移入回收站"><input type="checkbox" class="dup-item-sel" value="${escapeHtml(it.rel)}" /> 删除</label>
+              ${i === best
+                ? `<span class="tag ok" title="推荐保留；勾选左侧删除可连它一起人工筛选">${cropGroup ? '保留原图' : '保留'}${!cropGroup && it.orientation ? ' · ' + (ORIENTATION_LABELS[it.orientation] || '') : ''}</span>`
+                : ''}
+              ${it.isCrop ? '<span class="tag dup" title="识别为从完整原图截取出的局部图">截取</span>' : ''}
+            </div>
             <div class="name" title="${escapeHtml(it.rel)}">${escapeHtml(it.name)}${i === best ? ' ⭐' : ''}</div>
             <div class="muted">${it.w && it.h ? `${it.w}×${it.h} · ` : ''}${it.orientation ? `${ORIENTATION_LABELS[it.orientation] || ''} · ` : ''}${it.sizeText || ''}</div>
           </div>`).join('')}
@@ -2151,7 +2171,16 @@ function renderDupGroups(groups, label, ignorable = false) {
     });
 
     sec.querySelector('.dup-group-sel').addEventListener('change', (e) => {
-      sec.querySelectorAll('.dup-item-sel').forEach((c) => { c.checked = e.target.checked; });
+      sec.querySelectorAll('.dup-item-sel').forEach((c) => {
+        c.checked = e.target.checked;
+        c.closest('.dup-item').classList.toggle('marked-delete', c.checked);
+      });
+    });
+    // 推荐保留图同样可勾选删除：勾选后红框提示，避免误删无感知
+    sec.querySelectorAll('.dup-item-sel').forEach((c) => {
+      c.addEventListener('change', () => {
+        c.closest('.dup-item').classList.toggle('marked-delete', c.checked);
+      });
     });
 
     sec.querySelector('.keep-best').addEventListener('click', async () => {
@@ -2230,8 +2259,25 @@ function renderDupGroups(groups, label, ignorable = false) {
 
     sec.querySelector('.dup-delete').addEventListener('click', async () => {
       const rels = [...sec.querySelectorAll('.dup-item-sel:checked')].map((c) => c.value);
-      if (!rels.length) return toast('请先勾选要删除的图片（建议保留一张）', 'warn');
-      const res = await trashPaths(rels);
+      if (!rels.length) return toast('请先勾选要删除的图片', 'warn');
+      const keeper = g[best];
+      const includesKeeper = rels.includes(keeper.rel);
+      const deletesAll = rels.length === g.length;
+      // 勾选里包含推荐保留图时，单独确认一次：这正是“人工筛选”允许的操作
+      if (includesKeeper) {
+        const ok = await confirmDialog({
+          title: deletesAll ? '删除整组' : '删除所选（含保留图）',
+          message: deletesAll
+            ? `将本组 ${rels.length} 张图片全部移入回收站？`
+            : `所选包含推荐保留图 ${keeper.name}，仍要删除这 ${rels.length} 张？`,
+          detail: deletesAll
+            ? '本组将没有保留图。图片会移入回收站，可随时恢复；若想留下其中一张，请取消勾选它后再删除。'
+            : '图片会移入回收站，可随时恢复；若想留下推荐保留图，请取消勾选它后再删除。',
+          okText: '移入回收站'
+        });
+        if (!ok) return;
+      }
+      const res = await trashPaths(rels, { confirm: !includesKeeper });
       if (res && res.ok > 0) sec.remove();
     });
 
@@ -2416,7 +2462,9 @@ $('btnTrashPurgeAll').addEventListener('click', async () => {
 /* ---------------- 整理 ---------------- */
 
 $('btnOrganize').addEventListener('click', () => {
-  const dirs = [...new Set(state.libAll.map((r) => dirOf(r.rel)))].filter(Boolean).sort();
+  const dirs = sortDirsForSelect(
+    [...new Set(state.libAll.map((r) => dirOf(r.rel)))].filter(Boolean)
+  );
   const themes = dirs.filter((d) => d.startsWith('emoticon/')).map((d) => d.slice('emoticon/'.length));
   const defaultDir = state.dir && dirs.includes(state.dir) ? state.dir : (dirs[0] || '');
 
@@ -2541,6 +2589,334 @@ $('btnOrganize').addEventListener('click', () => {
   });
 
   openModal('organizePanel');
+});
+
+/* ---------------- 图片顺序管理 ---------------- */
+
+/** 目录内全部编号图片的目标编号（沿用当前已有的编号集合，升序） */
+function orderTargetNumbers() {
+  return state.order.original
+    .map((it) => parseInt(it.name, 10))
+    .filter((n) => Number.isFinite(n))
+    .sort((a, b) => a - b);
+}
+
+/** 当前顺序相对原顺序会有多少张图片需要改名 */
+function orderMovedCount() {
+  const slots = orderTargetNumbers();
+  let moved = 0;
+  state.order.items.forEach((it, i) => {
+    if (slots[i] !== parseInt(it.name, 10)) moved += 1;
+  });
+  return moved;
+}
+
+function updateOrderStats() {
+  const stats = $('orderStats');
+  const save = $('btnOrderSave');
+  const reset = $('btnOrderReset');
+  if (!stats) return;
+  const total = state.order.items.length;
+  const moved = orderMovedCount();
+  if (state.order.duplicate) {
+    stats.innerHTML = `${icon('warning', 'sm')}<span class="warn-text">目录内存在重复编号，请先在“整理 → 填补空位”中整理编号。</span>`;
+    if (save) save.disabled = true;
+    if (reset) reset.disabled = moved === 0;
+    return;
+  }
+  stats.innerHTML = `${icon('info', 'sm')}<span>共 <b>${total}</b> 张；保存后将重命名 <b>${moved}</b> 张，其余保持原名</span>`;
+  if (save) save.disabled = total < 2 || moved === 0;
+  if (reset) reset.disabled = moved === 0;
+}
+
+function renderOrderList() {
+  const list = $('orderList');
+  if (!list) return;
+  const items = state.order.items;
+  if (!items.length) {
+    list.innerHTML = '<div class="empty">该目录没有可排序的编号图片</div>';
+    updateOrderStats();
+    return;
+  }
+  list.innerHTML = items.map((it, i) => {
+    const v = it.mtime ? `&v=${Math.round(it.mtime)}` : '';
+    const thumb = `/api/thumb?p=${encodeURIComponent(it.rel)}&w=160${v}`;
+    const dim = it.w && it.h ? `${it.w}×${it.h} · ` : '';
+    return `<div class="order-row${state.order.dragging === it.name ? ' dragging' : ''}"
+        draggable="true" data-name="${escapeHtml(it.name)}">
+      <span class="order-handle" title="拖动排序" aria-hidden="true">⠿</span>
+      <input class="order-pos" type="number" min="1" max="${items.length}" value="${i + 1}"
+        data-name="${escapeHtml(it.name)}" title="输入目标序号后按回车交换位置"
+        aria-label="输入 ${escapeHtml(it.name)} 的目标序号，回车交换" />
+      <img loading="lazy" src="${thumb}" alt="" />
+      <div class="order-info">
+        <div class="order-name" title="${escapeHtml(it.rel)}">${escapeHtml(it.name)}</div>
+        <div class="muted">${dim}${fmtSize(it.size || 0)}</div>
+      </div>
+      <div class="order-btns">
+        <button class="icon-btn" type="button" data-order-move="-1" title="上移" ${i === 0 ? 'disabled' : ''}>↑</button>
+        <button class="icon-btn" type="button" data-order-move="1" title="下移" ${i === items.length - 1 ? 'disabled' : ''}>↓</button>
+      </div>
+    </div>`;
+  }).join('');
+  updateOrderStats();
+}
+
+function loadOrderDir(dir) {
+  const rows = state.libAll
+    .filter((r) => dirOf(r.rel) === dir && /^\d+\.\w+$/.test(r.name))
+    .sort((a, b) => {
+      const na = parseInt(a.name, 10);
+      const nb = parseInt(b.name, 10);
+      return na - nb || a.name.localeCompare(b.name);
+    });
+  const numbers = rows.map((r) => parseInt(r.name, 10));
+  state.order = {
+    dir,
+    items: rows.slice(),
+    original: rows.slice(),
+    dragging: '',
+    duplicate: new Set(numbers).size !== numbers.length
+  };
+  renderOrderList();
+}
+
+async function saveOrder() {
+  const { dir, items, duplicate } = state.order;
+  const moved = orderMovedCount();
+  if (duplicate) return toast('目录内存在重复编号，请先整理编号', 'warn');
+  if (items.length < 2) return toast('该目录图片太少，无需排序', 'warn');
+  if (!moved) return toast('顺序没有变化', 'warn');
+  const ok = await confirmDialog({
+    title: '保存图片顺序',
+    message: `保存「${dir}」的新顺序？`,
+    detail: `将重命名 ${moved} 张图片，旧链接会变化；其余 ${items.length - moved} 张保持原名。`,
+    okText: '保存顺序'
+  });
+  if (!ok) return;
+  try {
+    const r = await api('/api/reorder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dir, order: items.map((it) => it.name) })
+    });
+    toast(`顺序已保存：重命名 ${r.renumbered} 张（共 ${r.total} 张）`, 'ok');
+    closeModal('orderPanel');
+    refreshLibrary();
+    refreshGitStatus();
+  } catch (e) {
+    let msg = e.message;
+    if (/HTTP 404/.test(e.message)) {
+      msg = '保存接口不可用：请完整退出并重启图床管理器（当前进程可能是旧版本）';
+    } else if (/必须包含目录内全部编号图片|无效或重复文件/.test(e.message)) {
+      msg = '目录内容已变化（可能有新图或删图），请点“刷新”更新列表后重试';
+    } else if (/重复编号/.test(e.message)) {
+      msg = '目录内存在重复编号，请先在“整理 → 填补空位”中整理编号';
+    }
+    toast(msg, 'err');
+  }
+}
+
+function setupOrderDrag() {
+  const list = $('orderList');
+  if (!list) return;
+
+  list.addEventListener('dragstart', (e) => {
+    const row = e.target.closest('.order-row');
+    if (!row || e.target.closest('button, input, select, textarea') || !e.dataTransfer) {
+      e.preventDefault();
+      return;
+    }
+    state.order.dragging = row.dataset.name;
+    row.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', row.dataset.name);
+  });
+
+  list.addEventListener('dragend', () => {
+    state.order.dragging = '';
+    list.querySelectorAll('.order-row').forEach((r) => r.classList.remove('dragging', 'drop-before', 'drop-after'));
+  });
+
+  list.addEventListener('dragover', (e) => {
+    if (!state.order.dragging) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const row = e.target.closest('.order-row');
+    list.querySelectorAll('.order-row').forEach((r) => r.classList.remove('drop-before', 'drop-after'));
+    if (!row) return;
+    const rect = row.getBoundingClientRect();
+    row.classList.add(e.clientY < rect.top + rect.height / 2 ? 'drop-before' : 'drop-after');
+  });
+
+  list.addEventListener('dragleave', (e) => {
+    if (e.relatedTarget && list.contains(e.relatedTarget)) return;
+    list.querySelectorAll('.order-row').forEach((r) => r.classList.remove('drop-before', 'drop-after'));
+  });
+
+  list.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const dragging = state.order.dragging || e.dataTransfer.getData('text/plain');
+    const row = e.target.closest('.order-row');
+    list.querySelectorAll('.order-row').forEach((r) => r.classList.remove('dragging', 'drop-before', 'drop-after'));
+    state.order.dragging = '';
+    if (!dragging) return;
+
+    const from = state.order.items.findIndex((it) => it.name === dragging);
+    if (from < 0) return;
+
+    let to;
+    if (row) {
+      const idx = state.order.items.findIndex((it) => it.name === row.dataset.name);
+      if (idx < 0) return;
+      const rect = row.getBoundingClientRect();
+      to = e.clientY < rect.top + rect.height / 2 ? idx : idx + 1;
+    } else {
+      to = state.order.items.length;
+    }
+    if (from < to) to -= 1;
+    if (to === from) { renderOrderList(); return; }
+    const [moved] = state.order.items.splice(from, 1);
+    state.order.items.splice(to, 0, moved);
+    renderOrderList();
+  });
+
+  // 直接在序号框输入目标位置：回车或失焦后与目标位置交换（只改两张图）
+  const applyOrderPosition = (input) => {
+    if (!input || input.dataset.applied === '1') return;
+    const items = state.order.items;
+    const from = items.findIndex((it) => it.name === input.dataset.name);
+    if (from < 0) return;
+    const raw = input.value.trim();
+    if (!raw) { renderOrderList(); return; }
+    const target = Math.round(Number(raw));
+    if (!Number.isFinite(target)) { renderOrderList(); return; }
+    const to = Math.max(0, Math.min(items.length - 1, target - 1));
+    if (to === from) { renderOrderList(); return; }
+    // 与目标位置交换，而不是整体顺延：只影响两张图，改名代价最小
+    input.dataset.applied = '1'; // 防止回车后的 blur/change 再交换回去
+    const movedName = items[from].name;
+    [items[from], items[to]] = [items[to], items[from]];
+    renderOrderList();
+    const nextInput = [...list.querySelectorAll('.order-pos')].find((el) => el.dataset.name === movedName);
+    if (nextInput) { nextInput.focus(); nextInput.select(); }
+  };
+
+  list.addEventListener('change', (e) => {
+    const input = e.target.closest('.order-pos');
+    if (input) applyOrderPosition(input);
+  });
+
+  list.addEventListener('keydown', (e) => {
+    const input = e.target.closest('.order-pos');
+    if (!input) return;
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      applyOrderPosition(input);
+      input.blur();
+    } else if (e.key === 'Escape') {
+      e.stopPropagation(); // 只重置输入，不关闭整个面板
+      renderOrderList();
+    }
+  });
+
+  list.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-order-move]');
+    if (!btn) return;
+    const row = btn.closest('.order-row');
+    if (!row) return;
+    const idx = state.order.items.findIndex((it) => it.name === row.dataset.name);
+    const to = idx + Number(btn.dataset.orderMove);
+    if (idx < 0 || to < 0 || to >= state.order.items.length) return;
+    const [moved] = state.order.items.splice(idx, 1);
+    state.order.items.splice(to, 0, moved);
+    renderOrderList();
+  });
+}
+
+async function openOrderPanel() {
+  // 每次都拉一次最新列表：外部工具刚上传的新图也能进入排序面板
+  await refreshLibrary();
+  const dirs = sortDirsForSelect(
+    [...new Set(
+      state.libAll
+        .filter((r) => /^\d+\.\w+$/.test(r.name))
+        .map((r) => dirOf(r.rel))
+        .filter(Boolean)
+    )]
+  );
+  if (!dirs.length) return toast('图库中没有可排序的编号图片', 'warn');
+  // 优先跟随当前目录树；没有具体目录时按“横 → 竖 → 方 → 表情包 → 其他”取第一个
+  const defaultDir = state.dir && dirs.includes(state.dir) ? state.dir : dirs[0];
+
+  $('orderBody').innerHTML = `
+    <div class="opt-grid">
+      <label class="opt">
+        <span class="opt-label">选择目录</span>
+        <select id="orderDir">${dirs.map((d) =>
+          `<option value="${escapeHtml(d)}"${d === defaultDir ? ' selected' : ''}>${escapeHtml(d)}</option>`).join('')}</select>
+      </label>
+      <div class="opt">
+        <span class="opt-label">影响范围</span>
+        <div class="callout" id="orderStats" style="margin-top:0"></div>
+      </div>
+    </div>
+    <div class="callout warn" style="margin-top:12px">
+      ${icon('warning', 'sm')}
+      <span>拖动行、使用 ↑/↓，或直接修改每行左侧序号后按回车与目标位置交换（只改两张图）。保存后按新顺序改写编号，旧链接可能变化；位置未变的图片保持原名。</span>
+    </div>
+    <div class="order-list" id="orderList" aria-label="图片顺序列表"></div>
+    <div class="queue-actions">
+      <button class="btn ghost" id="btnOrderRefresh" type="button">刷新</button>
+      <button class="btn ghost" id="btnOrderReset" type="button">重置</button>
+      <button class="btn primary" id="btnOrderSave" type="button">保存顺序</button>
+    </div>`;
+
+  loadOrderDir(defaultDir);
+  setupOrderDrag();
+
+  $('orderDir').addEventListener('change', async () => {
+    const next = $('orderDir').value;
+    if (next === state.order.dir) return;
+    if (orderMovedCount() > 0) {
+      const ok = await confirmDialog({
+        title: '切换目录',
+        message: '当前顺序尚未保存，切换后将丢弃修改？',
+        okText: '丢弃并切换'
+      });
+      if (!ok) { $('orderDir').value = state.order.dir; return; }
+    }
+    loadOrderDir(next);
+  });
+
+  $('btnOrderRefresh').addEventListener('click', async () => {
+    if (orderMovedCount() > 0) {
+      const ok = await confirmDialog({
+        title: '刷新顺序列表',
+        message: '当前顺序尚未保存，刷新后将丢弃修改？',
+        okText: '丢弃并刷新'
+      });
+      if (!ok) return;
+    }
+    const keepDir = state.order.dir;
+    await refreshLibrary();
+    const stillExists = state.libAll.some((r) => dirOf(r.rel) === keepDir && /^\d+\.\w+$/.test(r.name));
+    if (stillExists) loadOrderDir(keepDir);
+    else await openOrderPanel();
+  });
+
+  $('btnOrderReset').addEventListener('click', () => {
+    if (!state.order.original.length) return;
+    state.order.items = state.order.original.slice();
+    renderOrderList();
+  });
+
+  $('btnOrderSave').addEventListener('click', saveOrder);
+  openModal('orderPanel');
+}
+
+$('btnOrder').addEventListener('click', () => {
+  openOrderPanel().catch((e) => toast(e.message, 'err'));
 });
 
 /* ================================================================
@@ -3075,7 +3451,7 @@ $('btnSpeed').addEventListener('click', runSpeedTest);
 /* ---------- 操作历史 ---------- */
 const HISTORY_TYPES = {
   upload: '上传', trash: '回收站', restore: '恢复', purge: '彻底删除',
-  move: '移动', convert: '转换', renumber: '规整', 'rename-theme': '改名', sync: '同步'
+  move: '移动', convert: '转换', renumber: '规整', reorder: '排序', 'rename-theme': '改名', sync: '同步'
 };
 let historyOffset = 0;
 

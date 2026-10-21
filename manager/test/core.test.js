@@ -525,6 +525,153 @@ test('organize：目标文件名被非编号文件占用时中止且不改名', 
   }
 });
 
+test('organize：手动排序按新顺序改名并同步索引', async () => {
+  const { root, cfg, index } = await makeOrgEnv();
+  try {
+    const dir = path.join(cfg._paths.imageRoot, 'avatar');
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, '0001.jpg'), 'a');
+    await fsp.writeFile(path.join(dir, '0002.jpg'), 'b');
+    await fsp.writeFile(path.join(dir, '0003.jpg'), 'c');
+    dedup.setIndexItem(index, 'avatar/0001.jpg', { mtime: 1, size: 1, w: 1, h: 1, md5: 'a', dhash: '' });
+    dedup.setIndexItem(index, 'avatar/0002.jpg', { mtime: 1, size: 1, w: 1, h: 1, md5: 'b', dhash: '' });
+    dedup.setIndexItem(index, 'avatar/0003.jpg', { mtime: 1, size: 1, w: 1, h: 1, md5: 'c', dhash: '' });
+
+    // A、C、B：A 原地不动，B/C 交换
+    const r = await organize.reorderDirectory(cfg, index, 'avatar',
+      ['0001.jpg', '0003.jpg', '0002.jpg']);
+    assert.strictEqual(r.total, 3);
+    assert.strictEqual(r.renumbered, 2);
+    assert.strictEqual(r.unchanged, 1);
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0001.jpg'))).toString(), 'a');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0002.jpg'))).toString(), 'c');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0003.jpg'))).toString(), 'b');
+    assert.strictEqual(index.items['avatar/0001.jpg'].md5, 'a');
+    assert.strictEqual(index.items['avatar/0002.jpg'].md5, 'c');
+    assert.strictEqual(index.items['avatar/0003.jpg'].md5, 'b');
+    // 不应残留临时文件
+    const left = (await fsp.readdir(dir)).filter((n) => n.includes('.order-'));
+    assert.deepStrictEqual(left, []);
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('organize：手动排序保留目录已有编号空洞', async () => {
+  const { root, cfg, index } = await makeOrgEnv();
+  try {
+    const dir = path.join(cfg._paths.imageRoot, 'avatar');
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, '0001.jpg'), 'a');
+    await fsp.writeFile(path.join(dir, '0003.jpg'), 'b');
+    await fsp.writeFile(path.join(dir, '0005.jpg'), 'c');
+
+    // 倒序：C、B、A → 目标编号仍是 1/3/5（B 原地不动）
+    const r = await organize.reorderDirectory(cfg, index, 'avatar',
+      ['0005.jpg', '0003.jpg', '0001.jpg']);
+    assert.strictEqual(r.renumbered, 2);
+    assert.strictEqual(r.unchanged, 1);
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0001.jpg'))).toString(), 'c');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0003.jpg'))).toString(), 'b');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0005.jpg'))).toString(), 'a');
+    assert.strictEqual(await fileExists(path.join(dir, '0002.jpg')), false);
+    assert.strictEqual(await fileExists(path.join(dir, '0004.jpg')), false);
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('organize：输入序号交换只重命名两张图', async () => {
+  const { root, cfg, index } = await makeOrgEnv();
+  try {
+    const dir = path.join(cfg._paths.imageRoot, 'avatar');
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, '0001.jpg'), 'a');
+    await fsp.writeFile(path.join(dir, '0002.jpg'), 'b');
+    await fsp.writeFile(path.join(dir, '0003.jpg'), 'c');
+
+    // 前端输入目标序号执行的是交换：A、C 互换，B 原地不动
+    const r = await organize.reorderDirectory(cfg, index, 'avatar',
+      ['0003.jpg', '0002.jpg', '0001.jpg']);
+    assert.strictEqual(r.renumbered, 2, '交换只应改两张图');
+    assert.strictEqual(r.unchanged, 1, '中间那张保持原名');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0001.jpg'))).toString(), 'c');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0002.jpg'))).toString(), 'b');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0003.jpg'))).toString(), 'a');
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('organize：排序列表不完整/重复/含未知文件时拒绝且不改名', async () => {
+  const { root, cfg, index } = await makeOrgEnv();
+  try {
+    const dir = path.join(cfg._paths.imageRoot, 'avatar');
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, '0001.jpg'), 'a');
+    await fsp.writeFile(path.join(dir, '0002.jpg'), 'b');
+    await fsp.writeFile(path.join(dir, '0003.jpg'), 'c');
+
+    await assert.rejects(
+      () => organize.reorderDirectory(cfg, index, 'avatar', ['0001.jpg', '0002.jpg']),
+      /必须包含目录内全部编号图片/
+    );
+    await assert.rejects(
+      () => organize.reorderDirectory(cfg, index, 'avatar', ['0001.jpg', '0001.jpg', '0003.jpg']),
+      /无效或重复文件/
+    );
+    await assert.rejects(
+      () => organize.reorderDirectory(cfg, index, 'avatar', ['0001.jpg', '0002.jpg', 'nope.jpg']),
+      /无效或重复文件/
+    );
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0001.jpg'))).toString(), 'a');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0002.jpg'))).toString(), 'b');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0003.jpg'))).toString(), 'c');
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('organize：重复编号拒绝手动排序', async () => {
+  const { root, cfg, index } = await makeOrgEnv();
+  try {
+    const dir = path.join(cfg._paths.imageRoot, 'avatar');
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, '0001.jpg'), 'a');
+    await fsp.writeFile(path.join(dir, '0001.png'), 'b');
+    await fsp.writeFile(path.join(dir, '0002.jpg'), 'c');
+
+    await assert.rejects(
+      () => organize.reorderDirectory(cfg, index, 'avatar', ['0001.png', '0002.jpg', '0001.jpg']),
+      /重复编号/
+    );
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('organize：手动排序目标名被目录占用时中止且不改名', async () => {
+  const { root, cfg, index } = await makeOrgEnv();
+  try {
+    const dir = path.join(cfg._paths.imageRoot, 'avatar');
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, '0001.png'), 'a');
+    await fsp.writeFile(path.join(dir, '0002.jpg'), 'b');
+    // 目标 0001.jpg 被目录占用：不能覆盖
+    await fsp.mkdir(path.join(dir, '0001.jpg'));
+
+    await assert.rejects(
+      () => organize.reorderDirectory(cfg, index, 'avatar', ['0002.jpg', '0001.png']),
+      /目标文件名已被占用/
+    );
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0001.png'))).toString(), 'a');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0002.jpg'))).toString(), 'b');
+    assert.ok(await fileExists(path.join(dir, '0001.jpg')));
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('organize：表情包主题改名', async () => {
   const { root, cfg, index } = await makeOrgEnv();
   try {
@@ -789,6 +936,67 @@ test('相似归组：横/方/竖不同目录的相似图进入同一组', () => 
   ]);
 });
 
+test('表情包归组：只在同一主题目录内比对，不跨文件夹', () => {
+  const cfg = makeCfg();
+  const index = { items: {
+    'emoticon/A/001.png': { md5: 'a1', dhash: '0000000000000000' },
+    'emoticon/A/002.png': { md5: 'a2', dhash: '0000000000000001' },
+    'emoticon/B/001.png': { md5: 'b1', dhash: '0000000000000000' },
+    'emoticon/B/002.png': { md5: 'b2', dhash: '0000000000000001' },
+    'wallpapers&illustration/heng/0001.jpg': { md5: 'w1', dhash: '0000000000000000' },
+    'wallpapers&illustration/shu/0001.jpg': { md5: 'w2', dhash: '0000000000000001' },
+  } };
+  const g = dedup.findDuplicateGroups(index, 3, new Set(), { cfg });
+  const groups = g.similarGroups.map((gr) => gr.slice().sort());
+  assert.deepStrictEqual(groups, [
+    ['emoticon/A/001.png', 'emoticon/A/002.png'],
+    ['emoticon/B/001.png', 'emoticon/B/002.png'],
+    ['wallpapers&illustration/heng/0001.jpg', 'wallpapers&illustration/shu/0001.jpg'],
+  ]);
+});
+
+test('表情包归组：MD5 完全相同也不跨主题归组', () => {
+  const cfg = makeCfg();
+  const index = { items: {
+    'emoticon/A/001.png': { md5: 'same', dhash: '0000000000000000' },
+    'emoticon/A/002.png': { md5: 'same', dhash: '0000000000000000' },
+    'emoticon/B/001.png': { md5: 'same', dhash: '0000000000000000' },
+  } };
+  const g = dedup.findDuplicateGroups(index, 3, new Set(), { cfg });
+  assert.deepStrictEqual(g.exactGroups.map((gr) => gr.slice().sort()), [
+    ['emoticon/A/001.png', 'emoticon/A/002.png'],
+  ]);
+});
+
+test('表情包上传查重：只命中同主题目录', () => {
+  const cfg = makeCfg();
+  const index = { items: {
+    'emoticon/A/001.png': { md5: 'old-a', dhash: '0000000000000000' },
+    'emoticon/B/001.png': { md5: 'old-b', dhash: '0000000000000000' },
+    'wallpapers&illustration/heng/0001.jpg': { md5: 'old-w', dhash: '0000000000000000' },
+  } };
+  const hitA = dedup.compareAgainstLibrary(index, 'new-md5', '0000000000000000', 3, {
+    item: { rel: 'emoticon/A/__incoming__', w: 100, h: 100 }, cfg
+  });
+  assert.deepStrictEqual(hitA.similar.map((s) => s.rel), ['emoticon/A/001.png']);
+
+  const hitB = dedup.compareAgainstLibrary(index, 'new-md5', '0000000000000000', 3, {
+    item: { rel: 'emoticon/B/__incoming__', w: 100, h: 100 }, cfg
+  });
+  assert.deepStrictEqual(hitB.similar.map((s) => s.rel), ['emoticon/B/001.png']);
+
+  const exactA = dedup.compareAgainstLibrary(index, 'old-a', '0000000000000000', 3, {
+    item: { rel: 'emoticon/A/__incoming__', w: 100, h: 100 }, cfg
+  });
+  assert.deepStrictEqual(exactA.exact, ['emoticon/A/001.png']);
+
+  // 壁纸上传不与该表情包互相比对
+  const hitW = dedup.compareAgainstLibrary(index, 'new-md5', '0000000000000000', 3, {
+    item: { rel: 'wallpapers&illustration/heng/__incoming__', w: 1920, h: 1080 }, cfg
+  });
+  assert.deepStrictEqual(hitW.similar.map((s) => s.rel), ['wallpapers&illustration/heng/0001.jpg']);
+});
+
 // ---------------- 11. 跨方向局部裁切识别 ----------------
 test('局部裁切：整图 dHash 差很远时，竖图仍可凭裁切指纹与横图归组', () => {
   const cfg = { classify: { avatarRatioMax: 1.2 } };
@@ -812,7 +1020,7 @@ test('局部裁切：整图 dHash 差很远时，竖图仍可凭裁切指纹与�
   assert.deepStrictEqual(g.similarGroups[0].slice().sort(), [heng, shu].sort());
 });
 
-test('局部裁切：只在不同方向之间生效，同方向不凭裁切指纹归组', () => {
+test('局部裁切：同方向同宽高比仍交给整图 dHash', () => {
   const cfg = { classify: { avatarRatioMax: 1.2 } };
   const a = 'wallpapers&illustration/heng/0001.jpg';
   const b = 'wallpapers&illustration/heng/0002.jpg';
@@ -829,7 +1037,7 @@ test('局部裁切：只在不同方向之间生效，同方向不凭裁切指�
     }
   } };
   const g = dedup.findDuplicateGroups(index, 3, new Set(), { cfg, cropThreshold: 5 });
-  assert.strictEqual(g.similarGroups.length, 0, '同方向应交给整图 dHash，不启用裁切比对');
+  assert.strictEqual(g.similarGroups.length, 0, '宽高比一致时应交给整图 dHash，不启用局部裁切比对');
 });
 
 test('局部裁切：阈值边界生效（距离 6 时 5 不命中、6 命中）', () => {
@@ -1000,6 +1208,101 @@ test('局部裁切 NCC：整图与固定裁切指纹都不命中时仍能归组'
   assert.strictEqual(cmp.similar.length, 1);
   assert.strictEqual(cmp.similar[0].via, 'ncc');
   assert.ok(cmp.similar[0].score >= 0.9);
+});
+
+test('同方向局部裁切：横图被二次裁切后凭 NCC 归组', async () => {
+  const sharp = require('sharp');
+  const cfg = makeCfg();
+  const width = 400, height = 200;
+  const raw = Buffer.alloc(width * height * 3);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 3;
+      raw[i] = Math.round(255 * x / width);
+      raw[i + 1] = Math.round(255 * y / height);
+      raw[i + 2] = Math.round(128 + 64 * Math.sin(x / 12) * Math.cos(y / 9));
+    }
+  }
+  const fullBuf = await sharp(raw, { raw: { width, height, channels: 3 } }).png().toBuffer();
+  // 同方向二次裁切：只截掉左右，宽高比从 2.0 变成 1.4（仍属横图）
+  const cropBuf = await sharp(fullBuf).extract({ left: 60, top: 0, width: 280, height }).png().toBuffer();
+  const full = await dedup.cropHashesOf(fullBuf, cfg);
+  const crop = await dedup.cropHashesOf(cropBuf, cfg);
+  const fullRel = 'wallpapers&illustration/heng/0001.png';
+  const cropRel = 'wallpapers&illustration/heng/0002.png';
+  // 故意让整图 hash 不命中，强制走局部裁切 NCC
+  const item = (w, h, dhash, C) => ({
+    w, h, dhash, chash: dhash, crops: [], cropVersion: dedup.CROP_VERSION,
+    thumb: C.thumb, rowProf: C.rowProf, colProf: C.colProf
+  });
+  const index = { items: {
+    [fullRel]: item(width, height, '0000000000000000', full),
+    [cropRel]: item(280, height, 'ffffffffffffffff', crop)
+  } };
+
+  const g = dedup.findDuplicateGroups(index, 3, new Set(), { cfg, cropThreshold: 5 });
+  assert.strictEqual(g.similarGroups.length, 1, '同方向二次裁切应凭 NCC 归组');
+  assert.deepStrictEqual(g.similarGroups[0].slice().sort(), [fullRel, cropRel].sort());
+
+  // 上传前查重同样命中，并标记 via=ncc
+  const cmp = dedup.compareAgainstLibrary({ items: { [fullRel]: index.items[fullRel] } },
+    'new-md5', 'ffffffffffffffff', 3, {
+      item: {
+        w: 280, h: height, chash: 'ffffffffffffffff', crops: [],
+        thumb: crop.thumb, rowProf: crop.rowProf, colProf: crop.colProf
+      },
+      cfg, cropThreshold: 5
+    });
+  assert.strictEqual(cmp.similar.length, 1);
+  assert.strictEqual(cmp.similar[0].via, 'ncc');
+
+  // 同方向不参与"谁被裁切"的方向判断；清理时按面积保留完整大图
+  const fullItem = { rel: fullRel, ...index.items[fullRel] };
+  const cropItem = { rel: cropRel, ...index.items[cropRel] };
+  assert.strictEqual(dedup.cropRelationOf(fullItem, cropItem, 5, cfg), null);
+  assert.strictEqual(dedup.pickKeep([cropItem, fullItem], cfg).rel, fullRel);
+});
+
+test('同方向局部裁切：缩放后再裁切可从灰区复核命中', async () => {
+  const sharp = require('sharp');
+  const cfg = makeCfg();
+  const width = 480, height = 240;
+  // 确定性块状纹理：低频结构在缩到 48px 后仍保留，适合验证 NCC 灰区
+  const raw = Buffer.alloc(width * height * 3);
+  let seed = 12345;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  const blocks = [];
+  for (let k = 0; k < 40; k++) {
+    blocks.push({
+      x: Math.floor(rnd() * width), y: Math.floor(rnd() * height),
+      w: 20 + Math.floor(rnd() * 80), h: 20 + Math.floor(rnd() * 60),
+      v: Math.floor(rnd() * 255)
+    });
+  }
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      let v = Math.round(40 + 180 * (x / width));
+      for (const b of blocks) {
+        if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) v = b.v;
+      }
+      const i = (y * width + x) * 3;
+      raw[i] = v; raw[i + 1] = Math.min(255, v + 20); raw[i + 2] = Math.max(0, v - 20);
+    }
+  }
+  const fullBuf = await sharp(raw, { raw: { width, height, channels: 3 } }).png().toBuffer();
+  // 先裁出 340×220，再放大到 360×230：同时存在裁切与缩放
+  const cropBuf = await sharp(fullBuf)
+    .extract({ left: 70, top: 10, width: 340, height: 220 })
+    .resize(360, 230, { fit: 'fill' }).png().toBuffer();
+  const A = await dedup.cropHashesOf(fullBuf, cfg);
+  const B = await dedup.cropHashesOf(cropBuf, cfg);
+  const a = { rel: 'wallpapers&illustration/heng/a.png', w: width, h: height, ...A };
+  const b = { rel: 'wallpapers&illustration/heng/b.png', w: 360, h: 230, ...B };
+
+  const base = dedup.nccScore(a, b, new Map());
+  assert.ok(base >= 0.75 && base < 0.9, `固定尺度应落在灰区，实际 NCC=${base}`);
+  const score = dedup.nccCropMatch(a, b, new Map(), cfg);
+  assert.ok(score !== null && score >= 0.9, `灰区缩放复核应命中，实际 NCC=${score}`);
 });
 
 // ---------------- 12. 裁切方向：保留完整原图 ----------------
