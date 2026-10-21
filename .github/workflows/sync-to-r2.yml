@@ -91,16 +91,25 @@ jobs:
           fi
 
       - name: Validate manifest completeness
-        # 画廊卡片只认 thumb，灯箱优先 large；缺字段会让前端退回原图，这里直接拦下
+        # 画廊卡片只认 thumb，灯箱优先 large；静图必须 thumb/large/宽高齐全。
+        # 动图（GIF/APNG/动态 WebP）按设计不生成 large，灯箱回退原文件以保留动画，
+        # 因此校验时排除带 animated 标记或 .gif 后缀的条目。
         run: |
           node -e '
             const m = require("./worker/assets/manifest.json");
+            const isAnimated = (x) => x.animated === true || /\.gif$/i.test(x.path);
             const noThumb = m.images.filter((x) => !x.thumb).length;
-            const noLarge = m.images.filter((x) => !x.large).length;
+            const noLarge = m.images.filter((x) => !x.large && !isAnimated(x)).length;
             const noSize = m.images.filter((x) => !x.width || !x.height).length;
-            console.log({ count: m.count, noThumb, noLarge, noSize });
-            if (!m.count || noThumb || noLarge || noSize) {
-              console.error("manifest 字段不完整，中止部署");
+            const animated = m.images.filter(isAnimated).length;
+            const countMismatch = m.count !== m.images.length;
+            console.log({ count: m.count, images: m.images.length, noThumb, noLarge, noSize, animated, countMismatch });
+            if (!m.count || countMismatch || noThumb || noLarge || noSize) {
+              const bad = m.images
+                .filter((x) => !x.thumb || (!x.large && !isAnimated(x)) || !x.width || !x.height)
+                .slice(0, 10)
+                .map((x) => x.path);
+              console.error("manifest 字段不完整，中止部署：", bad);
               process.exit(1);
             }
           '

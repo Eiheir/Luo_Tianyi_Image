@@ -16,13 +16,13 @@ Action 现在会为每张原图生成两种变体，并把 `_headers` 一并部�
 | --- | --- | --- |
 | `LTYpicture/**` | 原图 | 原图直链 |
 | `thumbs/**` | 640 宽 WebP | 画廊网格卡片 |
-| `large/**` | 1600 宽 WebP（不放大） | 灯箱高清预览，避免直接加载十几 MB 原图 |
-| `manifest.json` | `{ path, size, width, height, thumb, large }` | 画廊数据源 |
+| `large/**` | 1600 宽 WebP（不放大） | 灯箱高清预览，避免直接加载十几 MB 原图；动图不生成，灯箱回退原 GIF |
+| `manifest.json` | `{ path, size, width, height, thumb, large?, animated? }` | 画廊数据源 |
 
 - 构建脚本与 `_headers` 在本仓库 `scripts/gallery-assets/` 留有 CI 副本；
   博客仓库的 `cloudflare/gallery-assets/build-manifest.mjs` 更新后需同步该副本
   （博客仓库的 `assets/` 被 gitignore，`_headers` 无法随骨架进入 CI）。
-- 当前资产总量约 1.9GB / 2198 个文件（732 原图 + 732 缩略图 + 732 高清图 + 清单 + 头），
+- 当前约 2500+ 个文件（909 原图 + 909 缩略图 + 741 高清图 + 清单/头；168 张 GIF 不生成 large），
   低于 Workers 每版本 20,000 文件限制。
 
 ## 首次启用配置（一次性）
@@ -42,5 +42,5 @@ Action 现在会为每张原图生成两种变体，并把 `_headers` 一并部�
   缩略图 `https://img.xinchengp.cn/thumbs/...`；
   高清预览 `https://img.xinchengp.cn/large/...`；
   清单 `https://img.xinchengp.cn/manifest.json`。
-- 部署前会校验 manifest：任一图片缺 `thumb`、`large`、宽高即中止，防止画廊回退原图。
+- 部署前会校验 manifest：静图必须同时有 `thumb`、`large`、宽高；动图（GIF/APNG/动态 WebP）允许没有 `large`，灯箱会回退原文件以保留动画。任一静图字段缺失即中止。
 - 同步失败会在 Actions 页标红，可点 Re-run。
