@@ -423,27 +423,103 @@ test('organize：移动批次失败时全部回滚', async () => {
   }
 });
 
-test('organize：编号规整消除空洞且两阶段改名无碰撞', async () => {
+test('organize：编号规整用末尾编号回填空位，只改最少的文件', async () => {
   const { root, cfg, index } = await makeOrgEnv();
   try {
     const dir = path.join(cfg._paths.imageRoot, 'avatar');
     await fsp.mkdir(dir, { recursive: true });
-    // 编号集合 {1,3,5}，含"3→2 时 1 不冲突"的常规情形；索引登记 0003
+    // 编号集合 {1,3,5}：1、3 已在连续区间内，只把末尾的 5 填到空位 2
     await fsp.writeFile(path.join(dir, '0001.jpg'), 'a');
     await fsp.writeFile(path.join(dir, '0003.jpg'), 'b');
     await fsp.writeFile(path.join(dir, '0005.jpg'), 'c');
     await fsp.writeFile(path.join(dir, 'readme.txt'), 'skip'); // 非编号文件不动
-    dedup.setIndexItem(index, 'avatar/0003.jpg', { mtime: 1, size: 1, w: 1, h: 1, md5: '', dhash: '' });
+    dedup.setIndexItem(index, 'avatar/0003.jpg', { mtime: 1, size: 2, w: 1, h: 1, md5: 'b', dhash: '' });
+    dedup.setIndexItem(index, 'avatar/0005.jpg', { mtime: 1, size: 3, w: 1, h: 1, md5: 'c', dhash: '' });
 
-    const r = await organize.renumberDirectory(cfg, index, 'wallpapers&illustration/avatar'.replace('wallpapers&illustration/', ''));
-    // 上面一行等价于 'avatar'（direct dir），返回映射应把 0003→0002
+    const r = await organize.renumberDirectory(cfg, index, 'avatar');
     assert.strictEqual(r.total, 3);
-    assert.strictEqual(r.renumbered, 2); // 0003→0002、0005→0003（0001 不变）
-    assert.ok((await fsp.readFile(path.join(dir, '0002.jpg'))).toString() === 'b');
-    assert.ok((await fsp.readFile(path.join(dir, '0003.jpg'))).toString() === 'c');
-    assert.ok(await fileExists(path.join(dir, '0001.jpg')));
+    assert.strictEqual(r.renumbered, 1, '只需把 0005 改名为 0002');
+    assert.strictEqual(r.filled, 1);
+    assert.strictEqual(r.alreadyInPlace, 2);
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0001.jpg'))).toString(), 'a');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0002.jpg'))).toString(), 'c');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0003.jpg'))).toString(), 'b');
     assert.ok(await fileExists(path.join(dir, 'readme.txt')), '非编号文件不应被动');
-    assert.ok(index.items['avatar/0002.jpg'], '索引应换到新键 0002');
+    // 索引随移动迁移：0003 原地不动，0005 → 0002
+    assert.ok(index.items['avatar/0003.jpg'], '已在正确编号的文件索引不变');
+    assert.ok(index.items['avatar/0002.jpg'], '被移动文件的索引应换到新键');
+    assert.strictEqual(index.items['avatar/0005.jpg'], undefined, '旧索引键应移除');
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('organize：多个空洞按“末尾优先”回填，重命名次数等于空位数', async () => {
+  const { root, cfg, index } = await makeOrgEnv();
+  try {
+    const dir = path.join(cfg._paths.imageRoot, 'avatar');
+    await fsp.mkdir(dir, { recursive: true });
+    // {1,3,5,9} → 空位 {2,4}；用最大的 9 填 2、5 填 4
+    await fsp.writeFile(path.join(dir, '0001.jpg'), 'a');
+    await fsp.writeFile(path.join(dir, '0003.jpg'), 'b');
+    await fsp.writeFile(path.join(dir, '0005.jpg'), 'c');
+    await fsp.writeFile(path.join(dir, '0009.jpg'), 'd');
+
+    const r = await organize.renumberDirectory(cfg, index, 'avatar');
+    assert.strictEqual(r.total, 4);
+    assert.strictEqual(r.renumbered, 2);
+    assert.strictEqual(r.filled, 2);
+    assert.strictEqual(r.alreadyInPlace, 2);
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0001.jpg'))).toString(), 'a');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0002.jpg'))).toString(), 'd');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0003.jpg'))).toString(), 'b');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0004.jpg'))).toString(), 'c');
+    assert.strictEqual(await fileExists(path.join(dir, '0005.jpg')), false);
+    assert.strictEqual(await fileExists(path.join(dir, '0009.jpg')), false);
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('organize：编号已连续时不做任何改名', async () => {
+  const { root, cfg, index } = await makeOrgEnv();
+  try {
+    const dir = path.join(cfg._paths.imageRoot, 'avatar');
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, '0001.jpg'), 'a');
+    await fsp.writeFile(path.join(dir, '0002.jpg'), 'b');
+    await fsp.writeFile(path.join(dir, '0003.jpg'), 'c');
+
+    const r = await organize.renumberDirectory(cfg, index, 'avatar');
+    assert.strictEqual(r.total, 3);
+    assert.strictEqual(r.renumbered, 0);
+    assert.strictEqual(r.filled, 0);
+    assert.strictEqual(r.alreadyInPlace, 3);
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0001.jpg'))).toString(), 'a');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0002.jpg'))).toString(), 'b');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0003.jpg'))).toString(), 'c');
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('organize：目标文件名被非编号文件占用时中止且不改名', async () => {
+  const { root, cfg, index } = await makeOrgEnv();
+  try {
+    const dir = path.join(cfg._paths.imageRoot, 'avatar');
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, '0001.jpg'), 'a');
+    await fsp.writeFile(path.join(dir, '0003.jpg'), 'b');
+    // 目录名恰好占用了空位 0002.jpg；规整不得覆盖它
+    await fsp.mkdir(path.join(dir, '0002.jpg'));
+
+    await assert.rejects(
+      () => organize.renumberDirectory(cfg, index, 'avatar'),
+      /目标文件名已被占用/
+    );
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0001.jpg'))).toString(), 'a');
+    assert.strictEqual((await fsp.readFile(path.join(dir, '0003.jpg'))).toString(), 'b');
+    assert.ok(await fileExists(path.join(dir, '0002.jpg')), '冲突目标应保持原样');
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
   }
@@ -475,15 +551,15 @@ const settings = require('../core/settings');
 test('settings：publicView 只含白名单字段', () => {
   const view = settings.publicView({
     upload: { quality: 100, maxBatchFiles: 200, maxFileMB: 60 },
-    dedup: { hammingThreshold: 5, onExactDuplicate: 'skip' },
+    dedup: { hammingThreshold: 5, cropThreshold: 5, onExactDuplicate: 'skip' },
     linkFormat: 'jsdelivr',
     git: { purgeCdn: false },
     accessToken: '',
     _paths: { secret: 'x' }
   });
   assert.deepStrictEqual(Object.keys(view).sort(),
-    ['accessToken', 'dedup.hammingThreshold', 'dedup.onExactDuplicate', 'git.purgeCdn',
-     'linkFormat', 'upload.maxBatchFiles', 'upload.maxFileMB', 'upload.quality'].sort());
+    ['accessToken', 'dedup.hammingThreshold', 'dedup.cropThreshold', 'dedup.onExactDuplicate',
+     'git.purgeCdn', 'linkFormat', 'upload.maxBatchFiles', 'upload.maxFileMB', 'upload.quality'].sort());
 });
 
 test('settings：SETTABLE 校验函数拒绝越界值', () => {
@@ -494,6 +570,9 @@ test('settings：SETTABLE 校验函数拒绝越界值', () => {
   assert.strictEqual(settings.SETTABLE['linkFormat']('evil'), null);
   assert.strictEqual(settings.SETTABLE['git.purgeCdn'](true), true);
   assert.strictEqual(settings.SETTABLE['git.purgeCdn'](1), null);
+  // 局部裁切阈值：与整图阈值同范围
+  assert.strictEqual(settings.SETTABLE['dedup.cropThreshold'](5), 5);
+  assert.strictEqual(settings.SETTABLE['dedup.cropThreshold'](21), null);
   // 访问令牌：任意字符串（含空串=关闭鉴权）；超长拒绝
   assert.strictEqual(settings.SETTABLE['accessToken']('abc-123'), 'abc-123');
   assert.strictEqual(settings.SETTABLE['accessToken'](''), '');
@@ -636,4 +715,365 @@ test('organize：去重保留图自动压缩到组内最小序号，目标被占
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
   }
+});
+
+// ---------------- 10. 查重保留规则：横 > 方 > 竖 ----------------
+test('保留规则：跨方向时横图优先于更大的方图/竖图', () => {
+  const cfg = { classify: { avatarRatioMax: 1.2 }, dedup: {} };
+  const items = [
+    { rel: 'wallpapers&illustration/shu/0001.jpg', w: 4000, h: 6000, size: 5000000 },
+    { rel: 'wallpapers&illustration/avatar/0001.jpg', w: 3000, h: 3000, size: 4000000 },
+    { rel: 'wallpapers&illustration/heng/0001.jpg', w: 1920, h: 1080, size: 2000000 },
+  ];
+  const r = dedup.pickKeep(items, cfg);
+  assert.strictEqual(r.rel, 'wallpapers&illustration/heng/0001.jpg', '横图应优先，即使面积更小');
+  assert.strictEqual(r.orientation, 'heng');
+  // 没有横图时，方图优先于面积更大的竖图
+  const r2 = dedup.pickKeep(items.slice(0, 2), cfg);
+  assert.strictEqual(r2.rel, 'wallpapers&illustration/avatar/0001.jpg', '方图应优先于竖图');
+  assert.strictEqual(r2.orientation, 'avatar');
+});
+
+test('保留规则：同方向比面积，面积相同比体积，仍相同保持原顺序', () => {
+  const cfg = { classify: { avatarRatioMax: 1.2 }, dedup: {} };
+  const r = dedup.pickKeep([
+    { rel: 'a.jpg', w: 1920, h: 1080, size: 100 },
+    { rel: 'b.jpg', w: 2560, h: 1440, size: 90 },
+    { rel: 'c.jpg', w: 1280, h: 720, size: 999 },
+  ], cfg);
+  assert.strictEqual(r.rel, 'b.jpg', '同为横图时保留面积最大的');
+  const r2 = dedup.pickKeep([
+    { rel: 'a.jpg', w: 1920, h: 1080, size: 100 },
+    { rel: 'b.jpg', w: 1920, h: 1080, size: 200 },
+  ], cfg);
+  assert.strictEqual(r2.rel, 'b.jpg', '面积相同保留体积更大的');
+  const r3 = dedup.pickKeep([
+    { rel: 'a.jpg', w: 1920, h: 1080, size: 100 },
+    { rel: 'b.jpg', w: 1920, h: 1080, size: 100 },
+  ], cfg);
+  assert.strictEqual(r3.rel, 'a.jpg', '完全同分保持组内原顺序');
+});
+
+test('保留规则：dedup.keepPriority 可覆盖默认顺序', () => {
+  const cfg = { classify: { avatarRatioMax: 1.2 }, dedup: { keepPriority: ['shu', 'avatar', 'heng'] } };
+  const r = dedup.pickKeep([
+    { rel: 'heng.jpg', w: 4000, h: 2000, size: 1 },
+    { rel: 'shu.jpg', w: 1000, h: 2000, size: 1 },
+  ], cfg);
+  assert.strictEqual(r.rel, 'shu.jpg');
+  assert.deepStrictEqual(r.priority, ['shu', 'avatar', 'heng']);
+});
+
+test('方向判定：尺寸缺失时按目录兜底，非法优先级回退默认', () => {
+  const cfg = { classify: { avatarRatioMax: 1.2 }, dedup: { keepPriority: ['heng', 'heng', 'shu'] } };
+  assert.strictEqual(dedup.orientationOf(1920, 1080, cfg), 'heng');
+  assert.strictEqual(dedup.orientationOf(1080, 1920, cfg), 'shu');
+  assert.strictEqual(dedup.orientationOf(1080, 1080, cfg), 'avatar');
+  assert.strictEqual(dedup.orientationOf(0, 1080, cfg), '');
+  assert.strictEqual(dedup.orientationOfItem({ rel: 'wallpapers&illustration/shu/0001.jpg' }, cfg), 'shu');
+  assert.deepStrictEqual(dedup.keepPriorityOf(cfg), ['heng', 'avatar', 'shu'], '非法顺序应回退默认');
+});
+
+test('相似归组：横/方/竖不同目录的相似图进入同一组', () => {
+  const index = { items: {
+    'wallpapers&illustration/heng/0001.jpg': { dhash: '0000000000000000' },
+    'wallpapers&illustration/shu/0001.jpg': { dhash: '0000000000000001' },
+    'wallpapers&illustration/avatar/0001.jpg': { dhash: '0000000000000003' },
+  } };
+  const g = dedup.findDuplicateGroups(index, 3);
+  assert.strictEqual(g.similarGroups.length, 1);
+  assert.deepStrictEqual(g.similarGroups[0].slice().sort(), [
+    'wallpapers&illustration/avatar/0001.jpg',
+    'wallpapers&illustration/heng/0001.jpg',
+    'wallpapers&illustration/shu/0001.jpg',
+  ]);
+});
+
+// ---------------- 11. 跨方向局部裁切识别 ----------------
+test('局部裁切：整图 dHash 差很远时，竖图仍可凭裁切指纹与横图归组', () => {
+  const cfg = { classify: { avatarRatioMax: 1.2 } };
+  const heng = 'wallpapers&illustration/heng/0001.jpg';
+  const shu = 'wallpapers&illustration/shu/0001.jpg';
+  const index = { items: {
+    [heng]: {
+      w: 1920, h: 1080, dhash: '0000000000000000',
+      chash: 'aaaaaaaaaaaaaaaa', cropVersion: 1,
+      crops: [[0.5625, 'bbbbbbbbbbbbbbbb'], [1, 'cccccccccccccccc']]
+    },
+    [shu]: {
+      w: 1080, h: 1920, dhash: 'ffffffffffffffff',
+      chash: 'bbbbbbbbbbbbbbbb', cropVersion: 1,
+      crops: [[1.7778, 'dddddddddddddddd'], [1, 'eeeeeeeeeeeeeeee']]
+    }
+  } };
+  // 整图 dHash 距离 64；竖图整图 = 横图 9:16 位置的裁切指纹 → 应归组
+  const g = dedup.findDuplicateGroups(index, 3, new Set(), { cfg, cropThreshold: 5 });
+  assert.strictEqual(g.similarGroups.length, 1);
+  assert.deepStrictEqual(g.similarGroups[0].slice().sort(), [heng, shu].sort());
+});
+
+test('局部裁切：只在不同方向之间生效，同方向不凭裁切指纹归组', () => {
+  const cfg = { classify: { avatarRatioMax: 1.2 } };
+  const a = 'wallpapers&illustration/heng/0001.jpg';
+  const b = 'wallpapers&illustration/heng/0002.jpg';
+  const index = { items: {
+    [a]: {
+      w: 1920, h: 1080, dhash: '0000000000000000',
+      chash: 'aaaaaaaaaaaaaaaa', cropVersion: 1,
+      crops: [[0.5625, 'bbbbbbbbbbbbbbbb']]
+    },
+    [b]: {
+      w: 2560, h: 1440, dhash: 'ffffffffffffffff',
+      chash: 'bbbbbbbbbbbbbbbb', cropVersion: 1,
+      crops: [[0.5625, 'cccccccccccccccc']]
+    }
+  } };
+  const g = dedup.findDuplicateGroups(index, 3, new Set(), { cfg, cropThreshold: 5 });
+  assert.strictEqual(g.similarGroups.length, 0, '同方向应交给整图 dHash，不启用裁切比对');
+});
+
+test('局部裁切：阈值边界生效（距离 6 时 5 不命中、6 命中）', () => {
+  const cfg = { classify: { avatarRatioMax: 1.2 } };
+  const heng = 'wallpapers&illustration/heng/0001.jpg';
+  const shu = 'wallpapers&illustration/shu/0001.jpg';
+  const index = { items: {
+    [heng]: {
+      w: 1920, h: 1080, dhash: '0000000000000000',
+      chash: 'aaaaaaaaaaaaaaaa', cropVersion: 1,
+      crops: [[0.5625, 'bbbbbbbbbbbbbbbb']]
+    },
+    [shu]: {
+      w: 1080, h: 1920, dhash: 'ffffffffffffffff',
+      chash: 'bbbbbbbbbbbbbb00', cropVersion: 1,
+      crops: [[1.7778, 'dddddddddddddddd']]
+    }
+  } };
+  assert.strictEqual(dedup.findDuplicateGroups(index, 3, new Set(), { cfg, cropThreshold: 5 }).similarGroups.length, 0);
+  assert.strictEqual(dedup.findDuplicateGroups(index, 3, new Set(), { cfg, cropThreshold: 6 }).similarGroups.length, 1);
+});
+
+test('局部裁切：上传前查重能标记 via=crop', () => {
+  const cfg = { classify: { avatarRatioMax: 1.2 } };
+  const shu = 'wallpapers&illustration/shu/0001.jpg';
+  const index = { items: {
+    [shu]: {
+      w: 1080, h: 1920, md5: 'old', dhash: 'ffffffffffffffff',
+      chash: 'cccccccccccccccc', cropVersion: 1,
+      crops: [[1.7778, 'bbbbbbbbbbbbbbbb'], [1, 'dddddddddddddddd']]
+    }
+  } };
+  // 新上传的横图整图与库内竖图的 16:9 裁切位置一致
+  const incoming = {
+    w: 1920, h: 1080,
+    chash: 'bbbbbbbbbbbbbbbb',
+    crops: [[0.5625, 'eeeeeeeeeeeeeeee']]
+  };
+  const cmp = dedup.compareAgainstLibrary(index, 'new-md5', '0000000000000000', 3, {
+    item: incoming, cfg, cropThreshold: 5
+  });
+  assert.strictEqual(cmp.similar.length, 1);
+  assert.strictEqual(cmp.similar[0].rel, shu);
+  assert.strictEqual(cmp.similar[0].via, 'crop');
+});
+
+test('局部裁切指纹：cropHashesOf 生成整图与多宽高比裁切哈希', async () => {
+  const sharp = require('sharp');
+  const width = 240, height = 120;
+  const raw = Buffer.alloc(width * height * 3);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 3;
+      raw[i] = Math.round(255 * x / width);
+      raw[i + 1] = Math.round(255 * y / height);
+      raw[i + 2] = 128;
+    }
+  }
+  const buf = await sharp(raw, { raw: { width, height, channels: 3 } }).png().toBuffer();
+  const c = await dedup.cropHashesOf(buf, makeCfg());
+  assert.match(c.chash, /^[0-9a-f]{16}$/);
+  assert.strictEqual(c.cropVersion, dedup.CROP_VERSION);
+  // v2 数据：缩略图 + 32 段行列投影（供任意位置 NCC）
+  assert.ok(c.thumb && c.thumb.w > 0 && c.thumb.h > 0);
+  assert.strictEqual(typeof c.thumb.data, 'string');
+  assert.ok(c.thumb.data.length > 0);
+  assert.strictEqual(c.rowProf.length, 32);
+  assert.strictEqual(c.colProf.length, 32);
+  // 横图应有 3 个竖裁切宽高比 + 1 个方裁切
+  assert.strictEqual(c.crops.length, 4);
+  for (const g of c.crops) {
+    assert.strictEqual(typeof g[0], 'number');
+    assert.ok(g.length >= 2);
+    for (let i = 1; i < g.length; i++) assert.match(g[i], /^[0-9a-f]{16}$/);
+  }
+});
+
+test('局部裁切 NCC：任意位置截取可命中，明显无关的图不命中', async () => {
+  const sharp = require('sharp');
+  const cfg = makeCfg();
+  const width = 240, height = 120;
+  const raw = Buffer.alloc(width * height * 3);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 3;
+      raw[i] = Math.round(255 * x / width);
+      raw[i + 1] = Math.round(255 * y / height);
+      raw[i + 2] = Math.round(128 + 64 * Math.sin(x / 12) * Math.cos(y / 9));
+    }
+  }
+  const buf = await sharp(raw, { raw: { width, height, channels: 3 } }).png().toBuffer();
+  // 任意位置（偏左 73px）截取一张 80×120 的竖图
+  const cropBuf = await sharp(buf).extract({ left: 73, top: 0, width: 80, height: 120 }).png().toBuffer();
+  const A = await dedup.cropHashesOf(buf, cfg);
+  const B = await dedup.cropHashesOf(cropBuf, cfg);
+  const score = dedup.nccCropMatch(
+    { rel: 'wallpapers&illustration/heng/a.png', w: width, h: height, ...A },
+    { rel: 'wallpapers&illustration/shu/b.png', w: 80, h: 120, ...B },
+    new Map(), cfg
+  );
+  assert.ok(score !== null && score >= 0.9, `任意位置裁切应命中，实际 NCC=${score}`);
+
+  // 反相渐变：结构完全不同，不应命中
+  const raw2 = Buffer.alloc(width * height * 3);
+  for (let i = 0; i < raw2.length; i += 3) {
+    raw2[i] = 255 - raw[i];
+    raw2[i + 1] = 255 - raw[i + 1];
+    raw2[i + 2] = 255 - raw[i + 2];
+  }
+  const otherBuf = await sharp(raw2, { raw: { width, height, channels: 3 } }).png().toBuffer();
+  const C = await dedup.cropHashesOf(otherBuf, cfg);
+  const miss = dedup.nccCropMatch(
+    { rel: 'wallpapers&illustration/heng/c.png', w: width, h: height, ...C },
+    { rel: 'wallpapers&illustration/shu/b.png', w: 80, h: 120, ...B },
+    new Map(), cfg
+  );
+  assert.strictEqual(miss, null, '反相图不应被判为同一裁切');
+});
+
+test('局部裁切 NCC：整图与固定裁切指纹都不命中时仍能归组', async () => {
+  const sharp = require('sharp');
+  const cfg = makeCfg();
+  const width = 240, height = 120;
+  const raw = Buffer.alloc(width * height * 3);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 3;
+      raw[i] = Math.round(255 * x / width);
+      raw[i + 1] = Math.round(255 * y / height);
+      raw[i + 2] = Math.round(128 + 64 * Math.sin(x / 12) * Math.cos(y / 9));
+    }
+  }
+  const buf = await sharp(raw, { raw: { width, height, channels: 3 } }).png().toBuffer();
+  const cropBuf = await sharp(buf).extract({ left: 73, top: 0, width: 80, height: 120 }).png().toBuffer();
+  const A = await dedup.cropHashesOf(buf, cfg);
+  const B = await dedup.cropHashesOf(cropBuf, cfg);
+  const heng = 'wallpapers&illustration/heng/0001.png';
+  const shu = 'wallpapers&illustration/shu/0001.png';
+  const base = (x, w, h) => ({
+    w, h,
+    // 故意让整图 dHash 与固定裁切指纹都不命中，只保留 NCC 所需的缩略图/投影
+    dhash: x, chash: x, crops: [], cropVersion: dedup.CROP_VERSION,
+    thumb: null, rowProf: null, colProf: null
+  });
+  const index = { items: {
+    [heng]: { ...base('0000000000000000', width, height), thumb: A.thumb, rowProf: A.rowProf, colProf: A.colProf },
+    [shu]: { ...base('ffffffffffffffff', 80, 120), thumb: B.thumb, rowProf: B.rowProf, colProf: B.colProf }
+  } };
+  const g = dedup.findDuplicateGroups(index, 3, new Set(), { cfg, cropThreshold: 5 });
+  assert.strictEqual(g.similarGroups.length, 1);
+  assert.deepStrictEqual(g.similarGroups[0].slice().sort(), [heng, shu].sort());
+
+  // 同一套数据走"上传前查重"路径：应返回 via=ncc 并带上 NCC 分数
+  const uploadIndex = { items: {
+    [shu]: {
+      w: 80, h: 120, md5: 'old', dhash: 'ffffffffffffffff',
+      chash: 'ffffffffffffffff', crops: [], cropVersion: dedup.CROP_VERSION,
+      thumb: B.thumb, rowProf: B.rowProf, colProf: B.colProf
+    }
+  } };
+  const cmp = dedup.compareAgainstLibrary(uploadIndex, 'new-md5', '0000000000000000', 3, {
+    item: {
+      w: width, h: height, chash: '0000000000000000', crops: [],
+      thumb: A.thumb, rowProf: A.rowProf, colProf: A.colProf
+    },
+    cfg, cropThreshold: 5
+  });
+  assert.strictEqual(cmp.similar.length, 1);
+  assert.strictEqual(cmp.similar[0].via, 'ncc');
+  assert.ok(cmp.similar[0].score >= 0.9);
+});
+
+// ---------------- 12. 裁切方向：保留完整原图 ----------------
+test('裁切方向：固定裁切指纹能指出被截取的图', () => {
+  const cfg = makeCfg();
+  const heng = 'wallpapers&illustration/heng/0001.jpg';
+  const shu = 'wallpapers&illustration/shu/0001.jpg';
+  const A = {
+    rel: heng, w: 1920, h: 1080,
+    chash: 'aaaaaaaaaaaaaaaa',
+    crops: [[0.5625, 'bbbbbbbbbbbbbbbb'], [1, 'cccccccccccccccc']]
+  };
+  const B = {
+    rel: shu, w: 1080, h: 1920,
+    chash: 'bbbbbbbbbbbbbbbb',
+    crops: [[1.7778, 'dddddddddddddddd'], [1, 'eeeeeeeeeeeeeeee']]
+  };
+  const direction = dedup.cropRelationOf(A, B, 5, cfg);
+  assert.ok(direction);
+  assert.strictEqual(direction.cropRel, shu, '竖图整图命中横图裁切，竖图应是被截取图');
+  assert.strictEqual(direction.fullRel, heng);
+
+  const keep = dedup.pickCropKeeper([A, B], cfg, 5);
+  assert.strictEqual(keep.keepRel, heng);
+  assert.deepStrictEqual(keep.cropRels, [shu]);
+});
+
+test('裁切方向：多张截取图只保留完整原图', () => {
+  const cfg = makeCfg();
+  const full = {
+    rel: 'wallpapers&illustration/shu/0001.jpg', w: 1080, h: 1920,
+    chash: 'ffffffffffffffff',
+    crops: [[1.7778, 'aaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbb']]
+  };
+  const a = { rel: 'wallpapers&illustration/heng/0001.jpg', w: 1920, h: 1080, chash: 'aaaaaaaaaaaaaaaa', crops: [] };
+  const b = { rel: 'wallpapers&illustration/heng/0002.jpg', w: 1920, h: 1080, chash: 'bbbbbbbbbbbbbbbb', crops: [] };
+
+  const keep = dedup.pickCropKeeper([full, a, b], cfg, 5);
+  assert.strictEqual(keep.keepRel, full.rel);
+  assert.deepStrictEqual(keep.cropRels.slice().sort(), [a.rel, b.rel].sort());
+});
+
+test('裁切方向：同方向不参与裁切方向判断', () => {
+  const cfg = makeCfg();
+  const a = { rel: 'wallpapers&illustration/heng/0001.jpg', w: 1920, h: 1080, chash: 'aaaaaaaaaaaaaaaa', crops: [[0.5625, 'bbbbbbbbbbbbbbbb']] };
+  const b = { rel: 'wallpapers&illustration/heng/0002.jpg', w: 2560, h: 1440, chash: 'bbbbbbbbbbbbbbbb', crops: [[0.5625, 'cccccccccccccccc']] };
+  assert.strictEqual(dedup.cropRelationOf(a, b, 5, cfg), null);
+  assert.strictEqual(dedup.pickCropKeeper([a, b], cfg, 5), null);
+});
+
+test('裁切方向：NCC 滑窗能指出被截取的图', async () => {
+  const sharp = require('sharp');
+  const cfg = makeCfg();
+  const width = 240, height = 120;
+  const raw = Buffer.alloc(width * height * 3);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 3;
+      raw[i] = Math.round(255 * x / width);
+      raw[i + 1] = Math.round(255 * y / height);
+      raw[i + 2] = Math.round(128 + 64 * Math.sin(x / 12) * Math.cos(y / 9));
+    }
+  }
+  const buf = await sharp(raw, { raw: { width, height, channels: 3 } }).png().toBuffer();
+  const cropBuf = await sharp(buf).extract({ left: 73, top: 0, width: 80, height: 120 }).png().toBuffer();
+  const A = await dedup.cropHashesOf(buf, cfg);
+  const B = await dedup.cropHashesOf(cropBuf, cfg);
+  // 清空固定裁切指纹，强制走 NCC 方向判断
+  const aItem = { rel: 'wallpapers&illustration/heng/a.png', w: width, h: height, ...A, chash: '0000000000000000', crops: [] };
+  const bItem = { rel: 'wallpapers&illustration/shu/b.png', w: 80, h: 120, ...B, chash: 'ffffffffffffffff', crops: [] };
+
+  const keep = dedup.pickCropKeeper([aItem, bItem], cfg, 5);
+  assert.ok(keep);
+  assert.strictEqual(keep.keepRel, aItem.rel, '完整横图应保留');
+  assert.deepStrictEqual(keep.cropRels, [bItem.rel], '局部竖图应被去除');
+  assert.strictEqual(keep.via, 'ncc');
 });

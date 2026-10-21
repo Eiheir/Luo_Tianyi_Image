@@ -32,7 +32,13 @@
   },
   "dedup": {
     "hammingThreshold": 3,
-    "onExactDuplicate": "skip"
+    "cropThreshold": 5,
+    "onExactDuplicate": "skip",
+    "keepPriority": [
+      "heng",
+      "avatar",
+      "shu"
+    ]
   },
   "upload": {
     "maxBatchFiles": 500,
@@ -44,5 +50,6 @@
     "timeoutMs": 120000,
     "purgeCdn": true
   },
-  "linkFormat": "jsdelivr"
+  "linkFormat": "jsdelivr",
+  "accessToken": ""
 }

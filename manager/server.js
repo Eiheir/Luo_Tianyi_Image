@@ -178,7 +178,11 @@ app.get('/api/config', (req, res) => ok(res, {
   imageRoot: cfg.imageRoot,
   classify: cfg.classify,
   naming: cfg.naming,
-  dedup: { hammingThreshold: cfg.dedup.hammingThreshold },
+  dedup: {
+    hammingThreshold: cfg.dedup.hammingThreshold,
+    cropThreshold: Number(cfg.dedup.cropThreshold) || 5,
+    keepPriority: dedup.keepPriorityOf(cfg) // 默认 ['heng','avatar','shu']
+  },
   upload: cfg.upload,
   git: { enabled: cfg.git.enabled !== false, purgeCdn: !!cfg.git.purgeCdn },
   linkFormat: cfg.linkFormat,
@@ -344,21 +348,54 @@ app.get('/api/raw', wrap(async (req, res) => {
 
 app.post('/api/duplicates/scan', wrap(async (req, res) => {
   const deep = !!(req.body && req.body.deep);
-  // deep=true 时补算全部缺失哈希（首次全量查重）；之后增量
-  const scan = await dedup.scanLibrary(cfg, { deep: deep || Object.values(index.items).every((i) => !i.dhash) });
+  // deep=true 时补齐缺失的整图指纹；withCrops 确保壁纸拥有局部裁切指纹（首次会慢一些）
+  const scan = await dedup.scanLibrary(cfg, {
+    deep: deep || Object.values(index.items).every((i) => !i.dhash),
+    withCrops: true
+  });
   index.items = scan.items;
   const threshold = Number(cfg.dedup.hammingThreshold) || 5;
+  const cropThreshold = Number(cfg.dedup.cropThreshold) || 5;
   // 手动忽略：用户确认"看着像但不是重复"的图片，相似归组时彻底跳过
   const muted = await dedup.loadIgnoreSet(cfg);
-  const groups = dedup.findDuplicateGroups(index, threshold, muted);
-  // 组内附带缩略图信息，前端直接渲染
-  const decorate = (group) => group.map((rel) => {
-    const it = index.items[rel] || {};
-    return { rel, name: path.basename(rel), w: it.w, h: it.h, size: it.size, sizeText: storage.humanSize(it.size) };
-  });
+  const groups = dedup.findDuplicateGroups(index, threshold, muted, { cfg, cropThreshold });
+  // 组内附带缩略图信息 + 方向 + 默认保留标记，前端直接渲染
+  const decorate = (group) => {
+    // 内部条目保留裁切指纹/缩略图，用于判断谁是被截取的图；响应中不下发这些大字段
+    const internal = group.map((rel) => ({ rel, ...(index.items[rel] || {}) }));
+    const items = internal.map((it) => ({
+      rel: it.rel, name: path.basename(it.rel), w: it.w || 0, h: it.h || 0,
+      size: it.size || 0, sizeText: storage.humanSize(it.size), mtime: it.mtime || 0,
+      orientation: dedup.orientationOfItem({ rel: it.rel, w: it.w, h: it.h }, cfg),
+      crossOrientation: false,
+      cropGroup: false,
+      isCrop: false,
+      keepReason: 'rule',
+      keeper: false
+    }));
+    // 组内出现横/方/竖不同方向 → 可能来自"整图 + 局部裁切"识别
+    const orientations = new Set(items.map((it) => it.orientation).filter(Boolean));
+    const cross = orientations.size > 1;
+    for (const it of items) it.crossOrientation = cross;
+
+    // 跨方向裁切组：智能识别完整原图，保留原图、去除被截取的图；
+    // 非裁切组仍按方向规则（横 > 方 > 竖）选保留项。
+    const cropInfo = dedup.pickCropKeeper(internal, cfg, cropThreshold);
+    const keep = cropInfo ? { rel: cropInfo.keepRel } : dedup.pickKeep(items, cfg);
+    const cropSet = new Set(cropInfo ? cropInfo.cropRels : []);
+    for (const it of items) {
+      it.keeper = it.rel === keep.rel;
+      it.cropGroup = !!cropInfo;
+      it.isCrop = cropSet.has(it.rel);
+      it.keepReason = cropInfo ? 'crop' : 'rule';
+    }
+    return items;
+  };
   ok(res, {
     exactGroups: groups.exactGroups.map(decorate),
     similarGroups: groups.similarGroups.map(decorate),
+    keepPriority: dedup.keepPriorityOf(cfg),
+    cropThreshold,
     scanned: Object.keys(index.items).length,
     ignoredPairs: muted.size
   });
@@ -371,7 +408,10 @@ app.get('/api/duplicates/ignored', wrap(async (req, res) => {
   const muted = await dedup.loadIgnoreSet(cfg);
   const items = [...muted].map((rel) => {
     const it = index.items[rel] || {};
-    return { rel, name: path.basename(rel), w: it.w, h: it.h, sizeText: storage.humanSize(it.size) };
+    return {
+      rel, name: path.basename(rel), w: it.w || 0, h: it.h || 0,
+      size: it.size || 0, mtime: it.mtime || 0, sizeText: storage.humanSize(it.size)
+    };
   });
   ok(res, { items });
 }));
@@ -433,8 +473,19 @@ app.post('/api/convert', wrap(async (req, res) => {
       });
       const md5 = dedup.md5Of(processed.buffer);
       const dhash = await dedup.dhashOf(processed.buffer).catch(() => '');
+      // 壁纸类补充局部裁切指纹，转换后的新文件同样参与跨方向裁切匹配
+      let cropData = null;
+      if (['heng', 'shu', 'avatar'].includes(storage.categoryOf(newRel, cfg))) {
+        try { cropData = await dedup.cropHashesOf(processed.buffer, cfg); } catch (e) { cropData = null; }
+      }
       dedup.setIndexItem(index, newRel, {
-        mtime: st.mtimeMs, size: st.size, w: processed.width, h: processed.height, md5, dhash
+        mtime: st.mtimeMs, size: st.size, w: processed.width, h: processed.height, md5, dhash,
+        chash: cropData && cropData.chash,
+        crops: cropData && cropData.crops,
+        cropVersion: cropData && cropData.cropVersion,
+        thumb: cropData && cropData.thumb,
+        rowProf: cropData && cropData.rowProf,
+        colProf: cropData && cropData.colProf
       });
 
       // 替换原图：原文件移入回收站（可恢复），并从索引移除
@@ -547,17 +598,32 @@ app.post('/api/trash', wrap(async (req, res) => {
 
 app.get('/api/trash', wrap(async (req, res) => ok(res, await storage.listTrash(cfg))));
 
-/* ---------- 查重清理：保留最高清 + 序号压到组内最小值 ---------- */
+/* ---------- 查重清理：按方向规则保留（横>方>竖）+ 序号压到组内最小值 ---------- */
 
 app.post('/api/duplicates/keep-best', wrap(async (req, res) => {
-  const { group, keep } = req.body || {};
-  if (!Array.isArray(group) || group.length < 2 || !keep || !group.includes(keep)) {
-    return fail(res, 400, '参数不完整：需要 group 数组和其中的 keep');
+  const { group, keep: requestedKeep, manual } = req.body || {};
+  if (!Array.isArray(group) || group.length < 2) {
+    return fail(res, 400, '参数不完整：需要至少 2 张图片的 group 数组');
   }
   for (const rel of group) {
     if (!safeJoinImage(cfg, rel)) return fail(res, 400, `非法路径：${rel}`);
   }
+
+  // 默认由服务端决策：跨方向裁切组保留完整原图、去除截取图；
+  // 其他组仍按方向规则（横图 > 方图 > 竖图，同方向取最高清）。
+  // 只有显式 manual=true 才允许前端指定 keep 覆盖默认决策。
+  const items = group.map((rel) => ({ rel, ...(index.items[rel] || {}) }));
+  const cropInfo = dedup.pickCropKeeper(items, cfg, Number(cfg.dedup.cropThreshold) || 5);
+  const auto = cropInfo ? { rel: cropInfo.keepRel } : dedup.pickKeep(items, cfg);
+  let keep = auto.rel;
+  if (manual) {
+    if (!requestedKeep || !group.includes(requestedKeep)) {
+      return fail(res, 400, '手动指定的保留图片不在组内');
+    }
+    keep = requestedKeep;
+  }
   if (!index.items[keep]) return fail(res, 400, '保留的图片不在索引中');
+  const keepOrientation = dedup.orientationOfItem({ rel: keep, ...index.items[keep] }, cfg);
 
   // 先把同组其他图片移入回收站
   const result = await storage.moveToTrash(cfg, group.filter((rel) => rel !== keep));
@@ -578,7 +644,15 @@ app.post('/api/duplicates/keep-best', wrap(async (req, res) => {
 
   await dedup.saveIndex(cfg, index);
   await dedup.pruneIgnorePairs(cfg, index);
-  ok(res, { trash: result, compact });
+  ok(res, {
+    trash: result,
+    compact,
+    keep,
+    keepOrientation,
+    keepReason: manual ? 'manual' : (cropInfo ? 'crop' : 'rule'),
+    cropRels: cropInfo ? cropInfo.cropRels : [],
+    keepPriority: dedup.keepPriorityOf(cfg)
+  });
 }));
 
 // 回收站条目缩略图（恢复前预览）
@@ -678,7 +752,8 @@ app.post('/api/renumber', wrap(async (req, res) => {
   if (result.renumbered > 0) {
     await dedup.saveIndex(cfg, index);
     await dedup.pruneIgnorePairs(cfg, index); // 编号已变，清理含失效路径的忽略对
-    await history.record(cfg, 'renumber', `编号规整 ${norm}：${result.renumbered} 张重排`);
+    await history.record(cfg, 'renumber',
+      `编号规整 ${norm}：填补 ${result.filled} 个空位，重命名 ${result.renumbered} 张（保持 ${result.alreadyInPlace} 张不变）`);
   }
   ok(res, result);
 }));

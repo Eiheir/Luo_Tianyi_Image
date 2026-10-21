@@ -347,7 +347,7 @@ const state = {
   stats: null,
   themeLoaded: false,
   trashRows: [],
-  lb: { list: [], pos: -1, zoom: 1, x: 0, y: 0, drag: null },
+  lb: { list: [], pos: -1, zoom: 1, x: 0, y: 0, drag: null, rows: null },
   gitSyncing: false,
   convert: { running: false, stop: false },
   dragRels: null // 网格拖拽移动中的图片路径集合
@@ -871,6 +871,17 @@ $('btnUpload').addEventListener('click', async () => {
 
 function dirOf(rel) {
   return String(rel).split('/').slice(0, -1).join('/');
+}
+
+/** 从相对路径推断分类（查重面板的条目没有服务端 category 字段时用） */
+function categoryOfRel(rel) {
+  const dir = dirOf(rel);
+  if (dir === CHIP_DIR.heng) return 'heng';
+  if (dir === CHIP_DIR.shu) return 'shu';
+  if (dir === CHIP_DIR.avatar) return 'avatar';
+  if (dir === CHIP_DIR.temporary) return 'temporary';
+  if (dir === CHIP_DIR.emoticon || dir.startsWith(`${CHIP_DIR.emoticon}/`)) return 'emoticon';
+  return '其他';
 }
 
 function groupKeyOf(row) {
@@ -1432,8 +1443,15 @@ $('btnSelNone').addEventListener('click', clearSelection);
 
 let lbLastFocus = null;
 
+/** 灯箱当前图片的元数据：优先用 openLightbox 传入的自定义行（查重面板等），否则查图库全量列表 */
+function lbRowOf(rel) {
+  const rows = state.lb && state.lb.rows;
+  if (rows && rows.has(rel)) return rows.get(rel);
+  return state.libAll.find((r) => r.rel === rel) || {};
+}
+
 function previewUrl(rel, w = 1800) {
-  const row = state.libAll.find((r) => r.rel === rel);
+  const row = lbRowOf(rel);
   const v = row && row.mtime ? `&v=${Math.round(row.mtime)}` : '';
   return `/api/thumb?p=${encodeURIComponent(rel)}&w=${w}${v}`;
 }
@@ -1442,15 +1460,28 @@ function rawUrl(rel) {
   return `/api/raw?p=${encodeURIComponent(rel)}`;
 }
 
-function openLightbox(rel) {
-  const list = state.lib.map((r) => r.rel);
+/**
+ * 打开大图预览。
+ * @param {string} rel 图片相对路径
+ * @param {object} [opts] 可选
+ * @param {Array} [opts.rows] 自定义导航与元数据列表（如当前相似组）；
+ *   传入后左右切换只在本组内进行，不跟随图片库筛选列表。
+ */
+function openLightbox(rel, opts = {}) {
+  const customRows = Array.isArray(opts.rows) ? opts.rows : null;
+  const list = customRows ? customRows.map((r) => r.rel) : state.lib.map((r) => r.rel);
   const pos = list.indexOf(rel);
   if (pos < 0) {
     // 不在当前筛选结果中（例如从统计页跳转）时，补进导航列表
     list.unshift(rel);
   }
   lbLastFocus = document.activeElement;
-  state.lb = { list, pos: Math.max(0, list.indexOf(rel)), zoom: 1, x: 0, y: 0, drag: null };
+  state.lb = {
+    list,
+    pos: Math.max(0, list.indexOf(rel)),
+    zoom: 1, x: 0, y: 0, drag: null,
+    rows: customRows ? new Map(customRows.map((r) => [r.rel, r])) : null
+  };
   $('lightbox').hidden = false;
   syncOverlayLock();
   renderLightbox();
@@ -1461,6 +1492,7 @@ function closeLightbox() {
   $('lightbox').hidden = true;
   $('lbInfo').hidden = true;
   $('lbImg').src = '';
+  if (state.lb) state.lb.rows = null;
   syncOverlayLock();
   if (lbLastFocus && lbLastFocus.isConnected && lbLastFocus.focus) lbLastFocus.focus();
 }
@@ -1477,7 +1509,7 @@ function lbStep(delta) {
 function renderLightbox() {
   const rel = state.lb.list[state.lb.pos];
   if (!rel) return;
-  const row = state.libAll.find((r) => r.rel === rel) || {};
+  const row = lbRowOf(rel);
   $('lbImg').src = previewUrl(rel);
   $('lbImg').alt = row.name || rel;
   $('lbTitle').textContent = row.name || rel;
@@ -1498,10 +1530,11 @@ function renderLightbox() {
 
 /* ---------- 灯箱信息面板 ---------- */
 async function renderLbInfo(rel) {
-  const row = state.libAll.find((r) => r.rel === rel) || { rel, name: rel.split('/').pop() };
-  const ext = (row.name.split('.').pop() || '').toUpperCase();
+  const row = lbRowOf(rel);
+  const name = row.name || rel.split('/').pop();
+  const ext = (name.split('.').pop() || '').toUpperCase();
   $('lbInfoList').innerHTML = `
-    <dt>文件名</dt><dd>${escapeHtml(row.name)}</dd>
+    <dt>文件名</dt><dd>${escapeHtml(name)}</dd>
     <dt>路径</dt><dd>${escapeHtml(rel)}</dd>
     <dt>分类</dt><dd>${escapeHtml(CAT_NAMES[row.category] || row.category || '—')}</dd>
     <dt>分辨率</dt><dd>${row.w ? `${row.w} × ${row.h}` : '—'}</dd>
@@ -1603,10 +1636,10 @@ $('lbCopy').addEventListener('click', async () => {
 $('lbDownload').addEventListener('click', () => {
   const rel = state.lb.list[state.lb.pos];
   if (!rel) return;
-  const row = state.libAll.find((r) => r.rel === rel);
+  const row = lbRowOf(rel);
   const a = document.createElement('a');
   a.href = rawUrl(rel);
-  a.download = row ? row.name : rel.split('/').pop();
+  a.download = row.name || rel.split('/').pop();
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -1936,7 +1969,7 @@ $('btnDupScan').addEventListener('click', async () => {
   $('dupBody').setAttribute('aria-busy', 'true');
   $('dupBody').innerHTML = `<div class="empty">
     <div class="skeleton" style="width:42px;height:42px;border-radius:50%"></div>
-    <div>正在扫描（首次全量需计算全部图片指纹）…</div></div>`;
+    <div>正在扫描（首次会建立裁切指纹与比对缩略图，可能需要几十秒）…</div></div>`;
   try {
     const r = await api('/api/duplicates/scan', {
       method: 'POST',
@@ -1945,7 +1978,9 @@ $('btnDupScan').addEventListener('click', async () => {
     });
     $('dupMeta').textContent =
       `已扫描 ${r.scanned} 张 · 完全重复组 ${r.exactGroups.length} · 相似组 ${r.similarGroups.length}` +
-      (r.ignoredPairs ? ` · 已忽略 ${r.ignoredPairs} 张` : '');
+      (r.ignoredPairs ? ` · 已忽略 ${r.ignoredPairs} 张` : '') +
+      ` · 截取组保留原图 · 其他：${keepPriorityLabel(r.keepPriority)}` +
+      (r.cropThreshold != null ? ` · 局部裁切阈值：${r.cropThreshold}` : '');
     // 关键：先清空“正在扫描”占位，避免加载文案与结果同时显示
     $('dupBody').innerHTML = '';
     $('dupBody').removeAttribute('aria-busy');
@@ -1968,6 +2003,7 @@ async function appendIgnoredSection() {
   if (!ignored.items.length) return;
 
   const collapsed = ignored.items.length > 12;
+  const previewRows = ignored.items.map((it) => ({ ...it, category: categoryOfRel(it.rel) }));
   const sec = document.createElement('div');
   sec.className = 'dup-group ignored-sec';
   sec.id = 'dupIgnoredSec';
@@ -1982,13 +2018,25 @@ async function appendIgnoredSection() {
     </div>
     <div class="dup-row ignored-list${collapsed ? ' collapsed' : ''}">
       ${ignored.items.map((it) => `
-        <div class="dup-item">
-          <img loading="lazy" src="/api/thumb?p=${encodeURIComponent(it.rel)}&w=264" alt="" />
+        <div class="dup-item" data-rel="${escapeHtml(it.rel)}">
+          <img loading="lazy" src="/api/thumb?p=${encodeURIComponent(it.rel)}&w=264"
+            alt="${escapeHtml(it.name)}" tabindex="0" role="button"
+            title="点击预览大图" aria-label="预览 ${escapeHtml(it.name)}" />
           <div class="name" title="${escapeHtml(it.rel)}">${escapeHtml(it.name)}</div>
           <div class="muted">${it.sizeText || ''}</div>
           <button class="btn small" type="button" data-unignore="${escapeHtml(it.rel)}">取消忽略</button>
         </div>`).join('')}
     </div>`;
+
+  // 已忽略列表同样支持点击预览大图（左右切换仅在本列表内）
+  sec.querySelectorAll('.dup-item img').forEach((img) => {
+    const item = img.closest('.dup-item');
+    const open = () => openLightbox(item.dataset.rel, { rows: previewRows });
+    img.addEventListener('click', open);
+    img.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+    });
+  });
 
   sec.querySelector('#btnToggleIgnored').addEventListener('click', (e) => {
     const list = sec.querySelector('.ignored-list');
@@ -2013,60 +2061,139 @@ async function appendIgnoredSection() {
   $('dupBody').appendChild(sec);
 }
 
+const ORIENTATION_LABELS = { heng: '横图', avatar: '方图', shu: '竖图' };
+const KEEP_RANK = { heng: 3, avatar: 2, shu: 1 };
+
+/** 默认保留顺序的中文简写：横 > 方 > 竖 */
+function keepPriorityLabel(priority) {
+  const short = { heng: '横', avatar: '方', shu: '竖' };
+  const list = Array.isArray(priority) && priority.length ? priority : ['heng', 'avatar', 'shu'];
+  return list.map((k) => short[k] || k).join(' > ');
+}
+
+/**
+ * 兼容旧服务端：未返回 keeper 标记时，前端按同一规则计算保留项。
+ * 规则：横图 > 方图 > 竖图；同方向比像素面积；面积相同比文件体积。
+ */
+function fallbackKeepIndex(group) {
+  const keyOf = (it) => {
+    const w = Number(it.w) || 0;
+    const h = Number(it.h) || 0;
+    let orientation = it.orientation || '';
+    if (!orientation && w > 0 && h > 0) {
+      const limit = Number(state.cfg && state.cfg.classify && state.cfg.classify.avatarRatioMax) || 1.2;
+      orientation = Math.max(w, h) / Math.min(w, h) <= limit ? 'avatar' : (w > h ? 'heng' : 'shu');
+    }
+    return [KEEP_RANK[orientation] || 0, w * h, Number(it.size) || 0];
+  };
+  let best = 0;
+  let bestKey = keyOf(group[0]);
+  group.forEach((it, i) => {
+    const k = keyOf(it);
+    if (k[0] > bestKey[0] || (k[0] === bestKey[0] && k[1] > bestKey[1]) ||
+        (k[0] === bestKey[0] && k[1] === bestKey[1] && k[2] > bestKey[2])) {
+      best = i;
+      bestKey = k;
+    }
+  });
+  return best;
+}
+
 function renderDupGroups(groups, label, ignorable = false) {
   if (!groups.length) return;
   const body = $('dupBody');
   groups.forEach((g, gi) => {
     const sec = document.createElement('div');
     sec.className = 'dup-group';
-    let best = 0;
-    g.forEach((it, i) => {
-      if ((it.w || 0) * (it.h || 0) > (g[best].w || 0) * (g[best].h || 0)) best = i;
-    });
+    // 服务端已按统一规则标出 keeper；旧数据/旧服务端则在前端用同一规则兜底
+    let best = g.findIndex((it) => it.keeper);
+    if (best < 0) best = fallbackKeepIndex(g);
+    const cross = g.some((it) => it.crossOrientation);
+    const cropGroup = g.some((it) => it.cropGroup);
+    const cropItems = g.filter((it) => it.isCrop);
+    // 灯箱导航只在当前相似组内切换；补齐 category 供信息面板显示
+    const previewRows = g.map((it) => ({ ...it, category: categoryOfRel(it.rel) }));
     sec.innerHTML = `
       <div class="dup-group-title">
         <span class="tag">${escapeHtml(label)}</span> 第 ${gi + 1} 组（${g.length} 张）
+        ${cross ? '<span class="tag ok" title="组内含横/方/竖不同方向，可能是同一作品的局部裁切">跨方向</span>' : ''}
         <label><input type="checkbox" class="dup-group-sel" /> 全选本组</label>
         <button class="btn small warn keep-best" type="button"
-          title="保留分辨率最高的一张，其余移入回收站；保留图会自动改为组内最小序号（同目录且目标未被占用时）">保留最高清</button>
+          title="${cropGroup
+            ? '已识别出被截取的图：保留完整原图，其余移入回收站；保留图会自动改为组内最小序号（同目录且目标未被占用时）'
+            : '按规则保留：横图 > 方图 > 竖图，同方向保留分辨率最高的一张；其余移入回收站。保留图会自动改为组内最小序号（同目录且目标未被占用时）'}">${cropGroup ? '保留原图' : '按规则保留'}</button>
         ${ignorable ? `<button class="btn small ignore-group" type="button"
           title="这些图只是画风相似——之后查重不再提示它们">忽略本组</button>` : ''}
         <button class="btn small danger dup-delete" type="button">删除所选</button>
       </div>
       <div class="dup-row">
         ${g.map((it, i) => `
-          <div class="dup-item${i === best ? ' best' : ''}">
-            <img loading="lazy" src="/api/thumb?p=${encodeURIComponent(it.rel)}&w=264" alt="" />
+          <div class="dup-item${i === best ? ' best' : ''}" data-rel="${escapeHtml(it.rel)}">
+            <img loading="lazy" src="/api/thumb?p=${encodeURIComponent(it.rel)}&w=264"
+              alt="${escapeHtml(it.name)}" tabindex="0" role="button"
+              title="点击预览大图" aria-label="预览 ${escapeHtml(it.name)}" />
             ${i === best
-              ? '<div><span class="tag ok">保留</span></div>'
-              : `<label><input type="checkbox" class="dup-item-sel" value="${escapeHtml(it.rel)}" /> 删除</label>`}
+              ? `<div><span class="tag ok">${cropGroup ? '保留原图' : '保留'}${!cropGroup && it.orientation ? ' · ' + (ORIENTATION_LABELS[it.orientation] || '') : ''}</span></div>`
+              : `<label><input type="checkbox" class="dup-item-sel" value="${escapeHtml(it.rel)}" /> 删除</label>${it.isCrop ? ' <span class="tag dup" title="识别为从完整原图截取出的局部图">截取</span>' : ''}`}
             <div class="name" title="${escapeHtml(it.rel)}">${escapeHtml(it.name)}${i === best ? ' ⭐' : ''}</div>
-            <div class="muted">${it.w && it.h ? `${it.w}×${it.h} · ` : ''}${it.sizeText || ''}</div>
+            <div class="muted">${it.w && it.h ? `${it.w}×${it.h} · ` : ''}${it.orientation ? `${ORIENTATION_LABELS[it.orientation] || ''} · ` : ''}${it.sizeText || ''}</div>
           </div>`).join('')}
       </div>`;
+
+    // 点击/回车预览大图：左右切换限制在当前相似组内
+    sec.querySelectorAll('.dup-item img').forEach((img) => {
+      const item = img.closest('.dup-item');
+      const open = () => openLightbox(item.dataset.rel, { rows: previewRows });
+      img.addEventListener('click', open);
+      img.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+      });
+    });
 
     sec.querySelector('.dup-group-sel').addEventListener('change', (e) => {
       sec.querySelectorAll('.dup-item-sel').forEach((c) => { c.checked = e.target.checked; });
     });
 
     sec.querySelector('.keep-best').addEventListener('click', async () => {
-      const rels = g.map((it) => it.rel).filter((rel) => rel !== g[best].rel);
+      const keepItem = g[best];
+      const rels = g.map((it) => it.rel).filter((rel) => rel !== keepItem.rel);
       if (!rels.length) return toast('本组只有一张，无需清理', 'warn');
+      const keepOrient = keepItem.orientation ? `${ORIENTATION_LABELS[keepItem.orientation] || ''} ` : '';
+      const cropNames = cropItems.map((it) => it.name).slice(0, 5).join('、');
+      const cropDetail = cropGroup && cropItems.length
+        ? `识别到 ${cropItems.length} 张被截取的图${cropNames ? `：${cropNames}${cropItems.length > 5 ? '…' : ''}` : ''}。`
+        : '';
       const ok = await confirmDialog({
-        title: '保留最高清',
-        message: `保留 ${g[best].name}（${g[best].w}×${g[best].h}），其余 ${rels.length} 张移入回收站？`,
-        detail: '保留图会自动改为同目录组内最小序号（目标序号被占用时保持原名）。',
+        title: cropGroup ? '保留原图' : '按规则保留',
+        message: cropGroup
+          ? `保留完整原图 ${keepItem.name}（${keepItem.w}×${keepItem.h}），其余 ${rels.length} 张移入回收站？`
+          : `保留 ${keepItem.name}（${keepOrient}${keepItem.w}×${keepItem.h}），其余 ${rels.length} 张移入回收站？`,
+        detail: cropGroup
+          ? `${cropDetail}将保留完整原图并去除截取版本。保留图会自动改为同目录组内最小序号（目标序号被占用时保持原名）。`
+          : '默认规则：横图 > 方图 > 竖图；同方向保留分辨率最高的一张。保留图会自动改为同目录组内最小序号（目标序号被占用时保持原名）。',
         okText: '清理'
       });
       if (!ok) return;
       try {
+        // 不传 keep：由服务端按裁切方向/统一规则决策，避免前后端规则漂移
         const r = await api('/api/duplicates/keep-best', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ group: g.map((it) => it.rel), keep: g[best].rel })
+          body: JSON.stringify({ group: g.map((it) => it.rel) })
         });
         const failed = (r.trash && r.trash.moved ? r.trash.moved : []).filter((m) => m.error);
-        let msg = `已保留最高清一张，${rels.length} 张移入回收站`;
+        const keptName = (r.keep || keepItem.rel).split('/').pop();
+        const keptOrient = r.keepOrientation ? `${ORIENTATION_LABELS[r.keepOrientation] || ''} ` : '';
+        const keptReason = r.keepReason || (cropGroup ? 'crop' : 'rule');
+        let msg;
+        if (keptReason === 'crop') {
+          const n = Array.isArray(r.cropRels) ? r.cropRels.length : cropItems.length;
+          msg = `已保留完整原图 ${keptName}，${rels.length} 张移入回收站${n ? `（含 ${n} 张截取图）` : ''}`;
+        } else if (keptReason === 'manual') {
+          msg = `已保留 ${keptOrient}${keptName}，${rels.length} 张移入回收站`;
+        } else {
+          msg = `已按规则保留 ${keptOrient}${keptName}，${rels.length} 张移入回收站`;
+        }
         if (r.compact && r.compact.renamed) msg += `；保留图序号已改为 ${r.compact.keptRel.split('/').pop()}`;
         else if (r.compact && r.compact.reason === 'target-occupied') msg += '；最小序号已被占用，保留图未改名';
         if (failed.length) msg += `；${failed.length} 张移入失败`;
@@ -2295,7 +2422,7 @@ $('btnOrganize').addEventListener('click', () => {
 
   $('organizeBody').innerHTML = `
     <h4 class="org-title">编号规整</h4>
-    <p class="muted">把目录内文件重排为 0001..N 连续编号，消除删除留下的空洞。</p>
+    <p class="muted">用末尾编号回填空位，尽量少改名：已在连续编号内的文件保持原名。</p>
     <div class="opt-grid">
       <label class="opt">
         <span class="opt-label">选择目录</span>
@@ -2308,10 +2435,10 @@ $('btnOrganize').addEventListener('click', () => {
     </div>
     <div class="callout warn" style="margin-top:12px">
       ${icon('warning', 'sm')}
-      <span>已发布的链接按文件名寻址，编号规整后旧链接会失效。建议先同步 Git，确认无误后再操作。</span>
+      <span>只有被移动去填补空位的文件会改名，其余文件的旧链接保持不变。建议先同步 Git，确认无误后再操作。</span>
     </div>
     <div class="queue-actions">
-      <button class="btn warn" id="btnRenumber" type="button">规整所选目录</button>
+      <button class="btn warn" id="btnRenumber" type="button">填补空位（最小改动）</button>
     </div>
 
     <h4 class="org-title" style="margin-top:22px">表情包主题改名</h4>
@@ -2335,7 +2462,7 @@ $('btnOrganize').addEventListener('click', () => {
   const updateOrgCount = () => {
     const dir = $('orgDir').value;
     const n = state.libAll.filter((r) => r.rel.startsWith(dir + '/')).length;
-    $('orgCount').innerHTML = `${icon('info', 'sm')}<span>将重命名 <b>${n}</b> 个文件，影响最多 <b>${n}</b> 条旧链接</span>`;
+    $('orgCount').innerHTML = `${icon('info', 'sm')}<span>目录内 <b>${n}</b> 个文件；只重命名需要填补空位的文件，其余保持原名</span>`;
   };
   const updateThemePreview = () => {
     const from = $('orgTheme').value;
@@ -2361,9 +2488,9 @@ $('btnOrganize').addEventListener('click', () => {
     const dir = $('orgDir').value;
     const n = state.libAll.filter((r) => r.rel.startsWith(dir + '/')).length;
     const ok = await confirmDialog({
-      title: '编号规整',
-      message: `把「${dir}」内的 ${n} 个文件重排为连续编号？`,
-      detail: '该目录内编号发生变化文件的旧链接将全部失效。',
+      title: '编号规整（最小改动）',
+      message: `用末尾编号回填「${dir}」的空位，尽量少改名？`,
+      detail: '只重命名需要填补空位的文件；已在连续编号内的文件保持原名。若目标文件名被占用会中止且不做任何修改。',
       okText: '开始规整'
     });
     if (!ok) return;
@@ -2374,7 +2501,9 @@ $('btnOrganize').addEventListener('click', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ dir })
       });
-      toast(`规整完成：共 ${r.total} 个文件，重命名 ${r.renumbered} 个`, 'ok');
+      const filled = r.filled != null ? r.filled : r.renumbered;
+      const kept = r.alreadyInPlace != null ? r.alreadyInPlace : Math.max(0, r.total - r.renumbered);
+      toast(`规整完成：共 ${r.total} 个文件，保持 ${kept} 个不变，填补 ${filled} 个空位（重命名 ${r.renumbered} 个）`, 'ok');
       closeModal('organizePanel');
       refreshLibrary();
       refreshGitStatus();
@@ -2553,6 +2682,7 @@ function fillSettings(view) {
   $('setMaxBatch').value = view['upload.maxBatchFiles'].value;
   $('setMaxFileMB').value = view['upload.maxFileMB'].value;
   $('setHamming').value = view['dedup.hammingThreshold'].value;
+  $('setCropThreshold').value = view['dedup.cropThreshold'].value;
   $('setOnDup').value = view['dedup.onExactDuplicate'].value;
   $('setLinkFormat').value = view['linkFormat'].value;
   $('setPurgeCdn').checked = !!view['git.purgeCdn'].value;
@@ -2598,6 +2728,7 @@ const SETTING_LABELS = {
   'upload.maxBatchFiles': '单批最多文件数',
   'upload.maxFileMB': '单文件上限',
   'dedup.hammingThreshold': '相似判定阈值',
+  'dedup.cropThreshold': '局部裁切相似阈值',
   'dedup.onExactDuplicate': '完全重复策略',
   'linkFormat': '默认链接格式',
   'git.purgeCdn': '同步后刷新缓存'
@@ -2625,6 +2756,7 @@ $('btnSaveSettings').addEventListener('click', async () => {
         'upload.maxBatchFiles': Number($('setMaxBatch').value),
         'upload.maxFileMB': Number($('setMaxFileMB').value),
         'dedup.hammingThreshold': Number($('setHamming').value),
+        'dedup.cropThreshold': Number($('setCropThreshold').value),
         'dedup.onExactDuplicate': $('setOnDup').value,
         'linkFormat': $('setLinkFormat').value,
         'git.purgeCdn': $('setPurgeCdn').checked,

@@ -49,7 +49,17 @@ const DEFAULTS = {
     // 编码器），入库时由 converter 兜底转 jpg 存档；avif 同属 heif 容器（可读可写）
     allowedExt: ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'avif', 'heic', 'heif']
   },
-  dedup: { hammingThreshold: 5, onExactDuplicate: 'skip' },
+  // keepPriority：非截取组的默认保留顺序（横图 > 方图 > 竖图）；
+  // 跨方向裁切组始终智能保留完整原图，不受此顺序影响。
+  // 必须是 ['heng','avatar','shu'] 的排列，其余值自动回退默认顺序
+  // cropThreshold：跨方向"局部裁切"相似阈值（竖图是横图的一部分截取时使用），
+  // 通常比整图 hammingThreshold 略宽（默认 5）
+  dedup: {
+    hammingThreshold: 5,
+    cropThreshold: 5,
+    onExactDuplicate: 'skip',
+    keepPriority: ['heng', 'avatar', 'shu']
+  },
   upload: { maxBatchFiles: 200, maxFileMB: 60, quality: 100 },
   git: { enabled: true, timeoutMs: 120000, purgeCdn: false },
   linkFormat: 'jsdelivr'

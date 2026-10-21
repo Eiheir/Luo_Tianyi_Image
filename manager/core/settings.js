@@ -33,6 +33,10 @@ const SETTABLE = {
     const n = Math.round(Number(v));
     return Number.isFinite(n) && n >= 0 && n <= 20 ? n : null;
   },
+  'dedup.cropThreshold': (v) => {
+    const n = Math.round(Number(v));
+    return Number.isFinite(n) && n >= 0 && n <= 20 ? n : null;
+  },
   'dedup.onExactDuplicate': (v) => (['skip', 'keep'].includes(v) ? v : null),
   'linkFormat': (v) => (['jsdelivr', 'fastly', 'testingcf', 'gcore', 'raw'].includes(v) ? v : null),
   'git.purgeCdn': (v) => (typeof v === 'boolean' ? v : null),

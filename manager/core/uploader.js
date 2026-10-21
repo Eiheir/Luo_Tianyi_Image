@@ -64,11 +64,38 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
     let dhash = '';
     try { dhash = await dedup.dhashOf(processed.buffer); } catch (e) { dhash = ''; /* 指纹失败不阻断上传 */ }
 
-    // ---------- 4. 查重比对 ----------
+    // ---------- 4. 分类决策（提前，便于判断是否需要局部裁切指纹） ----------
+    let category = opts.category;
+    if (!category || category === 'auto') {
+      // 自动分类：动图与静图统一按宽高比判定（长边/短边≤1.2 → avatar）
+      category = classify.decideCategory(processed.width, processed.height, cfg);
+    }
+    if (!classify.CATEGORIES.includes(category)) throw new Error(`无效分类：${category}`);
+    result.category = category;
+
+    // 壁纸类补充局部裁切指纹：上传时即可识别"竖图是横图的局部截取"
+    let cropData = null;
+    if (['heng', 'shu', 'avatar'].includes(category)) {
+      try { cropData = await dedup.cropHashesOf(processed.buffer, cfg); } catch (e) { cropData = null; }
+    }
+
+    // ---------- 5. 查重比对 ----------
     // 说明：手动忽略对是"库内两图"之间的记录，新上传文件不可能已有忽略记录，
     // 故此处无需过滤——忽略只影响 /api/duplicates/scan 的全库聚类。
     const threshold = Number(cfg.dedup.hammingThreshold) || 5;
-    const dup = dedup.compareAgainstLibrary(index, md5, dhash, threshold);
+    const cropThreshold = Number(cfg.dedup.cropThreshold) || 5;
+    const dup = dedup.compareAgainstLibrary(index, md5, dhash, threshold, {
+      item: {
+        w: processed.width, h: processed.height,
+        chash: cropData && cropData.chash,
+        crops: cropData && cropData.crops,
+        thumb: cropData && cropData.thumb,
+        rowProf: cropData && cropData.rowProf,
+        colProf: cropData && cropData.colProf
+      },
+      cfg,
+      cropThreshold
+    });
     result.similar = dup.similar;
     if (dup.exact.length > 0) {
       const policy = opts.onDuplicate || cfg.dedup.onExactDuplicate;
@@ -87,18 +114,13 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
       result.notice = result.notice ? `${result.notice}；` : '';
       result.notice += `注意：与库内 ${path.basename(dup.exact[0])} 字节级完全相同，仍按你的选择保留`;
     } else if (dup.similar.length > 0) {
-      const simText = `疑似相似：${dup.similar.map((s) => `${path.basename(s.rel)}(距离${s.distance})`).join('、')}`;
+      const simText = `疑似相似：${dup.similar.map((s) => {
+        if (s.via === 'crop') return `${path.basename(s.rel)}(局部裁切 距离${s.distance})`;
+        if (s.via === 'ncc') return `${path.basename(s.rel)}(裁切 NCC ${Number(s.score).toFixed(3)})`;
+        return `${path.basename(s.rel)}(距离${s.distance})`;
+      }).join('、')}`;
       result.notice = result.notice ? `${result.notice}；${simText}` : simText;
     }
-
-    // ---------- 5. 分类决策 ----------
-    let category = opts.category;
-    if (!category || category === 'auto') {
-      // 自动分类：动图与静图统一按宽高比判定（长边/短边≤1.2 → avatar）
-      category = classify.decideCategory(processed.width, processed.height, cfg);
-    }
-    if (!classify.CATEGORIES.includes(category)) throw new Error(`无效分类：${category}`);
-    result.category = category;
 
     // ---------- 6. 编号分配（目录扫描 + 占位探测双保险） ----------
     const relDir = classify.categoryDir(category, opts.theme, cfg);
@@ -128,7 +150,13 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
     result.url = buildLink(cfg, rel, opts.linkType || cfg.linkFormat);
     result.status = 'ok';
     dedup.setIndexItem(index, rel, {
-      mtime: st.mtimeMs, size: st.size, w: processed.width, h: processed.height, md5, dhash
+      mtime: st.mtimeMs, size: st.size, w: processed.width, h: processed.height, md5, dhash,
+      chash: cropData && cropData.chash,
+      crops: cropData && cropData.crops,
+      cropVersion: cropData && cropData.cropVersion,
+      thumb: cropData && cropData.thumb,
+      rowProf: cropData && cropData.rowProf,
+      colProf: cropData && cropData.colProf
     });
     return result;
   } catch (err) {

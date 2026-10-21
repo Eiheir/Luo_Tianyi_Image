@@ -4,7 +4,7 @@
  * ---------------------------------------------------------------
  * 三个操作共同的实现骨架：
  *  1. 计算目标目录与目标文件名（移动/改名用"目标目录最大编号+1 起分配"，
- *     规整用"按原顺序压缩为 1..N 连续编号"）
+ *     规整用"末尾编号回填空位，保持 1..N 连续且尽量少改名"）
  *  2. 逐文件 rename（同盘原子操作）；任何一步失败立即中止并回滚已完成的移动，
  *     保证目录不处于"移了一半"的中间态
  *  3. 返回新旧路径映射，由调用方（server.js）同步更新内存索引并持久化
@@ -99,14 +99,19 @@ async function moveImages(cfg, index, rels, target) {
 }
 
 /**
- * 目录编号规整：把目标目录内"纯编号文件"按当前顺序（文件名数字升序）压缩重排为
- * 0001..N 连续编号，消除删除留下的空洞。非编号文件（缩略图、说明等）不动。
+ * 目录编号规整（最小代价）：只消除编号空洞，不把所有文件重排一遍。
  *
- * ⚠️ 旧链接失效：已发布的 jsDelivr/Raw 链接按文件名寻址，重排后编号≥起点的文件
- *    URL 全部改变——调用方（前端）必须先向用户确认这一点。
+ * 目标编号为 1..N。已经在 1..N 区间内、且编号未被重复占用的文件保持原名不动；
+ * 把区间外的文件按编号从大到小，依次填入最小的空位：
+ *   {1,3,5,9} → 空位 {2,4} → 9→2、5→4（只改 2 个，而不是 3→2、5→3、9→4）
+ *
+ * 这样既保证 1..N 连续，又让改名数量严格等于空位数量（最小理论值），
+ * 已发布的旧链接中只有被移动文件的链接会失效。
+ * 非编号文件（说明、缩略图等）不动；目标文件名被占用时中止且不做任何修改。
  *
  * @param {string} dirRel 相对图库根的目录（如 wallpapers&illustration/heng、emoticon/辟浪）
- * @returns {{dirRel:string, total:number, renumbered:number, mapping:Array<[string,string]>}}
+ * @returns {{dirRel:string, total:number, renumbered:number, filled:number,
+ *   alreadyInPlace:number, mapping:Array<[string,string]>}}
  */
 async function renumberDirectory(cfg, index, dirRel) {
   const dirAbs = path.join(cfg._paths.imageRoot, dirRel.replace(/\//g, path.sep));
@@ -114,57 +119,95 @@ async function renumberDirectory(cfg, index, dirRel) {
   const stat = await fsp.stat(dirAbs).catch(() => null);
   if (!stat || !stat.isDirectory()) throw new Error(`目录不存在：${dirRel}`);
 
-  // 只收集"纯数字编号"的图片文件，按编号升序（这是重排前的展示顺序）
-  const entries = await fsp.readdir(dirAbs);
+  // 只收集"纯数字编号"的图片文件（真正的文件，不含同名目录），按编号升序
+  const entries = await fsp.readdir(dirAbs, { withFileTypes: true });
   const numbered = entries
-    .map((name) => ({ name, m: name.match(/^(\d+)\.(\w+)$/) }))
+    .filter((ent) => ent.isFile())
+    .map((ent) => ({ name: ent.name, m: ent.name.match(/^(\d+)\.(\w+)$/) }))
     .filter(({ m }) => m && exts.has(m[2].toLowerCase()))
     .map(({ name, m }) => ({ name, no: parseInt(m[1], 10), ext: m[2].toLowerCase() }))
-    .sort((a, b) => a.no - b.no);
+    .sort((a, b) => a.no - b.no || a.name.localeCompare(b.name));
+
+  const total = numbered.length;
+  if (total === 0) {
+    return { dirRel, total: 0, renumbered: 0, filled: 0, alreadyInPlace: 0, mapping: [] };
+  }
 
   // 编号位数：表情包目录 3 位，其余 4 位（与命名规则一致）
   const padLen = dirRel.startsWith(`${cfg.classify.emoticonDir}/`)
     ? cfg.naming.emoticonPadding : cfg.naming.padding;
+  const pad = (n) => String(n).padStart(padLen, '0');
 
-  const mapping = [];
-  const phase1 = []; // { from, to } 第一阶段（→临时名）
-  const phase2 = []; // { from, to } 第二阶段（临时名→最终名）
-  numbered.forEach((it, i) => {
-    const finalName = `${String(i + 1).padStart(padLen, '0')}.${it.ext}`;
-    if (it.name === finalName) { // 已经是目标名，无需动
-      mapping.push([it.name, finalName]);
-      return;
+  // 1..N 内、编号唯一占用的文件保持不动；同号多文件只留第一个，其余视为待移动
+  const occupied = new Set();
+  const inPlace = [];
+  const surplus = [];
+  for (const it of numbered) {
+    if (it.no >= 1 && it.no <= total && !occupied.has(it.no)) {
+      occupied.add(it.no);
+      inPlace.push(it);
+    } else {
+      surplus.push(it);
     }
-    const absOf = (n) => path.join(dirAbs, n);
-    phase1.push({ from: absOf(it.name), to: absOf(`${it.name}.renumber-tmp`) });
-    phase2.push({ from: absOf(`${it.name}.renumber-tmp`), to: absOf(finalName) });
-    mapping.push([it.name, finalName]);
-  });
+  }
 
-  const done1 = [];
+  const gaps = [];
+  for (let n = 1; n <= total; n++) if (!occupied.has(n)) gaps.push(n);
+
+  // 末尾优先：最大编号填最小空位（{1,3,5,9} → 9→2、5→4）
+  const surplusDesc = surplus.slice().sort((a, b) => b.no - a.no || b.name.localeCompare(a.name));
+  const moves = [];
+  for (let i = 0; i < gaps.length; i++) {
+    const src = surplusDesc[i];
+    if (!src) break; // 理论上 surplus 数量恒等于空位数量
+    moves.push({ src, targetName: `${pad(gaps[i])}.${src.ext}` });
+  }
+
+  // 目标名冲突预检：空位可能被目录/非编号文件占用，绝不覆盖
+  for (const m of moves) {
+    const targetAbs = path.join(dirAbs, m.targetName);
+    if (await fsp.stat(targetAbs).then(() => true, () => false)) {
+      throw new Error(`目标文件名已被占用：${m.targetName}，未做任何修改`);
+    }
+  }
+
+  // 目标都是空位，直接改名即可；失败时逆序还原已改的文件
+  const done = [];
   try {
-    for (const m of phase1) { await fsp.rename(m.from, m.to); done1.push(m); }
-    for (const m of phase2) await fsp.rename(m.from, m.to);
+    for (const m of moves) {
+      const fromAbs = path.join(dirAbs, m.src.name);
+      const toAbs = path.join(dirAbs, m.targetName);
+      await fsp.rename(fromAbs, toAbs);
+      done.push({ fromName: m.src.name, toName: m.targetName });
+    }
   } catch (e) {
-    // 回滚第一阶段已完成的改名（第二阶段尚未开始，临时名→原名的逆序还原即可）
-    for (const m of done1.reverse()) await fsp.rename(m.to, m.from).catch(() => {});
+    for (const m of done.reverse()) {
+      await fsp.rename(path.join(dirAbs, m.toName), path.join(dirAbs, m.fromName)).catch(() => {});
+    }
     throw new Error(`编号规整失败，已回滚：${e.message}`);
   }
 
-  // 索引键同步：旧 rel → 新 rel
-  const changed = [];
-  for (const [oldName, newName] of mapping) {
-    if (oldName === newName) continue;
-    const oldRel = `${dirRel}/${oldName}`;
-    const newRel = `${dirRel}/${newName}`;
+  // 索引键同步：只有被移动的文件需要换键
+  const mapping = [];
+  for (const m of done) {
+    const oldRel = `${dirRel}/${m.fromName}`;
+    const newRel = `${dirRel}/${m.toName}`;
     const it = index.items[oldRel];
     if (it) {
       dedup.deleteIndexItem(index, oldRel);
       dedup.setIndexItem(index, newRel, it);
     }
-    changed.push([oldRel, newRel]);
+    mapping.push([oldRel, newRel]);
   }
-  return { dirRel, total: numbered.length, renumbered: changed.length, mapping: changed };
+
+  return {
+    dirRel,
+    total,
+    renumbered: mapping.length,
+    filled: moves.length,
+    alreadyInPlace: inPlace.length,
+    mapping
+  };
 }
 
 /**
