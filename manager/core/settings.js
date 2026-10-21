@@ -35,7 +35,9 @@ const SETTABLE = {
   },
   'dedup.onExactDuplicate': (v) => (['skip', 'keep'].includes(v) ? v : null),
   'linkFormat': (v) => (['jsdelivr', 'fastly', 'testingcf', 'gcore', 'raw'].includes(v) ? v : null),
-  'git.purgeCdn': (v) => (typeof v === 'boolean' ? v : null)
+  'git.purgeCdn': (v) => (typeof v === 'boolean' ? v : null),
+  // 访问令牌：任意字符串（含空串 = 关闭鉴权），限长 128
+  'accessToken': (v) => (typeof v === 'string' && v.length <= 128 ? v.trim() : null)
 };
 
 /** 白名单内的键是否需要重启才能生效（端口/地址类不开放设置，故目前全部可热生效） */

@@ -478,10 +478,11 @@ test('settings：publicView 只含白名单字段', () => {
     dedup: { hammingThreshold: 5, onExactDuplicate: 'skip' },
     linkFormat: 'jsdelivr',
     git: { purgeCdn: false },
+    accessToken: '',
     _paths: { secret: 'x' }
   });
   assert.deepStrictEqual(Object.keys(view).sort(),
-    ['dedup.hammingThreshold', 'dedup.onExactDuplicate', 'git.purgeCdn',
+    ['accessToken', 'dedup.hammingThreshold', 'dedup.onExactDuplicate', 'git.purgeCdn',
      'linkFormat', 'upload.maxBatchFiles', 'upload.maxFileMB', 'upload.quality'].sort());
 });
 
@@ -493,6 +494,11 @@ test('settings：SETTABLE 校验函数拒绝越界值', () => {
   assert.strictEqual(settings.SETTABLE['linkFormat']('evil'), null);
   assert.strictEqual(settings.SETTABLE['git.purgeCdn'](true), true);
   assert.strictEqual(settings.SETTABLE['git.purgeCdn'](1), null);
+  // 访问令牌：任意字符串（含空串=关闭鉴权）；超长拒绝
+  assert.strictEqual(settings.SETTABLE['accessToken']('abc-123'), 'abc-123');
+  assert.strictEqual(settings.SETTABLE['accessToken'](''), '');
+  assert.strictEqual(settings.SETTABLE['accessToken']('x'.repeat(200)), null);
+  assert.strictEqual(settings.SETTABLE['accessToken'](123), null);
 });
 
 // ---------------- 8. 链接导出：html / bbcode ----------------

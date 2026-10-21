@@ -4,7 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>智能图床管理器 · 洛佬の美图</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%233b5bdb'/%3E%3Cpath d='M6 16l3.5-4 2.5 2.5L15.5 10 18 16z' fill='%23fff'/%3E%3Ccircle cx='9' cy='8.5' r='1.5' fill='%23fff'/%3E%3C/svg%3E" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%2366ccff'/%3E%3Cpath d='M6 16l3.5-4 2.5 2.5L15.5 10 18 16z' fill='%23fff'/%3E%3Ccircle cx='9' cy='8.5' r='1.5' fill='%23fff'/%3E%3C/svg%3E" />
+  <meta name="theme-color" content="#66ccff" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -39,6 +40,14 @@
     <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 7L4 12l5 5"/><path d="M4 12h9a6 6 0 0 1 0 12h-1"/></symbol>
     <symbol id="i-filter" viewBox="0 0 24 24"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></symbol>
     <symbol id="i-retry" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 6.3"/><path d="M20 4v7h-7"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 13.5A9 9 0 1 1 10.5 3 7 7 0 0 0 21 13.5z"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></symbol>
+    <symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.4 2.3c-.8.35-.9 1-.9 1.7M12 17v.01"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4 14h6l-1 8 9-12h-6z"/></symbol>
+    <symbol id="i-zip" viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M9 3v8l3-2 3 2V3"/></symbol>
   </svg>
 
   <!-- ============ 顶部栏 ============ -->
@@ -56,6 +65,15 @@
       <button class="tab" data-view="stats" type="button">统计</button>
     </nav>
     <div class="topbar-right">
+      <button class="icon-btn" id="btnSpeed" type="button" title="镜像测速：测试各线路延迟并自动选择最快">
+        <svg class="icon" aria-hidden="true"><use href="#i-bolt"></use></svg>
+      </button>
+      <button class="icon-btn" id="btnHistory" type="button" title="操作历史">
+        <svg class="icon" aria-hidden="true"><use href="#i-clock"></use></svg>
+      </button>
+      <button class="icon-btn" id="btnTheme" type="button" title="切换深色 / 浅色">
+        <svg class="icon" aria-hidden="true"><use href="#i-moon"></use></svg>
+      </button>
       <label class="link-switch" title="复制/导出链接时使用的访问地址">
         <span class="link-switch-label">链接</span>
         <select id="linkType" aria-label="访问链接类型">
@@ -192,6 +210,9 @@
         <div class="lib-main">
           <div class="card toolbar">
             <div class="toolbar-row">
+              <button class="icon-btn drawer-toggle" id="btnTreeDrawer" type="button" title="打开目录">
+                <svg class="icon" aria-hidden="true"><use href="#i-menu"></use></svg>
+              </button>
               <div class="chips" id="catChips"></div>
               <span class="flex-sp"></span>
               <button class="btn small ghost" id="btnSelectAllTop" type="button" title="全选当前筛选结果">全选</button>
@@ -244,7 +265,7 @@
             </div>
           </div>
 
-          <div class="lib-hint muted" id="libHint">点击图片预览；勾选左上角复选框可多选，Shift 连续选择，Ctrl+A 全选</div>
+          <div class="lib-hint muted" id="libHint">点击图片预览；勾选左上角复选框可多选，Shift 连续选择，Ctrl+A 全选，拖到目录树可移动分类，按 <kbd>?</kbd> 查看全部快捷键</div>
           <div class="lib-grid" id="libGrid" aria-live="polite"></div>
           <div class="grid-more" id="libMore" hidden>
             <button class="btn ghost" id="btnLoadMore" type="button">加载更多</button>
@@ -271,6 +292,9 @@
         </button>
         <button class="btn small" id="btnExportSel" type="button">
           <svg class="icon sm" aria-hidden="true"><use href="#i-download"></use></svg><span>导出</span>
+        </button>
+        <button class="btn small" id="btnZipSel" type="button" title="把选中图片打包为 ZIP 下载">
+          <svg class="icon sm" aria-hidden="true"><use href="#i-zip"></use></svg><span>打包下载</span>
         </button>
         <span class="bulk-divider"></span>
         <button class="btn small" id="btnMoveSel" type="button">
@@ -403,6 +427,20 @@
             <input type="checkbox" id="setPurgeCdn" />
             <span>同步后主动刷新 jsDelivr 缓存（覆盖旧文件时有用，纯新增无意义）</span>
           </label>
+        </div>
+        <h3 class="card-title settings-sec">安全与外部接入</h3>
+        <div class="opt-grid">
+          <label class="opt full">
+            <span class="opt-label">访问令牌（留空 = 关闭鉴权；监听局域网地址时务必设置）</span>
+            <span class="token-row">
+              <input type="text" id="setToken" autocomplete="off" placeholder="未设置" />
+              <button class="btn small" id="btnGenToken" type="button">随机生成</button>
+            </span>
+          </label>
+          <div class="opt full">
+            <span class="opt-label">外部上传接口（PicGo / ShareX / 快捷指令）</span>
+            <pre class="ext-api" id="extApiExample"></pre>
+          </div>
         </div>
         <div class="form-msg" id="settingsMsg" hidden></div>
       </div>
@@ -580,6 +618,92 @@
     </div>
   </div>
 
+  <!-- ============ 弹窗：访问令牌 ============ -->
+  <div class="modal" id="tokenPanel" hidden>
+    <div class="modal-card narrow" role="dialog" aria-modal="true" aria-labelledby="tokenTitle">
+      <div class="modal-head">
+        <h3 id="tokenTitle">需要访问令牌</h3>
+      </div>
+      <div class="modal-body">
+        <p class="muted">服务器启用了访问令牌（config.json → accessToken）。输入一次，本浏览器会记住；令牌错误时可在此处重新输入。</p>
+        <div class="opt-grid">
+          <label class="opt full">
+            <span class="opt-label">访问令牌</span>
+            <input type="text" id="tokenInput" autocomplete="off" placeholder="粘贴 accessToken" />
+          </label>
+        </div>
+        <div class="form-msg err" id="tokenMsg" hidden></div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn primary" id="btnTokenSave" type="button">保存并重试</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 弹窗：操作历史 ============ -->
+  <div class="modal" id="historyPanel" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="historyTitle">
+      <div class="modal-head">
+        <h3 id="historyTitle">操作历史</h3>
+        <button class="icon-btn" data-close="historyPanel" type="button" aria-label="关闭">
+          <svg class="icon"><use href="#i-close"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div id="historyBody" class="hist-list"></div>
+        <div class="grid-more" id="historyMoreWrap" hidden>
+          <button class="btn ghost" id="btnHistoryMore" type="button">加载更多</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 弹窗：快捷键 ============ -->
+  <div class="modal" id="helpPanel" hidden>
+    <div class="modal-card narrow" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+      <div class="modal-head">
+        <h3 id="helpTitle">快捷键</h3>
+        <button class="icon-btn" data-close="helpPanel" type="button" aria-label="关闭">
+          <svg class="icon"><use href="#i-close"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="kbd-group">
+          <div class="kbd-title">图片库</div>
+          <div class="kbd-row"><span><kbd>Ctrl</kbd>+<kbd>A</kbd></span><span>全选当前筛选结果</span></div>
+          <div class="kbd-row"><span><kbd>Shift</kbd>+点击</span><span>连续选择</span></div>
+          <div class="kbd-row"><span><kbd>Esc</kbd></span><span>取消选择 / 关闭弹窗</span></div>
+          <div class="kbd-row"><span><kbd>拖拽到目录树</kbd></span><span>移动分类</span></div>
+        </div>
+        <div class="kbd-group">
+          <div class="kbd-title">灯箱</div>
+          <div class="kbd-row"><span><kbd>←</kbd> <kbd>→</kbd></span><span>上一张 / 下一张</span></div>
+          <div class="kbd-row"><span><kbd>+</kbd> <kbd>-</kbd> <kbd>0</kbd></span><span>放大 / 缩小 / 原始大小</span></div>
+          <div class="kbd-row"><span><kbd>I</kbd></span><span>图片信息面板</span></div>
+          <div class="kbd-row"><span><kbd>Esc</kbd></span><span>关闭灯箱</span></div>
+        </div>
+        <div class="kbd-group">
+          <div class="kbd-title">全局</div>
+          <div class="kbd-row"><span><kbd>?</kbd></span><span>打开本帮助</span></div>
+          <div class="kbd-row"><span>拖拽图片到窗口任意处</span><span>加入上传队列</span></div>
+          <div class="kbd-row"><span><kbd>Ctrl</kbd>+<kbd>V</kbd></span><span>粘贴剪贴板图片上传</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 单图快捷菜单（悬浮卡片右上角 ⋯ 触发，定位由 JS 控制） -->
+  <div class="ctx-menu" id="cellMenu" hidden role="menu">
+    <button type="button" role="menuitem" data-act="copy">复制链接</button>
+    <button type="button" role="menuitem" data-act="preview">查看大图</button>
+    <button type="button" role="menuitem" data-act="download">下载原图</button>
+    <button type="button" role="menuitem" data-act="move">移动分类…</button>
+    <button type="button" role="menuitem" data-act="trash" class="danger">移入回收站</button>
+  </div>
+
+  <!-- 移动端目录抽屉遮罩 -->
+  <div class="drawer-mask" id="drawerMask" hidden></div>
+
   <!-- ============ 灯箱 ============ -->
   <div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true" aria-label="图片预览">
     <div class="lb-toolbar">
@@ -590,6 +714,7 @@
       <button class="lb-btn" id="lbZoomIn" type="button" title="放大（+）"><svg class="icon"><use href="#i-zoom-in"></use></svg></button>
       <button class="lb-btn" id="lbDownload" type="button" title="下载原图"><svg class="icon"><use href="#i-download"></use></svg></button>
       <button class="lb-btn" id="lbOpen" type="button" title="在新标签打开原图"><svg class="icon"><use href="#i-external"></use></svg></button>
+      <button class="lb-btn" id="lbInfoBtn" type="button" title="图片信息（I）"><svg class="icon"><use href="#i-info"></use></svg></button>
       <button class="lb-btn" id="lbClose" type="button" title="关闭（Esc）"><svg class="icon"><use href="#i-close"></use></svg></button>
     </div>
     <button class="lb-nav lb-prev" id="lbPrev" type="button" title="上一张（←）">‹</button>
@@ -608,6 +733,18 @@
         <svg class="icon sm" aria-hidden="true"><use href="#i-trash"></use></svg><span>移入回收站</span>
       </button>
     </div>
+    <!-- 灯箱图片信息侧栏：尺寸 / 体积 / 时间 / 各格式链接一键复制 -->
+    <aside class="lb-info" id="lbInfo" hidden>
+      <div class="lb-info-head">
+        <span>图片信息</span>
+        <span class="flex-sp"></span>
+        <button class="icon-btn" id="lbInfoClose" type="button" aria-label="关闭信息面板">
+          <svg class="icon sm"><use href="#i-close"></use></svg>
+        </button>
+      </div>
+      <dl class="lb-info-list" id="lbInfoList"></dl>
+      <div class="lb-info-links" id="lbInfoLinks"></div>
+    </aside>
   </div>
 
   <!-- 全局提示 -->

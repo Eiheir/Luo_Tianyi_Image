@@ -28,6 +28,10 @@ const DATA_ROOT = IS_PKG ? path.dirname(process.execPath) : ASSET_ROOT;
 const DEFAULTS = {
   port: 3210,
   host: '127.0.0.1',
+  // 访问令牌：为空 = 不启用鉴权（仅监听本机回环时推荐）；
+  // 配置后所有 /api/* 请求需携带 Authorization: Bearer <token> 或 ?token=<token>，
+  // 外部工具（PicGo/快捷指令）上传也走同一令牌。
+  accessToken: '',
   // 源码态：图库在 manager 上一级；exe 态：默认 exe 与图库根同级
   repoRoot: IS_PKG ? '.' : '..',
   imageRoot: 'LTYpicture',

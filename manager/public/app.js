@@ -19,9 +19,57 @@
 
 const $ = (id) => document.getElementById(id);
 
-/** 统一请求封装：后端约定 {ok:true,data} / {ok:false,error}；非成功时抛中文错误 */
+/** 访问令牌（localStorage 持久化；服务端启用 accessToken 时所有请求自动携带） */
+const TOKEN_KEY = 'lti.token';
+function getToken() { try { return localStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; } }
+function saveToken(t) { try { localStorage.setItem(TOKEN_KEY, t); } catch (e) { /* 隐私模式 */ } }
+
+/**
+ * 弹出令牌输入框。用户输入并保存 → resolve(token)；关闭弹窗 → reject。
+ * 弹窗无关闭按钮（必须给出令牌才能继续操作），Esc 关闭等同于放弃。
+ */
+function askToken() {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (fn, v) => { if (done) return; done = true; fn(v); };
+    $('tokenInput').value = getToken();
+    $('tokenMsg').hidden = true;
+    onModalClose('tokenPanel', () => finish(reject, new Error('需要访问令牌才能继续使用')));
+    $('btnTokenSave').onclick = () => {
+      const v = $('tokenInput').value.trim();
+      if (!v) {
+        $('tokenMsg').hidden = false;
+        $('tokenMsg').textContent = '令牌不能为空（在 manager/config.json 的 accessToken 字段查看）';
+        return;
+      }
+      saveToken(v);
+      closeModal('tokenPanel');
+      finish(resolve, v);
+    };
+    openModal('tokenPanel');
+    setTimeout(() => $('tokenInput').focus(), 0);
+  });
+}
+
+/** 统一请求封装：后端约定 {ok:true,data} / {ok:false,error}；非成功时抛中文错误。
+ *  自动携带访问令牌；401 时弹出让用户输入一次后重试。 */
 async function api(url, options = {}) {
-  const res = await fetch(url, options);
+  const authed = (opts) => {
+    const t = getToken();
+    if (!t) return opts;
+    const headers = new Headers(opts.headers || {});
+    headers.set('Authorization', `Bearer ${t}`);
+    return { ...opts, headers };
+  };
+  let res = await fetch(url, authed(options));
+  if (res.status === 401 && !options._retried) {
+    await askToken(); // 用户放弃时抛错，调用方按普通错误提示
+    res = await fetch(url, authed({ ...options, _retried: true }));
+  }
+  if (res.status === 401) {
+    try { localStorage.removeItem(TOKEN_KEY); } catch (e) { /* 忽略 */ }
+    throw new Error('访问令牌无效，请重新输入');
+  }
   let body = null;
   try { body = await res.json(); } catch (e) { /* 非 JSON 按错误处理 */ }
   if (!res.ok || !body || body.ok !== true) {
@@ -45,6 +93,12 @@ function toast(msg, type = 'info', opts = {}) {
   el.className = `toast ${type}`;
   el.setAttribute('role', type === 'err' ? 'alert' : 'status');
 
+  const dismiss = () => {
+    if (el.classList.contains('out')) return;
+    el.classList.add('out');
+    setTimeout(() => el.remove(), 190);
+  };
+
   const text = document.createElement('div');
   text.className = 'toast-text';
   text.textContent = msg;
@@ -56,7 +110,7 @@ function toast(msg, type = 'info', opts = {}) {
     btn.className = 'toast-action';
     btn.textContent = opts.action.label;
     btn.addEventListener('click', () => {
-      el.remove();
+      dismiss();
       Promise.resolve()
         .then(opts.action.onClick)
         .catch((e) => toast(e.message, 'err'));
@@ -69,7 +123,7 @@ function toast(msg, type = 'info', opts = {}) {
   close.className = 'toast-close';
   close.textContent = '×';
   close.setAttribute('aria-label', '关闭提示');
-  close.addEventListener('click', () => el.remove());
+  close.addEventListener('click', dismiss);
   el.appendChild(close);
 
   wrap.appendChild(el);
@@ -78,7 +132,7 @@ function toast(msg, type = 'info', opts = {}) {
   const duration = opts.duration != null
     ? opts.duration
     : type === 'err' ? 0 : type === 'warn' ? 7000 : 4500;
-  if (duration > 0) setTimeout(() => el.remove(), duration);
+  if (duration > 0) setTimeout(dismiss, duration);
   return el;
 }
 
@@ -295,8 +349,38 @@ const state = {
   trashRows: [],
   lb: { list: [], pos: -1, zoom: 1, x: 0, y: 0, drag: null },
   gitSyncing: false,
-  convert: { running: false, stop: false }
+  convert: { running: false, stop: false },
+  dragRels: null // 网格拖拽移动中的图片路径集合
 };
+
+/* ---------- 深色 / 浅色主题 ---------- */
+const THEME_KEY = 'lti.theme';
+function applyTheme(t) {
+  document.documentElement.dataset.theme = t;
+  const use = $('btnTheme') && $('btnTheme').querySelector('use');
+  if (use) use.setAttribute('href', t === 'dark' ? '#i-sun' : '#i-moon');
+  try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* 忽略 */ }
+}
+// 首次加载：本地记忆优先，否则跟随系统
+applyTheme(readStorage(THEME_KEY,
+  (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light'));
+$('btnTheme').addEventListener('click', () => {
+  applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+});
+
+/* ---------- 镜像类型切换（复制/导出/上传返回链接都走它） ---------- */
+$('linkType').addEventListener('change', () => {
+  state.linkType = $('linkType').value;
+  toast(`链接线路已切换：${$('linkType').selectedOptions[0].textContent}`, 'ok');
+});
+
+/* ---------- 进行中任务的关页保护 ---------- */
+window.addEventListener('beforeunload', (e) => {
+  if (state.uploading || state.convert.running || state.gitSyncing) {
+    e.preventDefault();
+    e.returnValue = ''; // 触发浏览器"离开确认"原生提示
+  }
+});
 
 function activateView(view) {
   document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.view === view));
@@ -726,9 +810,15 @@ $('btnUpload').addEventListener('click', async () => {
   renderUploadProgress(0, total, 0, 0, 0);
   renderQueue();
 
-  try {
-    for (const it of pending) {
-      if (state.uploadStop) break;
+  // 3 路并发工作池：字节网络传输并行；服务端对"编号分配→落盘"持互斥锁，
+  // 不会撞号；停止按钮置 uploadStop 后各 worker 自然排空退出
+  const CONCURRENCY = 3;
+  let cursor = 0;
+  const worker = async () => {
+    while (!state.uploadStop) {
+      const i = cursor++;
+      if (i >= pending.length) return;
+      const it = pending[i];
       const fd = new FormData();
       fd.append('options', opts);
       fd.append('files', it.file, it.file.name);
@@ -754,6 +844,10 @@ $('btnUpload').addEventListener('click', async () => {
       updateQueueSummary();
       updateQueueActionState();
     }
+  };
+
+  try {
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, pending.length) }, worker));
 
     if (state.uploadStop && done < total) {
       toast(`已停止：余下 ${total - done} 张未上传`, 'warn');
@@ -918,7 +1012,10 @@ function makeTreeRow(node) {
   row.tabIndex = 0;
   if (state.dir === node.path) row.setAttribute('aria-current', 'true');
 
-  const activate = () => { if (state.dir !== node.path) setDir(node.path); };
+  const activate = () => {
+    if (state.dir !== node.path) setDir(node.path);
+    setDrawer(false); // 移动端抽屉模式下选完目录即收起
+  };
   row.addEventListener('click', (e) => { if (!e.target.closest('.tree-arrow-btn')) activate(); });
   row.addEventListener('keydown', (e) => {
     if (e.target !== row) return;
@@ -936,6 +1033,27 @@ function makeTreeRow(node) {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(e); }
     });
   }
+
+  // 拖放目标：从图片网格拖卡片到此行 = 移动分类（放手后统一确认）
+  row.addEventListener('dragover', (e) => {
+    if (!state.dragRels || !e.dataTransfer.types.includes('text/lti-images')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    row.classList.add('drop-target');
+  });
+  row.addEventListener('dragleave', () => row.classList.remove('drop-target'));
+  row.addEventListener('drop', (e) => {
+    e.preventDefault();
+    row.classList.remove('drop-target');
+    // state.dragRels 在网格 dragend 时会被清空，先取后清
+    let rels = state.dragRels;
+    try {
+      const raw = e.dataTransfer.getData('text/lti-images');
+      if (raw) rels = JSON.parse(raw);
+    } catch (err) { /* 解析失败退回内存态 */ }
+    state.dragRels = null;
+    if (rels && rels.length) moveByDrop(rels, node);
+  });
   return row;
 }
 
@@ -1030,10 +1148,11 @@ function cellHtml(row) {
   const dim = row.w && row.h ? `${row.w}×${row.h}` : '';
   const label = `${row.name}，${CAT_NAMES[row.category] || row.category}，${sel ? '已选择' : '未选择'}。回车预览，空格选择`;
   return `<div class="cell${sel ? ' selected' : ''}" data-rel="${escapeHtml(row.rel)}" data-name="${escapeHtml(row.name)}"
-      role="button" tabindex="0" aria-label="${escapeHtml(label)}">
+      role="button" tabindex="0" draggable="true" aria-label="${escapeHtml(label)}">
     <button class="cell-check${sel ? ' checked' : ''}" type="button" data-check="1" tabindex="-1"
       aria-label="${sel ? '取消选择' : '选择'} ${escapeHtml(row.name)}">${icon('check')}</button>
     <button class="cell-open" type="button" data-preview="1" tabindex="-1" title="预览大图">${icon('expand')}</button>
+    <button class="cell-more" type="button" data-more="1" tabindex="-1" title="更多操作">${icon('more')}</button>
     <img class="cell-img" loading="lazy" alt="${escapeHtml(row.name)}"
       src="/api/thumb?p=${encodeURIComponent(row.rel)}&w=360&v=${Math.round(row.mtime || 0)}" />
     <div class="cell-info">
@@ -1147,6 +1266,11 @@ $('libGrid').addEventListener('click', (e) => {
   const cell = e.target.closest('.cell');
   if (!cell) return;
   const rel = cell.dataset.rel;
+  if (e.target.closest('[data-more]')) {
+    e.stopPropagation();
+    openCellMenu(rel, cell);
+    return;
+  }
   if (e.target.closest('[data-check]')) {
     e.stopPropagation();
     toggleSelect(rel, { shift: e.shiftKey });
@@ -1163,6 +1287,63 @@ $('libGrid').addEventListener('click', (e) => {
   }
   openLightbox(rel);
 });
+
+/* ---------- 网格拖拽：拖到目录树行 = 移动分类 ---------- */
+$('libGrid').addEventListener('dragstart', (e) => {
+  const cell = e.target.closest('.cell');
+  if (!cell || !e.dataTransfer) return;
+  const rel = cell.dataset.rel;
+  // 拖动已选中项则带上整个选区，否则只拖当前卡片
+  const rels = state.selected.has(rel) ? selRels() : [rel];
+  state.dragRels = rels;
+  e.dataTransfer.setData('text/lti-images', JSON.stringify(rels));
+  e.dataTransfer.effectAllowed = 'move';
+});
+$('libGrid').addEventListener('dragend', () => {
+  state.dragRels = null;
+  document.querySelectorAll('.tree-row.drop-target').forEach((r) => r.classList.remove('drop-target'));
+});
+
+/** 把一组图片移动到目标目录（拖拽放下与移动弹窗共用确认文案风格） */
+async function moveByDrop(rels, node) {
+  const dirKey = node.path;
+  if (!dirKey || !rels.length) return;
+  const cd = state.cfg.classify;
+  let category, theme = '';
+  if (dirKey === cd.emoticonDir) { category = 'emoticon'; theme = '默认'; }
+  else if (dirKey.startsWith(cd.emoticonDir + '/')) { category = 'emoticon'; theme = dirKey.slice(cd.emoticonDir.length + 1); }
+  else if (dirKey === cd.temporaryDir) category = 'temporary';
+  else if (dirKey.startsWith(cd.wallpaperDir + '/')) category = dirKey.slice(cd.wallpaperDir.length + 1);
+  else return toast('该目录不支持移动（请拖到具体分类或表情包主题）', 'warn');
+
+  const target = category === 'emoticon' ? `emoticon/${theme}` : dirKey;
+  const ok = await confirmDialog({
+    title: '移动分类',
+    message: `把 ${rels.length} 张图片移动到「${target}」？`,
+    detail: '目标目录内按最大编号续排；移动后旧链接会失效。',
+    okText: '移动'
+  });
+  if (!ok) return;
+  try {
+    const { results, movedCount } = await api('/api/move', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths: rels, category, theme })
+    });
+    const fails = results.filter((r) => !r.ok || r.error);
+    if (fails.length) {
+      showResult('移动分类结果', results.map((r) => r.error || !r.ok
+        ? { status: 'fail', title: r.rel, note: r.error || '移动失败，批次已回滚' }
+        : { status: 'ok', title: r.rel, note: `→ ${r.newRel}` }));
+    } else {
+      toast(`已移动 ${movedCount} 张到「${target}」`, 'ok');
+    }
+    for (const rel of rels) state.selected.delete(rel);
+    updateBulkbar();
+    refreshLibrary();
+    refreshGitStatus();
+  } catch (e) { toast(e.message, 'err'); }
+}
 
 // 网格键盘：方向键移动、空格选择、回车预览、Delete 删除
 $('libGrid').addEventListener('keydown', (e) => {
@@ -1278,6 +1459,7 @@ function openLightbox(rel) {
 
 function closeLightbox() {
   $('lightbox').hidden = true;
+  $('lbInfo').hidden = true;
   $('lbImg').src = '';
   syncOverlayLock();
   if (lbLastFocus && lbLastFocus.isConnected && lbLastFocus.focus) lbLastFocus.focus();
@@ -1306,12 +1488,54 @@ function renderLightbox() {
     `${row.w ? ` · ${row.w}×${row.h}` : ''}${row.size ? ` · ${fmtSize(row.size)}` : ''}`;
 
   applyLbTransform();
+  if (!$('lbInfo').hidden) renderLbInfo(rel); // 信息面板展开时同步刷新
   // 预加载前后各一张，翻页不闪白
   [-1, 1].forEach((d) => {
     const r = state.lb.list[(state.lb.pos + d + state.lb.list.length) % state.lb.list.length];
     if (r && r !== rel) { const img = new Image(); img.src = previewUrl(r); }
   });
 }
+
+/* ---------- 灯箱信息面板 ---------- */
+async function renderLbInfo(rel) {
+  const row = state.libAll.find((r) => r.rel === rel) || { rel, name: rel.split('/').pop() };
+  const ext = (row.name.split('.').pop() || '').toUpperCase();
+  $('lbInfoList').innerHTML = `
+    <dt>文件名</dt><dd>${escapeHtml(row.name)}</dd>
+    <dt>路径</dt><dd>${escapeHtml(rel)}</dd>
+    <dt>分类</dt><dd>${escapeHtml(CAT_NAMES[row.category] || row.category || '—')}</dd>
+    <dt>分辨率</dt><dd>${row.w ? `${row.w} × ${row.h}` : '—'}</dd>
+    <dt>体积</dt><dd>${row.size ? fmtSize(row.size) : '—'}</dd>
+    <dt>格式</dt><dd>${escapeHtml(ext || '—')}</dd>
+    <dt>修改时间</dt><dd>${row.mtime ? fmtTime(row.mtime) : '—'}</dd>`;
+  try {
+    const b = await api(`/api/link?p=${encodeURIComponent(rel)}&type=${state.linkType}`);
+    if (state.lb.list[state.lb.pos] !== rel || $('lbInfo').hidden) return; // 翻页或已关闭，丢弃过期结果
+    const entries = [['纯链接', b.url], ['Markdown', b.markdown], ['HTML', b.html], ['BBCode', b.bbcode]];
+    $('lbInfoLinks').innerHTML = '';
+    entries.forEach(([label, text]) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn small';
+      btn.textContent = label;
+      btn.addEventListener('click', async () => {
+        try { await copyText(text); toast(`已复制${label}`, 'ok'); }
+        catch (e) { toast(e.message, 'err'); }
+      });
+      $('lbInfoLinks').appendChild(btn);
+    });
+  } catch (e) {
+    if (!$('lbInfo').hidden) $('lbInfoLinks').innerHTML = `<span class="muted">${escapeHtml(e.message)}</span>`;
+  }
+}
+
+function toggleLbInfo(show) {
+  const want = show != null ? !!show : $('lbInfo').hidden;
+  $('lbInfo').hidden = !want;
+  if (want) renderLightbox(); // 借渲染主流程顺带填充信息
+}
+$('lbInfoBtn').addEventListener('click', () => toggleLbInfo());
+$('lbInfoClose').addEventListener('click', () => toggleLbInfo(false));
 
 function applyLbTransform() {
   const lb = state.lb;
@@ -2194,7 +2418,7 @@ $('btnOrganize').addEventListener('click', () => {
  * 8. 统计 / 设置 / Git / 初始化
  * ================================================================ */
 
-const PALETTE = ['#3b5bdb', '#7c5cf0', '#197a45', '#b7791f', '#b42318', '#2b7bb9', '#667085'];
+const PALETTE = ['#66ccff', '#7c9cf0', '#33bfa3', '#e8a33d', '#e86a6a', '#8fa3bf', '#b48beb'];
 
 async function refreshStats() {
   try {
@@ -2207,11 +2431,18 @@ async function refreshStats() {
 
 function renderStats(s) {
   const formatCount = Object.keys(s.byFormat).length;
+  // 磁盘剩余（statfs 不可用的平台返回 null，自动隐藏该卡）
+  const diskCard = s.disk
+    ? `<div class="stat-card"><div class="stat-num">${fmtSize(s.disk.free)}</div>
+       <div class="stat-label">磁盘剩余 / 共 ${fmtSize(s.disk.total)}</div>
+       <div class="usage-track" style="margin-top:6px"><div class="usage-fill${s.disk.total - s.disk.free > 0 ? '' : ' zero'}"
+         style="width:${Math.min(100, ((s.disk.total - s.disk.free) / Math.max(1, s.disk.total)) * 100).toFixed(1)}%"></div></div></div>`
+    : '';
   $('statCards').innerHTML = `
     <div class="stat-card"><div class="stat-num">${s.total.count}</div><div class="stat-label">图片总数</div></div>
     <div class="stat-card"><div class="stat-num">${s.total.sizeText}</div><div class="stat-label">占用空间</div></div>
     <div class="stat-card"><div class="stat-num">${s.categoryCount}</div><div class="stat-label">分类数</div></div>
-    <div class="stat-card"><div class="stat-num">${formatCount}</div><div class="stat-label">格式数</div></div>`;
+    <div class="stat-card"><div class="stat-num">${formatCount}</div><div class="stat-label">格式数</div></div>${diskCard}`;
 
   // —— 分类环形图（纯 SVG）——
   const cats = Object.entries(s.byCategory).sort((a, b) => b[1].count - a[1].count);
@@ -2325,9 +2556,31 @@ function fillSettings(view) {
   $('setOnDup').value = view['dedup.onExactDuplicate'].value;
   $('setLinkFormat').value = view['linkFormat'].value;
   $('setPurgeCdn').checked = !!view['git.purgeCdn'].value;
+  $('setToken').value = (view['accessToken'] && view['accessToken'].value) || '';
+  updateExtApiExample();
   $('settingsMsg').hidden = true;
   $('settingsMsg').className = 'form-msg';
 }
+
+/* ---------- 外部上传接口说明（设置面板内） ---------- */
+function updateExtApiExample() {
+  const t = $('setToken').value.trim();
+  $('extApiExample').textContent =
+`PicGo → 自定义图床 / ShareX → 自定义上传：
+  POST  ${location.origin}/api/external/upload
+  文件字段名：file（任意字段名均可）
+  请求头：Authorization: Bearer ${t || '<访问令牌>'}
+  返回：data.url 即为可用链接（完整结果在 data.results）
+  可选参数（query 或表单字段）：category / theme / convert / quality / linkType`;
+}
+$('setToken').addEventListener('input', updateExtApiExample);
+$('btnGenToken').addEventListener('click', () => {
+  const buf = new Uint8Array(16);
+  crypto.getRandomValues(buf);
+  $('setToken').value = [...buf].map((b) => b.toString(16).padStart(2, '0')).join('');
+  updateExtApiExample();
+  toast('已生成随机令牌，点"保存设置"后生效', 'ok');
+});
 
 function setCfgByKey(key, value) {
   if (!state.cfg) return;
@@ -2374,9 +2627,12 @@ $('btnSaveSettings').addEventListener('click', async () => {
         'dedup.hammingThreshold': Number($('setHamming').value),
         'dedup.onExactDuplicate': $('setOnDup').value,
         'linkFormat': $('setLinkFormat').value,
-        'git.purgeCdn': $('setPurgeCdn').checked
+        'git.purgeCdn': $('setPurgeCdn').checked,
+        'accessToken': $('setToken').value.trim()
       })
     });
+    // 服务端启用/关闭令牌后，本机记住的令牌可能已失效，按新状态同步本地
+    if ($('setToken').value.trim()) saveToken($('setToken').value.trim());
     // 把服务端确认后的值写回内存配置，上传面板立刻使用新默认值
     for (const [key, info] of Object.entries(res.settings || {})) setCfgByKey(key, info.value);
     state.linkType = state.cfg.linkFormat || state.linkType;
@@ -2515,6 +2771,9 @@ function isTypingTarget(el) {
 }
 
 document.addEventListener('keydown', (e) => {
+  // 单图快捷菜单优先收回
+  if (!$('cellMenu').hidden && e.key === 'Escape') { e.preventDefault(); closeCellMenu(); return; }
+
   // 灯箱优先
   if (!$('lightbox').hidden) {
     if (e.key === 'Escape') { e.preventDefault(); closeLightbox(); }
@@ -2523,6 +2782,7 @@ document.addEventListener('keydown', (e) => {
     else if (e.key === '+' || e.key === '=') { e.preventDefault(); lbZoom(1.25); }
     else if (e.key === '-') { e.preventDefault(); lbZoom(0.8); }
     else if (e.key === '0') { e.preventDefault(); lbResetZoom(); }
+    else if (e.key === 'i' || e.key === 'I') { e.preventDefault(); toggleLbInfo(); }
     return;
   }
 
@@ -2534,6 +2794,9 @@ document.addEventListener('keydown', (e) => {
     return;
   }
 
+  // 快捷键帮助（输入框内不劫持 /）
+  if (e.key === '?' && !isTypingTarget(e.target)) { e.preventDefault(); openModal('helpPanel'); return; }
+
   // 图片库快捷键
   if (!document.querySelector('#view-library').classList.contains('active')) return;
   if (isTypingTarget(e.target)) return;
@@ -2544,6 +2807,176 @@ document.addEventListener('keydown', (e) => {
     clearSelection();
   }
 });
+
+/* ================================================================
+ * 9. 单图菜单 / 打包下载 / 镜像测速 / 操作历史 / 移动端抽屉
+ * ================================================================ */
+
+/* ---------- 单图快捷菜单（卡片 ⋯ 触发） ---------- */
+let cellMenuRel = null;
+
+function openCellMenu(rel, cell) {
+  cellMenuRel = rel;
+  const menu = $('cellMenu');
+  document.querySelectorAll('.cell.menu-open').forEach((c) => c.classList.remove('menu-open'));
+  cell.classList.add('menu-open');
+  menu.hidden = false;
+  const anchor = cell.querySelector('.cell-more').getBoundingClientRect();
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  const x = Math.max(8, Math.min(anchor.right - mw, window.innerWidth - mw - 8));
+  let y = anchor.bottom + 6;
+  if (y + mh > window.innerHeight - 8) y = Math.max(8, anchor.top - mh - 6);
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+}
+
+function closeCellMenu() {
+  if ($('cellMenu').hidden) return;
+  $('cellMenu').hidden = true;
+  cellMenuRel = null;
+  document.querySelectorAll('.cell.menu-open').forEach((c) => c.classList.remove('menu-open'));
+}
+
+// 点击菜单外 / 滚动 / 拖放开始 → 收起
+document.addEventListener('click', (e) => {
+  if (!$('cellMenu').hidden && !e.target.closest('#cellMenu') && !e.target.closest('[data-more]')) closeCellMenu();
+});
+window.addEventListener('scroll', () => closeCellMenu(), true);
+
+$('cellMenu').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn || !cellMenuRel) return;
+  const rel = cellMenuRel;
+  closeCellMenu();
+  const row = state.libAll.find((r) => r.rel === rel) || { rel, name: rel.split('/').pop() };
+  try {
+    if (btn.dataset.act === 'copy') {
+      const b = await api(`/api/link?p=${encodeURIComponent(rel)}&type=${state.linkType}`);
+      await copyText(b.url);
+      toast('已复制链接', 'ok');
+    } else if (btn.dataset.act === 'preview') {
+      openLightbox(rel);
+    } else if (btn.dataset.act === 'download') {
+      const a = document.createElement('a');
+      a.href = rawUrl(rel) + (getToken() ? `&token=${encodeURIComponent(getToken())}` : '');
+      a.download = row.name || '';
+      document.body.appendChild(a); a.click(); a.remove();
+    } else if (btn.dataset.act === 'move') {
+      // 复用移动弹窗：把选区收敛到当前这一张
+      state.selected = new Set([rel]);
+      syncGridSelection();
+      updateBulkbar();
+      openModal('movePanel');
+    } else if (btn.dataset.act === 'trash') {
+      const okDel = await confirmDialog({
+        title: '移入回收站',
+        message: `把「${row.name}」移入回收站？`,
+        detail: `${rel}（可随时从回收站恢复）`,
+        okText: '移入'
+      });
+      if (!okDel) return;
+      const r = await api('/api/trash', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paths: [rel] })
+      });
+      const moved = (r.moved || []).filter((m) => !m.error).length;
+      toast(moved ? '已移入回收站' : '移动失败', moved ? 'ok' : 'err');
+      state.selected.delete(rel);
+      updateBulkbar();
+      refreshLibrary();
+      refreshGitStatus();
+    }
+  } catch (err) { toast(err.message, 'err'); }
+});
+
+/* ---------- 打包下载（选中 → ZIP） ---------- */
+$('btnZipSel').addEventListener('click', async () => {
+  const rels = selRels();
+  if (!rels.length) return;
+  try {
+    const job = await api('/api/download/zip', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths: rels })
+    });
+    const a = document.createElement('a');
+    a.href = `/api/download/zip?id=${encodeURIComponent(job.id)}${getToken() ? `&token=${encodeURIComponent(getToken())}` : ''}`;
+    document.body.appendChild(a); a.click(); a.remove();
+    toast(`服务器打包中，浏览器即将开始下载（${job.count} 张）`, 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+});
+
+/* ---------- 镜像测速：HEAD 探测各线路，自动切到最快 ---------- */
+async function runSpeedTest() {
+  if (!state.cfg || !state.cfg.repo || !state.cfg.repo.owner) {
+    return toast('仓库信息未就绪，稍后重试', 'warn');
+  }
+  const btn = $('btnSpeed');
+  btn.disabled = true;
+  toast('正在测速各线路…', 'info', { duration: 2500 });
+  try {
+    const { owner, name, branch } = state.cfg.repo;
+    const hosts = state.cfg.linkHosts || {};
+    const probes = Object.entries(hosts).map(([key, host]) =>
+      ({ key, url: `https://${host}/gh/${owner}/${name}@${branch}/README.md` }));
+    probes.push({ key: 'raw', url: `https://raw.githubusercontent.com/${owner}/${name}/${branch}/README.md` });
+    const LABELS = { jsdelivr: 'jsDelivr', fastly: 'Fastly', testingcf: 'Cloudflare', gcore: 'Gcore', raw: 'Raw' };
+    const results = await Promise.all(probes.map(async (p) => {
+      const t0 = performance.now();
+      try {
+        await fetch(p.url, { method: 'HEAD', mode: 'no-cors', cache: 'no-store' });
+        return { key: p.key, ms: Math.round(performance.now() - t0) };
+      } catch (e) { return { key: p.key, ms: null }; }
+    }));
+    const avail = results.filter((r) => r.ms != null).sort((a, b) => a.ms - b.ms);
+    if (!avail.length) { toast('所有线路均不可达，请检查网络', 'err'); return; }
+    const best = avail[0];
+    if ($('linkType').value !== best.key) {
+      $('linkType').value = best.key;
+      $('linkType').dispatchEvent(new Event('change')); // 复用切换逻辑与提示
+    }
+    const detail = results.map((r) => `${LABELS[r.key] || r.key} ${r.ms == null ? '超时' : r.ms + 'ms'}`).join(' · ');
+    toast(`${detail} —— 最快：${LABELS[best.key] || best.key}`, 'ok', { duration: 8000 });
+  } finally { btn.disabled = false; }
+}
+$('btnSpeed').addEventListener('click', runSpeedTest);
+
+/* ---------- 操作历史 ---------- */
+const HISTORY_TYPES = {
+  upload: '上传', trash: '回收站', restore: '恢复', purge: '彻底删除',
+  move: '移动', convert: '转换', renumber: '规整', 'rename-theme': '改名', sync: '同步'
+};
+let historyOffset = 0;
+
+async function loadHistory(reset) {
+  if (reset) { historyOffset = 0; $('historyBody').innerHTML = ''; }
+  const res = await api(`/api/history?limit=50&offset=${historyOffset}`);
+  const html = res.entries.map((en) => `
+    <div class="hist-row">
+      <span class="hist-time">${fmtTime(en.ts)}</span>
+      <span class="hist-type">${escapeHtml(HISTORY_TYPES[en.type] || en.type)}</span>
+      <span class="hist-summary">${escapeHtml(en.summary)}</span>
+    </div>`).join('');
+  if (reset && !res.entries.length) $('historyBody').innerHTML = '<div class="empty">还没有操作记录</div>';
+  else $('historyBody').insertAdjacentHTML('beforeend', html);
+  historyOffset += res.entries.length;
+  $('historyMoreWrap').hidden = historyOffset >= res.total;
+}
+$('btnHistory').addEventListener('click', () => {
+  openModal('historyPanel');
+  loadHistory(true).catch((e) => toast(e.message, 'err'));
+});
+$('btnHistoryMore').addEventListener('click', () => loadHistory(false).catch((e) => toast(e.message, 'err')));
+
+/* ---------- 移动端目录抽屉 ---------- */
+function setDrawer(open) {
+  const side = document.querySelector('.lib-side');
+  if (!side) return;
+  side.classList.toggle('open', open);
+  $('drawerMask').hidden = !open;
+  document.body.classList.toggle('drawer-open', open);
+}
+$('btnTreeDrawer').addEventListener('click', () => setDrawer(true));
+$('drawerMask').addEventListener('click', () => setDrawer(false));
 
 /* ---------------- 初始化 ---------------- */
 

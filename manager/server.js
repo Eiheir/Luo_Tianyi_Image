@@ -15,6 +15,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
+const crypto = require('crypto');
 
 const { loadConfig, safeJoinImage, ASSET_ROOT } = require('./core/config');
 const classify = require('./core/classify');
@@ -26,6 +27,8 @@ const uploader = require('./core/uploader');
 const converter = require('./core/converter');
 const organize = require('./core/organize');
 const settings = require('./core/settings');
+const history = require('./core/history');
+const zipstream = require('./core/zipstream');
 
 /* ---------------------------------------------------------------
  * 启动准备：配置、私有目录、索引
@@ -84,8 +87,39 @@ app.use((req, res, next) => {
   next();
 });
 
+/* ---------- 访问令牌鉴权（可选，config.accessToken 非空时启用） ----------
+ * 启用场景：监听局域网地址 / 开放外部工具上传时。
+ * 放行规则：Authorization: Bearer <token> 或 ?token=<token>（后者给浏览器下载/外部工具用）。
+ * 健康检查放行，便于监控探活；比较使用恒定时间算法，避免时序侧信道。 */
+function tokenMatch(a, b) {
+  const ba = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+}
+app.use('/api', (req, res, next) => {
+  if (!cfg.accessToken) return next();
+  if (req.path === '/health') return next();
+  const bearer = String(req.headers.authorization || '');
+  const token = bearer.startsWith('Bearer ') ? bearer.slice(7)
+    : (typeof req.query.token === 'string' ? req.query.token : '');
+  if (tokenMatch(token, cfg.accessToken)) return next();
+  fail(res, 401, '未授权：缺少或错误的访问令牌');
+});
+
 /** 内存态索引：启动时加载，上传/转换/删除时增量更新 */
 let index = null;
+
+/* 编号分配互斥锁：上传（含外部工具）/批量转换都先"扫描目录最大编号再落盘"，
+ * 前端 3 路并发上传时，若不串行化这段，两个请求会读到同一 maxNo → 同号互相覆盖。
+ * 锁只包住"处理+落盘"，不阻塞请求体接收：3 个文件的字节仍在并发上传，
+ * 服务端按到达顺序逐个处理——网络并行、落盘串行，兼得速度与正确性。 */
+let processLock = Promise.resolve();
+function withProcessLock(fn) {
+  const run = () => Promise.resolve().then(fn);
+  const p = processLock.then(run, run);
+  processLock = p.catch(() => {}); // 失败也要放行后续任务
+  return p;
+}
 
 // —— 扫描缓存（消除 /api/images 与 /api/stats 并发时的重复扫库与索引竞态）——
 // 前端刷新列表时这两个接口并行调用，旧实现各自 scanLibrary → 同一时刻把整个图库 stat 两遍，
@@ -138,7 +172,7 @@ function requireSafePath(req, res) {
 
 app.get('/api/health', (req, res) => ok(res, { status: 'up', time: Date.now() }));
 
-// 前端所需配置（脱敏：不暴露服务器内部路径）
+// 前端所需配置（脱敏：不暴露服务器内部路径与令牌）
 app.get('/api/config', (req, res) => ok(res, {
   repo: cfg.repo,
   imageRoot: cfg.imageRoot,
@@ -150,25 +184,28 @@ app.get('/api/config', (req, res) => ok(res, {
   linkFormat: cfg.linkFormat,
   linkHosts: links.JSDELIVR_HOSTS,
   categories: classify.CATEGORIES,
-  trashRetentionDays: Math.round(storage.TRASH_RETENTION_MS / 86400000)
+  trashRetentionDays: Math.round(storage.TRASH_RETENTION_MS / 86400000),
+  authRequired: !!cfg.accessToken,          // 前端据此决定是否可能弹出令牌输入框
+  externalUploadPath: '/api/external/upload' // 外部工具上传端点（PicGo 等）
 }));
 
 /* ---------- 上传（批量） ---------- */
 
 // multer 磁盘暂存配置：文件先落到 manager/.cache/tmp/，处理后即删
-const uploadMiddleware = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, cfg._paths.tmpDir),
-    filename: (req, file, cb) => {
-      // 随机暂存名，避免中文文件名编码问题
-      cb(null, `up-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
-    }
-  }),
-  limits: {
-    files: Number(cfg.upload.maxBatchFiles) || 200,
-    fileSize: (Number(cfg.upload.maxFileMB) || 60) * 1024 * 1024
+const uploadDiskStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, cfg._paths.tmpDir),
+  filename: (req, file, cb) => {
+    // 随机暂存名，避免中文文件名编码问题
+    cb(null, `up-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
   }
-}).array('files');
+});
+const uploadLimits = {
+  files: Number(cfg.upload.maxBatchFiles) || 200,
+  fileSize: (Number(cfg.upload.maxFileMB) || 60) * 1024 * 1024
+};
+const uploadMiddleware = multer({ storage: uploadDiskStorage, limits: uploadLimits }).array('files');
+// 外部工具端点：字段名不固定（PicGo 用 file，ShareX 用 sharex，快捷指令自定义），用 any 全收
+const uploadAnyMiddleware = multer({ storage: uploadDiskStorage, limits: uploadLimits }).any();
 
 // 包装 multer：解析失败（超数量/超大文件）返回友好中文错误。
 // 关键修正：返回 Promise，使 handleUpload 内部的异步异常能通过 reject 冒泡到外层 wrap，
@@ -199,11 +236,60 @@ async function handleUpload(req, res) {
   const files = req.files.map((f) => ({ tmpPath: f.path, originalName: Buffer.from(f.originalname, 'latin1').toString('utf8') }));
   // 注：multer 在部分环境下按 latin1 传输原始文件名，此处转回 utf8 保证中文名展示正常
 
-  const { results, summary } = await uploader.processBatch(cfg, index, files, opts);
+  const { results, summary } = await withProcessLock(() => uploader.processBatch(cfg, index, files, opts));
+  await history.record(cfg, 'upload',
+    `上传 ${summary.total} 张：成功 ${summary.ok} · 重复 ${summary.duplicate} · 失败 ${summary.failed}`,
+    { via: 'web', ok: summary.ok, failed: summary.failed });
   ok(res, { results, summary });
 }
 
 app.post('/api/upload', wrap(uploadHandler));
+
+/* ---------- 外部工具上传（PicGo / ShareX / 快捷指令） ----------
+ * POST /api/external/upload（multipart，任意文件字段名）
+ * 选项可走 query 或表单字段：category/theme/convert/quality/onDuplicate/stripMeta/linkType，
+ * 缺省使用管理器当前设置；响应顶层直接给首个可用 url（PicGo 自定义图床取 url 字段最省事）。 */
+function externalUploadHandler(req, res) {
+  return new Promise((resolve, reject) => {
+    uploadAnyMiddleware(req, res, (err) => {
+      if (err) {
+        const msg = /LIMIT_FILE_COUNT/.test(err.code || '') ? `单批最多 ${cfg.upload.maxBatchFiles} 个文件`
+          : /LIMIT_FILE_SIZE/.test(err.code || '') ? `单个文件不能超过 ${cfg.upload.maxFileMB} MB`
+          : err.message;
+        fail(res, 400, msg);
+        return resolve();
+      }
+      handleExternalUpload(req, res).then(resolve, reject);
+    });
+  });
+}
+
+async function handleExternalUpload(req, res) {
+  if (!req.files || req.files.length === 0) {
+    return fail(res, 400, '未收到任何文件（multipart 任意文件字段名均可，如 file/files/image/sharex）');
+  }
+  const q = req.query || {};
+  const b = req.body || {};
+  const pick = (k) => (q[k] != null && q[k] !== '' ? q[k] : b[k]);
+  const opts = {
+    category: pick('category') || 'auto',
+    theme: pick('theme') || '',
+    convert: pick('convert') || 'keep',
+    quality: Number(pick('quality')) || undefined,
+    onDuplicate: pick('onDuplicate') || undefined,
+    stripMeta: String(pick('stripMeta')) !== 'false',
+    linkType: pick('linkType') || cfg.linkFormat
+  };
+  const files = req.files.map((f) => ({ tmpPath: f.path, originalName: Buffer.from(f.originalname, 'latin1').toString('utf8') }));
+  const { results, summary } = await withProcessLock(() => uploader.processBatch(cfg, index, files, opts));
+  const firstOk = results.find((r) => r.status === 'ok' || r.status === 'duplicate');
+  await history.record(cfg, 'upload',
+    `外部工具上传 ${summary.total} 张：成功 ${summary.ok} · 重复 ${summary.duplicate} · 失败 ${summary.failed}`,
+    { via: 'external', ok: summary.ok, failed: summary.failed });
+  ok(res, { url: firstOk ? firstOk.url : '', results, summary });
+}
+
+app.post('/api/external/upload', wrap(externalUploadHandler));
 
 /* ---------- 图库查询 / 统计 / 预览 ---------- */
 
@@ -219,7 +305,16 @@ app.get('/api/images', wrap(async (req, res) => {
 app.get('/api/stats', wrap(async (req, res) => {
   // 与 /api/images 共用同一份扫描结果（TTL 内合并），避免重复扫库
   await getIndex();
-  ok(res, storage.buildStats(index, cfg));
+  const stats = storage.buildStats(index, cfg);
+  // 磁盘剩余空间（图库所在卷）。statfs 不可用的环境（旧 Node/平台限制）返回 null，前端自动隐藏
+  let disk = null;
+  try {
+    if (typeof fsp.statfs === 'function') {
+      const s = await fsp.statfs(cfg._paths.imageRoot);
+      disk = { free: Number(s.bavail) * Number(s.bsize), total: Number(s.blocks) * Number(s.bsize) };
+    }
+  } catch (e) { /* 降级为本功能缺席，不影响统计主体 */ }
+  ok(res, { ...stats, disk });
 }));
 
 // 缩略图（动态生成 + 落盘缓存）
@@ -321,20 +416,21 @@ app.post('/api/convert', wrap(async (req, res) => {
         });
         continue;
       }
-      const cat = storage.categoryOf(rel, cfg);
-      const relDir = cat === 'emoticon'
-        ? `${cfg.classify.emoticonDir}/${path.basename(path.dirname(rel))}` // 表情包保持原主题目录
-        : classify.categoryDir(cat, '', cfg);
-      const dirAbs = path.join(cfg._paths.imageRoot, relDir.replace(/\//g, path.sep));
-      const padding = cat === 'emoticon' ? cfg.naming.emoticonPadding : cfg.naming.padding;
-      const maxNo = await classify.scanMaxNumber(dirAbs, cfg.naming.allowedExt);
-      const allocated = await classify.allocatePath(dirAbs, maxNo, padding, processed.ext, cfg);
-      const tmpTarget = allocated.absPath + '.tmp';
-      await fsp.writeFile(tmpTarget, processed.buffer);
-      await fsp.rename(tmpTarget, allocated.absPath);
-
-      const newRel = `${relDir}/${allocated.fileName}`;
-      const st = await fsp.stat(allocated.absPath);
+      // 与上传共用编号互斥锁：扫描最大编号 → 原子落盘，避免与并发上传撞号
+      const { newRel, st } = await withProcessLock(async () => {
+        const cat = storage.categoryOf(rel, cfg);
+        const relDir = cat === 'emoticon'
+          ? `${cfg.classify.emoticonDir}/${path.basename(path.dirname(rel))}` // 表情包保持原主题目录
+          : classify.categoryDir(cat, '', cfg);
+        const dirAbs = path.join(cfg._paths.imageRoot, relDir.replace(/\//g, path.sep));
+        const padding = cat === 'emoticon' ? cfg.naming.emoticonPadding : cfg.naming.padding;
+        const maxNo = await classify.scanMaxNumber(dirAbs, cfg.naming.allowedExt);
+        const allocated = await classify.allocatePath(dirAbs, maxNo, padding, processed.ext, cfg);
+        const tmpTarget = allocated.absPath + '.tmp';
+        await fsp.writeFile(tmpTarget, processed.buffer);
+        await fsp.rename(tmpTarget, allocated.absPath);
+        return { newRel: `${relDir}/${allocated.fileName}`, st: await fsp.stat(allocated.absPath) };
+      });
       const md5 = dedup.md5Of(processed.buffer);
       const dhash = await dedup.dhashOf(processed.buffer).catch(() => '');
       dedup.setIndexItem(index, newRel, {
@@ -359,6 +455,10 @@ app.post('/api/convert', wrap(async (req, res) => {
   }
   // 批末一次性持久化索引（仅当本批确有成功转换时），避免逐张写盘
   if (results.some((r) => r.ok)) await dedup.saveIndex(cfg, index);
+  const convOk = results.filter((r) => r.ok && !r.skipped).length;
+  await history.record(cfg, 'convert',
+    `批量转换 ${convOk} 张为 ${target.toUpperCase()}${replaceOriginal ? '（原图已入回收站）' : ''}`,
+    { target, ok: convOk, skipped: results.filter((r) => r.skipped).length, failed: results.filter((r) => !r.ok).length });
   ok(res, { results });
 }));
 
@@ -385,6 +485,46 @@ app.post('/api/links/export', wrap(async (req, res) => {
   ok(res, { text, count: rows.length });
 }));
 
+/* ---------- 打包下载（ZIP，stored 无压缩流式输出） ----------
+ * 两步走：POST 校验路径并创建一次性任务（5 分钟有效）→ GET 按任务 id 流式下载。
+ * 这样浏览器原生下载（显示系统下载进度）不受 fetch 内存 Blob 的大小限制。 */
+const zipJobs = new Map(); // id → { entries: [{abs, name}], at }
+
+app.post('/api/download/zip', wrap(async (req, res) => {
+  const { paths } = req.body || {};
+  if (!Array.isArray(paths) || paths.length === 0) return fail(res, 400, '未指定图片');
+  const entries = [];
+  let totalBytes = 0;
+  for (const rel of paths) {
+    const abs = safeJoinImage(cfg, rel);
+    if (!abs) return fail(res, 400, `非法路径：${rel}`);
+    const st = await fsp.stat(abs).catch(() => null);
+    if (!st) return fail(res, 404, `文件不存在：${rel}`);
+    totalBytes += st.size;
+    // 包内文件名：相对路径压平（/ → __），中文名原样保留（ZIP 头标 UTF-8）
+    entries.push({ abs, name: rel.replace(/\//g, '__') });
+  }
+  if (entries.length > 60000 || totalBytes > 3.5e9) {
+    return fail(res, 400, '单次打包上限约 3.5GB / 6 万文件，请缩小选择范围分批下载');
+  }
+  const id = crypto.randomBytes(8).toString('hex');
+  zipJobs.set(id, { entries, at: Date.now() });
+  // 顺手清理过期任务，防止 Map 无限增长
+  for (const [k, v] of zipJobs) if (Date.now() - v.at > 5 * 60 * 1000) zipJobs.delete(k);
+  ok(res, { id, count: entries.length, totalBytes });
+}));
+
+app.get('/api/download/zip', wrap(async (req, res) => {
+  const id = String(req.query.id || '');
+  const job = zipJobs.get(id);
+  if (!job) return fail(res, 404, '下载任务不存在或已过期，请重新发起');
+  zipJobs.delete(id);
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const name = `洛佬の美图-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}.zip`;
+  await zipstream.streamZip(res, job.entries, name);
+}));
+
 /* ---------- 回收站 ---------- */
 
 app.post('/api/trash', wrap(async (req, res) => {
@@ -400,6 +540,8 @@ app.post('/api/trash', wrap(async (req, res) => {
     if (!m.error) dedup.deleteIndexItem(index, m.rel);
   }
   await dedup.saveIndex(cfg, index);
+  const movedOk = result.moved.filter((m) => !m.error).length;
+  await history.record(cfg, 'trash', `移入回收站 ${movedOk} 张`, { moved: movedOk, failed: result.moved.length - movedOk });
   ok(res, result);
 }));
 
@@ -472,6 +614,7 @@ app.post('/api/trash/restore', wrap(async (req, res) => {
   // 恢复后重新入索引
   const scan = await dedup.scanLibrary(cfg, { deep: false });
   index.items = scan.items;
+  await history.record(cfg, 'restore', `从回收站恢复 ${rel}${renamed ? '（编号冲突已改号）' : ''}`);
   ok(res, { restored: rel, renamed });
 }));
 
@@ -482,6 +625,8 @@ app.post('/api/trash/restore-batch', wrap(async (req, res) => {
   const result = await storage.restoreBatch(cfg, batchId);
   const scan = await dedup.scanLibrary(cfg, { deep: false });
   index.items = scan.items;
+  const restoredN = Array.isArray(result.restored) ? result.restored.filter((r) => !r.error).length : 0;
+  await history.record(cfg, 'restore', `整批恢复回收站批次（${restoredN} 张）`);
   ok(res, result);
 }));
 
@@ -490,6 +635,8 @@ app.post('/api/trash/purge', wrap(async (req, res) => {
   const { batchId, flats } = req.body || {};
   if (!batchId || !/^[\w-]+$/.test(batchId)) return fail(res, 400, '非法批次标识');
   const result = await storage.purgeTrash(cfg, batchId, flats);
+  await history.record(cfg, 'purge',
+    Array.isArray(flats) && flats.length ? `彻底删除回收站 ${flats.length} 条` : '清空回收站批次');
   ok(res, result);
 }));
 
@@ -509,6 +656,8 @@ app.post('/api/move', wrap(async (req, res) => {
   if (movedCount > 0) {
     await dedup.saveIndex(cfg, index);
     await dedup.pruneIgnorePairs(cfg, index); // 路径已变，清理含失效路径的忽略对
+    await history.record(cfg, 'move',
+      `移动 ${movedCount} 张到 ${category}${theme ? ' · ' + theme : ''}`, { category, theme, moved: movedCount });
   }
   ok(res, { results, movedCount });
 }));
@@ -529,6 +678,7 @@ app.post('/api/renumber', wrap(async (req, res) => {
   if (result.renumbered > 0) {
     await dedup.saveIndex(cfg, index);
     await dedup.pruneIgnorePairs(cfg, index); // 编号已变，清理含失效路径的忽略对
+    await history.record(cfg, 'renumber', `编号规整 ${norm}：${result.renumbered} 张重排`);
   }
   ok(res, result);
 }));
@@ -540,6 +690,7 @@ app.post('/api/rename-theme', wrap(async (req, res) => {
   const result = await organize.renameTheme(cfg, index, from, to);
   await dedup.saveIndex(cfg, index);
   await dedup.pruneIgnorePairs(cfg, index); // 主题路径已变，清理含失效路径的忽略对
+  await history.record(cfg, 'rename-theme', `表情包主题改名：${from} → ${to}`);
   ok(res, result);
 }));
 
@@ -580,7 +731,15 @@ app.get('/api/git/status', wrap(async (req, res) => {
 
 app.post('/api/git/sync', wrap(async (req, res) => {
   if (cfg.git.enabled === false) return fail(res, 403, '同步功能已在配置中关闭');
-  ok(res, await gitops.sync(cfg));
+  const result = await gitops.sync(cfg);
+  await history.record(cfg, 'sync', `Git 同步${result.ok ? '成功' : '失败'}${result.detail ? '：' + String(result.detail).slice(0, 120) : ''}`);
+  ok(res, result);
+}));
+
+/* ---------- 操作历史 ---------- */
+
+app.get('/api/history', wrap(async (req, res) => {
+  ok(res, await history.list(cfg, req.query.limit, req.query.offset));
 }));
 
 /* ---------- 静态资源（Web 界面） ---------- */
@@ -644,9 +803,16 @@ app.get(/^\/(?!api\/).*/, (req, res) => {
   console.log('  智能图床管理器已启动（独立模块，未改动原有图床）');
   console.log(`  管理界面：${url}`);
   console.log(`  图库目录：${cfg._paths.imageRoot}`);
-  // 安全提示：本服务无鉴权，仅应监听本机回环；若配置成其他地址会暴露到局域网
+  // 安全提示：非回环监听时必须配合访问令牌，否则等同于把图库管理权交给整个局域网
   if (!['127.0.0.1', 'localhost', '::1'].includes(cfg.host)) {
-    console.warn(`  [安全告警] 监听地址为 ${cfg.host}（非本机回环），服务无鉴权，可能被局域网内其他设备访问`);
+    if (cfg.accessToken) {
+      console.log('  访问令牌：已启用（局域网访问需凭令牌）');
+    } else {
+      console.warn(`  [安全告警] 监听地址为 ${cfg.host}（非本机回环）且未配置 accessToken！`);
+      console.warn('  [安全告警] 局域网内任何设备都可上传/删除你的图库，请立即在 config.json 设置 accessToken');
+    }
+  } else if (cfg.accessToken) {
+    console.log('  访问令牌：已启用');
   }
   console.log('  按 Ctrl+C 停止服务');
   console.log('──────────────────────────────────────────────');
