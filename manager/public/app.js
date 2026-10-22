@@ -1982,6 +1982,7 @@ $('btnConvertStart').addEventListener('click', async () => {
 $('btnDupScan').addEventListener('click', async () => {
   openModal('dupPanel');
   $('dupMeta').textContent = '';
+  $('btnKeepOriginalAll').hidden = true;
   $('dupBody').setAttribute('aria-busy', 'true');
   $('dupBody').innerHTML = `<div class="empty">
     <div class="skeleton" style="width:42px;height:42px;border-radius:50%"></div>
@@ -2005,15 +2006,75 @@ $('btnDupScan').addEventListener('click', async () => {
     if (!r.exactGroups.length && !r.similarGroups.length) {
       $('dupBody').insertAdjacentHTML('beforeend', '<div class="empty">未发现重复或相似图片</div>');
     }
+    syncKeepAllVisibility();
     if (r.ignoredPairs > 0) await appendIgnoredSection();
   } catch (e) {
     $('dupBody').removeAttribute('aria-busy');
+    $('btnKeepOriginalAll').hidden = true;
     $('dupBody').innerHTML = `<div class="empty">扫描失败：${escapeHtml(e.message)}</div>`;
   }
 });
 
-async function appendIgnoredSection() {
-  let ignored;
+/* 一键处理当前所有分组：每组保留完整原图/最高清的一张 */
+$('btnKeepOriginalAll').addEventListener('click', async () => {
+  const sections = [...$('dupBody').querySelectorAll('.dup-group:not(.ignored-sec)')];
+  const groups = sections
+    .map((sec) => [...sec.querySelectorAll('.dup-item')].map((el) => el.dataset.rel))
+    .filter((g) => g.length > 1);
+  if (!groups.length) return toast('当前没有可处理的重复/相似组', 'warn');
+
+  const total = groups.reduce((sum, g) => sum + g.length, 0);
+  const ok = await confirmDialog({
+    title: '一键保留原图',
+    message: `将处理当前 ${groups.length} 个组（共 ${total} 张），每组只保留一张原图？`,
+    detail: '裁切组保留完整原图；其他组保留像素面积最大（分辨率最高）的一张。其余图片移入回收站，可随时恢复。保留图会自动改为同目录组内最小序号（目标序号被占用时保持原名）。',
+    okText: '开始处理'
+  });
+  if (!ok) return;
+
+  const btn = $('btnKeepOriginalAll');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '处理中…';
+  try {
+    const r = await api('/api/duplicates/keep-original-all', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ groups })
+    });
+    const failed = Number(r.failed) || 0;
+    let msg = `已处理 ${r.kept} 组：每组保留 1 张，${r.trashed} 张移入回收站`;
+    if (failed) msg += `；${failed} 张移入失败`;
+    toast(msg, failed ? 'warn' : 'ok', r.trash && r.trash.batchId && !failed
+      ? { action: { label: '撤销删除', onClick: () => undoTrashBatch(r.trash.batchId) }, duration: 15000 }
+      : {});
+
+    // 成功的组直接移除；有失败的组保留下来，并列出失败项
+    const failedRels = new Set((r.groups || []).flatMap((g) => g.failed || []));
+    for (const sec of sections) {
+      const rels = [...sec.querySelectorAll('.dup-item')].map((el) => el.dataset.rel);
+      if (!rels.some((rel) => failedRels.has(rel))) sec.remove();
+    }
+    if (!$('dupBody').querySelector('.dup-group:not(.ignored-sec)')) {
+      $('dupBody').insertAdjacentHTML('beforeend', '<div class="empty">已按“保留原图”处理全部组</div>');
+    }
+    if (failed) {
+      showResult('一键保留原图结果', (r.groups || []).flatMap((g) => (g.failed || []).map((rel) => ({
+        status: 'fail', title: rel, note: '移入回收站失败'
+      }))));
+    }
+    refreshLibrary();
+    refreshGitStatus();
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+    syncKeepAllVisibility();
+  }
+});
+
+async function appendIgnoredSection() {  let ignored;
   try { ignored = await api('/api/duplicates/ignored'); }
   catch (e) { return; }
   if (!ignored.items.length) return;
@@ -2113,6 +2174,13 @@ function fallbackKeepIndex(group) {
     }
   });
   return best;
+}
+
+/** 只有存在可处理的分组时才显示“一键保留原图” */
+function syncKeepAllVisibility() {
+  const btn = $('btnKeepOriginalAll');
+  if (!btn) return;
+  btn.hidden = !$('dupBody').querySelector('.dup-group:not(.ignored-sec)');
 }
 
 function renderDupGroups(groups, label, ignorable = false) {
@@ -2230,6 +2298,7 @@ function renderDupGroups(groups, label, ignorable = false) {
           ? { action: { label: '撤销删除', onClick: () => undoTrashBatch(r.trash.batchId) }, duration: 12000 }
           : {});
         sec.remove();
+        syncKeepAllVisibility();
         refreshLibrary();
         refreshGitStatus();
       } catch (e) { toast(e.message, 'err'); }
@@ -2253,6 +2322,7 @@ function renderDupGroups(groups, label, ignorable = false) {
           });
           toast(`已忽略 ${r.added} 张（共 ${r.total} 张）`, 'ok');
           sec.remove();
+          syncKeepAllVisibility();
         } catch (e) { toast(e.message, 'err'); }
       });
     }
@@ -2278,11 +2348,15 @@ function renderDupGroups(groups, label, ignorable = false) {
         if (!ok) return;
       }
       const res = await trashPaths(rels, { confirm: !includesKeeper });
-      if (res && res.ok > 0) sec.remove();
+      if (res && res.ok > 0) {
+        sec.remove();
+        syncKeepAllVisibility();
+      }
     });
 
     body.appendChild(sec);
   });
+  syncKeepAllVisibility();
 }
 
 /* ---------------- 回收站 ---------------- */

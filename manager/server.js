@@ -655,6 +655,84 @@ app.post('/api/duplicates/keep-best', wrap(async (req, res) => {
   });
 }));
 
+/* ---------- 查重清理：一键保留原图（当前所有组） ---------- */
+
+app.post('/api/duplicates/keep-original-all', wrap(async (req, res) => {
+  const { groups } = req.body || {};
+  if (!Array.isArray(groups) || groups.length === 0) {
+    return fail(res, 400, '参数不完整：需要至少一个分组');
+  }
+  const seen = new Set();
+  for (const group of groups) {
+    if (!Array.isArray(group) || group.length < 2) {
+      return fail(res, 400, '每个分组至少需要 2 张图片');
+    }
+    for (const rel of group) {
+      if (!safeJoinImage(cfg, rel)) return fail(res, 400, `非法路径：${rel}`);
+      if (seen.has(rel)) return fail(res, 400, `图片重复出现在多个分组：${rel}`);
+      if (!index.items[rel]) return fail(res, 400, `图片不在索引中：${rel}`);
+      seen.add(rel);
+    }
+  }
+
+  // 每组独立决策：裁切组保留完整原图，其他组保留像素面积最大的一张
+  const cropThreshold = Number(cfg.dedup.cropThreshold) || 5;
+  const plans = groups.map((group) => {
+    const items = group.map((rel) => ({ rel, ...index.items[rel] }));
+    const original = dedup.pickOriginal(items, cfg, cropThreshold);
+    return {
+      group,
+      keep: original.rel,
+      keepReason: original.reason,
+      cropRels: original.cropRels,
+      toTrash: group.filter((rel) => rel !== original.rel)
+    };
+  });
+
+  // 所有组待删图片合并成一次回收站批次，便于一键撤销
+  const result = await storage.moveToTrash(cfg, plans.flatMap((p) => p.toTrash));
+  const failedRels = new Set(result.moved.filter((m) => m.error).map((m) => m.rel));
+  for (const m of result.moved) {
+    if (!m.error) dedup.deleteIndexItem(index, m.rel);
+  }
+
+  const results = [];
+  for (const plan of plans) {
+    const failed = plan.toTrash.filter((rel) => failedRels.has(rel));
+    // 本组全部移入成功才压缩保留图序号，避免半成功状态
+    let compact = { keptRel: plan.keep, renamed: false, reason: 'trash-failed' };
+    if (failed.length === 0 && index.items[plan.keep]) {
+      try {
+        compact = await organize.compactKeptSequence(cfg, index, plan.group, plan.keep);
+      } catch (e) {
+        compact = { keptRel: plan.keep, renamed: false, reason: e.message };
+      }
+    }
+    results.push({
+      keep: plan.keep,
+      keepReason: plan.keepReason,
+      cropRels: plan.cropRels,
+      compact,
+      failed
+    });
+  }
+
+  await dedup.saveIndex(cfg, index);
+  await dedup.pruneIgnorePairs(cfg, index);
+  const movedOk = result.moved.filter((m) => !m.error).length;
+  const failedN = result.moved.length - movedOk;
+  await history.record(cfg, 'trash', `一键保留原图：${results.length} 组，移入回收站 ${movedOk} 张`, {
+    groups: results.length, moved: movedOk, failed: failedN
+  });
+  ok(res, {
+    groups: results,
+    kept: results.length,
+    trashed: movedOk,
+    failed: failedN,
+    trash: result
+  });
+}));
+
 // 回收站条目缩略图（恢复前预览）
 app.get('/api/trash/thumb', wrap(async (req, res) => {
   const batchId = String(req.query.b || '');

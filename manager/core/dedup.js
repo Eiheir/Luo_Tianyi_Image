@@ -13,7 +13,8 @@
  *
  * 局部裁切识别：跨方向（竖图是横图的一部分截取）和同方向（横图被二次裁切后
  * 宽高比明显变化，如 4800×2620 → 1852×1080）都会在整图 dHash 不命中时，
- * 用多位置裁切指纹 / 缩略图滑窗 NCC 兜底。
+ * 用多位置裁切指纹 / 缩略图滑窗 NCC 兜底；只剩约 10% 面积的同方向细节裁切，
+ * 另走 patch dHash 粗筛 + 96px 局部 NCC 复核。
  *
  * 保留规则（清理相似/重复组时的默认决策）：
  *  - 跨方向局部裁切组：智能识别哪张是被截取的图，保留完整原图、去除截取版本，
@@ -101,7 +102,7 @@ function hammingDistance(a, b) {
  * 同方向则在宽高比明显不同时启用（见 sameOrientationCropCandidate）。
  */
 
-const CROP_VERSION = 2; // v2 = 增加缩略图 + 行列投影（滑窗 NCC）
+const CROP_VERSION = 3; // v3 = 缩略图提升到 96px + 小裁切 patch/NCC 复核
 const CROP_MAX_DIM = 512; // 裁切指纹的工作分辨率：9×8 输出足够，512px 兼顾细长裁切
 const CROP_POSITIONS = [0, 0.25, 0.5, 0.75, 1];
 const CROP_PORTRAIT_AR = [0.5625, 0.6667, 0.75]; // 9:16 / 2:3 / 3:4
@@ -116,16 +117,17 @@ const CROP_AR_TOLERANCE = 0.3;
 
 /* ---- 滑窗 NCC 参数 ----
  * 固定位置的裁切指纹只能命中"恰好对齐"的截图；真实截图位置任意。
- * 这里额外保存一张最长边 72px 的灰度缩略图 + 32 段行列投影：
+ * 这里额外保存一张最长边 96px 的灰度缩略图 + 32 段行列投影：
  *  - 行列投影做廉价预筛（不相关的图直接挡掉）
  *  - 预筛通过后，把两张缩略图归一化到 48px，沿被裁切的方向逐像素滑动求 NCC
  * 实测本图库：两对真实局部裁切 NCC = 0.995 / 0.958，最高误报 0.82。
  */
-const CROP_THUMB_MAX = 72;
+const CROP_THUMB_MAX = 96; // 96px 才能分辨约 10% 面积的细节裁切
 const CROP_PROFILE_SAMPLES = 32;
-/* 预筛阈值：实测同方向 11.2 万对中 0.9 只放行 1.5%，真命中全部在其中；
- * 放宽到 0.8 会把候选放大 4 倍、全库扫描多花约 3 秒，却不会多出任何命中。 */
-const CROP_PROFILE_MIN = 0.9;
+/* 投影预筛阈值：真实裁切可能只覆盖原图的局部区间，整轴投影相关会被稀释
+ * （实测 heng/0005 + shu/0009 这对真裁切仅 0.71）。0.7 仍能挡掉约 85% 的无关
+ * 组合，同时放行这批低投影真命中；最终由 NCC ≥ 0.9 判定。 */
+const CROP_PROFILE_MIN = 0.7;
 /** 同方向也做局部裁切复核的最小宽高比相对差异：低于该值构图窗口基本一致，交给整图 dHash */
 const CROP_SAME_AR_DIFF_MIN = 0.02;
 const CROP_NCC_SIZE = 48;
@@ -135,6 +137,24 @@ const CROP_NCC_MIN = 0.9;
  * 只对灰区候选执行，全库通常只有十几对，开销可忽略。 */
 const CROP_NCC_REFINE_MIN = 0.75;
 const CROP_REFINE_SCALES = [0.94, 0.97, 1.03, 1.06];
+/* 二维缩放+平移复核：裁切图可能同时在两个方向被缩放和裁切，一维滑窗无法对齐。
+ * 直接用 96px 原始缩略图（不先归一化），在完整图内按多种缩放比例二维滑窗；
+ * 要求裁切区域至少覆盖完整图面积的 20%，避免小区域碰巧高相关。 */
+const CROP_NCC_2D_MIN = 0.78;
+const CROP_2D_MIN_COVERAGE = 0.2;
+const CROP_2D_SCALE_MIN = 0.3;
+const CROP_2D_SCALE_STEP = 0.01;
+/* 同方向“细节裁切”通道：一张图可能只保留另一张约 10% 面积的一块。
+ * 72px 缩略图上该区域仅二十几像素，NCC 低于 0.9；这里先用多尺度 patch dHash
+ * 在 72px 上廉价筛出候选，再用 96px 缩略图在候选位置做局部 NCC 验证。
+ * 只处理同方向、面积比 ≤25%、宽高比差 ≤5% 的组合，避免全量高分辨率搜索。 */
+const CROP_SMALL_AREA_MAX = 0.25;
+const CROP_SMALL_AR_DIFF = 0.05;
+const CROP_SMALL_PATCH_MAX = 14;
+const CROP_PATCH_THUMB_MAX = 72;
+const CROP_PATCH_SCALE_STEP = 0.02;
+const CROP_PATCH_PX_STEP = 0.125;
+const CROP_PATCH_PY_STEP = 0.0625;
 
 /** 索引条目的宽高比；尺寸缺失返回 0 */
 function arOf(item) {
@@ -277,7 +297,7 @@ function profilesOf(data, width, height) {
 /**
  * 计算一张图片的裁切识别数据：
  *  - chash / crops：整图 + 多位置裁切指纹（固定位置，快速命中）
- *  - thumb / rowProf / colProf：最长边 72px 灰度缩略图与行列投影（任意位置滑窗 NCC）
+ *  - thumb / rowProf / colProf：最长边 96px 灰度缩略图与行列投影（任意位置滑窗 NCC）
  * 只解码一次：先按 EXIF 转正并缩到最长边 512px，再建积分图 / 生成缩略图。
  *
  * @returns {Promise<{chash:string, crops:Array<[number,...string]>, cropVersion:number,
@@ -318,7 +338,7 @@ async function cropHashesOf(buffer, cfg) {
     crops.push([ar, ...new Set(hashes)]); // 宽高比与图片一致时五个位置相同，去重
   }
 
-  // 缩略图：从 512px 灰度图再缩到最长边 72px，用于任意位置的滑窗 NCC
+  // 缩略图：从 512px 灰度图再缩到最长边 96px，用于任意位置的滑窗 NCC / 局部验证
   const { data: thumbData, info: thumbInfo } = await sharp(data, {
     raw: { width, height, channels: 1 }
   })
@@ -387,11 +407,13 @@ function cropDistanceOf(a, b, cropThreshold, cfg) {
  * 任意位置裁切：投影预筛 + 缩略图滑窗 NCC
  * ---------------------------------------------------------------
  * 固定位置的裁切指纹对"刚好对齐"的截图有效，但真实截取位置是任意的。
- * 这里用最长边 72px 的缩略图做逐像素滑动，位置连续覆盖：
- *  1. 行列投影预筛：裁剪图沿未裁切轴的投影与原图高度相关（先把 90%+ 的组合挡掉）
+ * 这里用最长边 96px 的缩略图做逐像素滑动，位置连续覆盖：
+ *  1. 行列投影预筛：裁剪图沿未裁切轴的投影与原图高度相关（先把 85% 的组合挡掉）
  *  2. 同宽纵向 / 同高横向两种归一化，各自滑动求最大 NCC
  *  3. NCC ≥ 0.9 判定为同一作品的局部截取；0.75~0.9 的灰区再做 ±6% 小幅缩放复核，
- *     覆盖"先缩放再裁切"的版本（真实案例从 0.82 提升到 0.93，无关图仍 <0.81）
+ *     覆盖"先缩放再裁切"的版本；一维仍不足时用 96px 缩略图做二维缩放+平移搜索
+ *     （裁切区域至少覆盖完整图 20%），覆盖两个方向同时缩放/偏移的情况；
+ *     只剩约 10% 面积的细节裁切走独立的 patch dHash 粗筛 + 96px 局部 NCC 通道
  * 跨方向始终启用；同方向仅在宽高比差异 ≥ 2% 时启用。且只对壁纸三分类生效。
  */
 
@@ -568,14 +590,179 @@ function nccScaledBest(a, b, cache) {
 }
 
 /**
- * 先固定尺度求 NCC；若落在灰区（0.75~0.9），再做小幅缩放复核。
+ * 取 96px 原始缩略图（不归一化），供二维缩放+平移复核使用。
+ * 与 thumbVariant 分开缓存，避免和 48px 归一化变体混用。
+ */
+function rawThumbOf(item, cache) {
+  if (!item || !item.thumb || typeof item.thumb.data !== 'string') return null;
+  const key = `${item.rel || ''}|2d`;
+  if (cache && cache.has(key)) return cache.get(key);
+  const w = Number(item.thumb.w) || 0;
+  const h = Number(item.thumb.h) || 0;
+  const src = Buffer.from(item.thumb.data, 'base64');
+  if (!w || !h || src.length < w * h) return null;
+  const v = { data: src, w, h };
+  if (cache) cache.set(key, v);
+  return v;
+}
+
+/**
+ * 二维缩放+平移复核：在完整图内以 30% 起的多种缩放比例、逐像素扫描裁切图。
+ * 相比一维滑窗，能覆盖"裁切图同时被缩放并在两个方向偏移"的情况；
+ * 覆盖率低于 20% 的小区域直接跳过，避免碰巧高相关造成误报。
+ * @returns {{score:number, cropRel:string, fullRel:string, mode:string, scale:number}}
+ */
+function ncc2dBest(a, b, cache) {
+  let best = { score: -1, cropRel: '', fullRel: '', mode: '2d', scale: 1 };
+  const va = rawThumbOf(a, cache);
+  const vb = rawThumbOf(b, cache);
+  if (!va || !vb) return best;
+  for (const [full, baseCrop, fullRel, cropRel] of [
+    [va, vb, a.rel, b.rel],
+    [vb, va, b.rel, a.rel]
+  ]) {
+    const fullArea = full.w * full.h;
+    const maxScale = Math.min(1, full.w / baseCrop.w, full.h / baseCrop.h);
+    for (let scale = CROP_2D_SCALE_MIN; scale <= maxScale + 1e-9; scale += CROP_2D_SCALE_STEP) {
+      const cw = Math.max(1, Math.round(baseCrop.w * scale));
+      const ch = Math.max(1, Math.round(baseCrop.h * scale));
+      if (cw > full.w || ch > full.h) continue;
+      if (cw * ch < fullArea * CROP_2D_MIN_COVERAGE) continue;
+      const crop = scale === 1
+        ? baseCrop
+        : { w: cw, h: ch, data: resizeGray(baseCrop.data, baseCrop.w, baseCrop.h, cw, ch) };
+      for (let oy = 0; oy <= full.h - ch; oy++) {
+        for (let ox = 0; ox <= full.w - cw; ox++) {
+          const v = nccAt(full, crop, ox, oy);
+          if (v > best.score) best = { score: v, cropRel, fullRel, mode: '2d', scale };
+        }
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * 72px patch 粗筛缩略图：从 96px 校验缩略图降采样，并预建积分图与整图 hash。
+ * 结果按 rel 缓存，供同方向“细节裁切”通道复用。
+ */
+function patchThumbOf(item, cache) {
+  if (!item || !item.thumb) return null;
+  const key = `${item.rel || ''}|patch72`;
+  if (cache && cache.has(key)) return cache.get(key);
+  const raw = rawThumbOf(item, cache);
+  if (!raw) return null;
+  const scale = Math.min(1, CROP_PATCH_THUMB_MAX / Math.max(raw.w, raw.h));
+  const w = Math.max(1, Math.round(raw.w * scale));
+  const h = Math.max(1, Math.round(raw.h * scale));
+  const data = w === raw.w && h === raw.h
+    ? raw.data
+    : resizeGray(raw.data, raw.w, raw.h, w, h);
+  const I = buildIntegral(data, w, h);
+  const v = { data, w, h, I, hash: hashRect(I, w, 0, 0, w, h) };
+  if (cache) cache.set(key, v);
+  return v;
+}
+
+/**
+ * 同方向“细节裁切”通道（补现有 NCC 的盲区）：
+ *  1. 只处理同方向、面积比 ≤25%、宽高比差 ≤5%、投影 ≥0.7 的壁纸对；
+ *  2. 在 72px 缩略图上按面积比估计裁切尺度，用多尺度 patch dHash 粗筛；
+ *  3. 对粗筛命中在 96px 缩略图上做局部 NCC 验证，≥0.9 才归组。
+ * 一张图只保留另一张约 10% 面积时，低分辨率整图 NCC 会失效，这条通道负责兜底。
+ * @returns {number|null} 命中返回 NCC 分数
+ */
+function smallCropMatch(a, b, cache, cfg) {
+  if (!a || !b || !a.rel || !b.rel) return null;
+  if (!isWallpaperRel(a.rel, cfg) || !isWallpaperRel(b.rel, cfg)) return null;
+  const orientA = orientationOfItem(a, cfg);
+  const orientB = orientationOfItem(b, cfg);
+  if (!orientA || !orientB || orientA !== orientB) return null;
+
+  const areaA = (Number(a.w) || 0) * (Number(a.h) || 0);
+  const areaB = (Number(b.w) || 0) * (Number(b.h) || 0);
+  if (!areaA || !areaB) return null;
+  const areaRatio = Math.min(areaA, areaB) / Math.max(areaA, areaB);
+  if (areaRatio > CROP_SMALL_AREA_MAX) return null;
+  const arA = arOf(a);
+  const arB = arOf(b);
+  if (!arA || !arB) return null;
+  if (Math.abs(arA - arB) / Math.max(arA, arB) > CROP_SMALL_AR_DIFF) return null;
+
+  const profile = Math.max(
+    profileCorr(a.rowProf, b.rowProf),
+    profileCorr(a.colProf, b.colProf)
+  );
+  if (profile < CROP_PROFILE_MIN) return null;
+
+  const [full, crop] = areaA >= areaB ? [a, b] : [b, a];
+  const fullPatch = patchThumbOf(full, cache);
+  const cropPatch = patchThumbOf(crop, cache);
+  if (!fullPatch || !cropPatch) return null;
+  if (cropPatch.w < 8 || cropPatch.h < 8 || fullPatch.w < 16 || fullPatch.h < 16) return null;
+
+  const patchAR = cropPatch.w / cropPatch.h;
+  const baseScale = Math.sqrt(areaRatio);
+  let best = { d: 64 };
+  for (let f = baseScale * 0.8; f <= baseScale * 1.25 + 1e-9; f += CROP_PATCH_SCALE_STEP) {
+    const cw = Math.max(8, Math.round(fullPatch.w * f));
+    const ch = Math.max(8, Math.round(cw / patchAR));
+    if (cw > fullPatch.w || ch > fullPatch.h) continue;
+    for (let px = 0; px <= 1.0001; px += CROP_PATCH_PX_STEP) {
+      for (let py = 0; py <= 1.0001; py += CROP_PATCH_PY_STEP) {
+        const x = Math.round((fullPatch.w - cw) * px);
+        const y = Math.round((fullPatch.h - ch) * py);
+        const d = hammingDistance(
+          hashRect(fullPatch.I, fullPatch.w, x, y, x + cw, y + ch),
+          cropPatch.hash
+        );
+        if (d < best.d) best = { d, f, px, py };
+      }
+    }
+  }
+  if (best.d > CROP_SMALL_PATCH_MAX) return null;
+
+  // 96px 局部 NCC 验证：围绕 patch 最佳位置做小范围缩放/平移细化
+  const fullRaw = rawThumbOf(full, cache);
+  const cropRaw = rawThumbOf(crop, cache);
+  if (!fullRaw || !cropRaw) return null;
+  const rawAR = cropRaw.w / cropRaw.h;
+  let score = -1;
+  for (let f = best.f - 0.02; f <= best.f + 0.02 + 1e-9; f += 0.005) {
+    const cw = Math.max(8, Math.round(fullRaw.w * f));
+    const ch = Math.max(8, Math.round(cw / rawAR));
+    if (cw > fullRaw.w || ch > fullRaw.h) continue;
+    const cropScaled = resizeGray(cropRaw.data, cropRaw.w, cropRaw.h, cw, ch);
+    const baseX = Math.round((fullRaw.w - cw) * best.px);
+    const baseY = Math.round((fullRaw.h - ch) * best.py);
+    for (let dx = -2; dx <= 2; dx++) {
+      for (let dy = -2; dy <= 2; dy++) {
+        const x = Math.min(fullRaw.w - cw, Math.max(0, baseX + dx));
+        const y = Math.min(fullRaw.h - ch, Math.max(0, baseY + dy));
+        const v = nccAt(fullRaw, { w: cw, h: ch, data: cropScaled }, x, y);
+        if (v > score) score = v;
+      }
+    }
+  }
+  return score >= CROP_NCC_MIN ? score : null;
+}
+
+/**
+ * 先固定尺度求 NCC；灰区先做一维缩放复核，仍不足时再做二维缩放+平移复核。
  * 返回最优的方向与分数，供归组（只关心分数）和保留决策（关心方向）共用。
  */
 function nccBestRefined(a, b, cache) {
   const best = nccBest(a, b, cache);
   if (best.score >= CROP_NCC_MIN || best.score < CROP_NCC_REFINE_MIN) return best;
   const refined = nccScaledBest(a, b, cache);
-  return refined.score > best.score ? refined : best;
+  let winner = refined.score > best.score ? refined : best;
+  if (winner.score >= CROP_NCC_MIN) return winner;
+  // 一维缩放仍不够：裁切图可能同时在两个方向被缩放/平移
+  if (best.score >= CROP_NCC_2D_MIN) {
+    const twoD = ncc2dBest(a, b, cache);
+    if (twoD.score > winner.score) winner = twoD;
+  }
+  return winner;
 }
 
 /**
@@ -695,6 +882,33 @@ function pickCropKeeper(items, cfg, cropThreshold, cache) {
     cropRels,
     via: relations.some((r) => r.via === 'ncc') ? 'ncc' : 'crop'
   };
+}
+
+/**
+ * "保留原图"决策（一键批量清理用）：
+ *  1. 能识别出裁切关系时，保留完整原图（与 pickCropKeeper 一致）；
+ *  2. 否则保留像素面积最大的一张（面积相同比文件体积），不按方向优先——
+ *     "原图"通常指分辨率最高、信息最全的版本。
+ * @returns {{rel:string, reason:'crop'|'area', cropRels:string[]}}
+ */
+function pickOriginal(items, cfg, cropThreshold, cache) {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) return { rel: '', reason: 'area', cropRels: [] };
+  const cropInfo = pickCropKeeper(list, cfg, cropThreshold, cache);
+  if (cropInfo) {
+    return { rel: cropInfo.keepRel, reason: 'crop', cropRels: cropInfo.cropRels };
+  }
+  const areaOf = (it) => (Number(it.w) || 0) * (Number(it.h) || 0);
+  let best = list[0];
+  for (const it of list) {
+    const area = areaOf(it);
+    const bestArea = areaOf(best);
+    if (area > bestArea ||
+        (area === bestArea && (Number(it.size) || 0) > (Number(best.size) || 0))) {
+      best = it;
+    }
+  }
+  return { rel: best.rel, reason: 'area', cropRels: [] };
 }
 
 /* ---------------------------------------------------------------
@@ -1023,6 +1237,13 @@ function compareAgainstLibrary(index, md5, dhash, threshold, opts = {}) {
           score = ncc;
           distance = Math.round((1 - ncc) * 64); // 伪距离：NCC 越高越靠前
           via = 'ncc';
+        } else {
+          const small = smallCropMatch(inItem, libItem, nccCache, cfg);
+          if (small !== null) {
+            score = small;
+            distance = Math.round((1 - small) * 64);
+            via = 'ncc';
+          }
         }
       }
     }
@@ -1201,8 +1422,14 @@ function findDuplicateGroups(index, threshold, muted = new Set(), opts = {}) {
           d = cropD;
         } else {
           const nccD = nccCropMatch(pivot, other, nccCache, cfg);
-          if (nccD === null) continue;
-          d = nccD;
+          if (nccD !== null) {
+            d = nccD;
+          } else {
+            // 同方向细节裁切：整图 NCC 失效时用 patch 粗筛 + 96px 局部验证兜底
+            const smallD = smallCropMatch(pivot, other, nccCache, cfg);
+            if (smallD === null) continue;
+            d = smallD;
+          }
         }
       }
       group.push(order[j]);
@@ -1219,7 +1446,7 @@ module.exports = {
   compareAgainstLibrary, findDuplicateGroups, extSetOf,
   orientationOf, orientationOfItem, keepPriorityOf, pickKeep,
   cropHashesOf, cropDistanceOf, nccCropMatch, nccScore, profileCorr, CROP_VERSION,
-  cropRelationOf, pickCropKeeper,
+  cropRelationOf, pickCropKeeper, pickOriginal, smallCropMatch,
   KEEP_PRIORITY, ORIENTATION_LABELS,
   loadIgnoreSet, saveIgnoreSet, addIgnorePairs, removeIgnorePairs, pruneIgnorePairs
 };

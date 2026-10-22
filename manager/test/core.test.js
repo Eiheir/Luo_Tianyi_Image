@@ -921,6 +921,36 @@ test('方向判定：尺寸缺失时按目录兜底，非法优先级回退默�
   assert.deepStrictEqual(dedup.keepPriorityOf(cfg), ['heng', 'avatar', 'shu'], '非法顺序应回退默认');
 });
 
+test('保留原图：裁切组保留完整图，非裁切组保留面积最大', () => {
+  const cfg = makeCfg();
+  const full = {
+    rel: 'wallpapers&illustration/heng/0001.jpg', w: 1920, h: 1080,
+    chash: 'aaaaaaaaaaaaaaaa', crops: [[0.5625, 'bbbbbbbbbbbbbbbb']]
+  };
+  const crop = {
+    rel: 'wallpapers&illustration/shu/0001.jpg', w: 1080, h: 1920,
+    chash: 'bbbbbbbbbbbbbbbb', crops: [[1.7778, 'cccccccccccccccc']]
+  };
+  const byCrop = dedup.pickOriginal([crop, full], cfg, 5);
+  assert.strictEqual(byCrop.rel, full.rel);
+  assert.strictEqual(byCrop.reason, 'crop');
+  assert.deepStrictEqual(byCrop.cropRels, [crop.rel]);
+
+  // 非裁切组：不按“横 > 竖”方向规则，保留像素面积最大的竖图
+  const smallHeng = {
+    rel: 'wallpapers&illustration/heng/0002.jpg', w: 1920, h: 1080,
+    chash: '1111111111111111', crops: []
+  };
+  const bigShu = {
+    rel: 'wallpapers&illustration/shu/0002.jpg', w: 2000, h: 3000,
+    chash: '2222222222222222', crops: []
+  };
+  const byArea = dedup.pickOriginal([smallHeng, bigShu], cfg, 5);
+  assert.strictEqual(byArea.rel, bigShu.rel);
+  assert.strictEqual(byArea.reason, 'area');
+  assert.deepStrictEqual(byArea.cropRels, []);
+});
+
 test('相似归组：横/方/竖不同目录的相似图进入同一组', () => {
   const index = { items: {
     'wallpapers&illustration/heng/0001.jpg': { dhash: '0000000000000000' },
@@ -1303,6 +1333,180 @@ test('同方向局部裁切：缩放后再裁切可从灰区复核命中', async
   assert.ok(base >= 0.75 && base < 0.9, `固定尺度应落在灰区，实际 NCC=${base}`);
   const score = dedup.nccCropMatch(a, b, new Map(), cfg);
   assert.ok(score !== null && score >= 0.9, `灰区缩放复核应命中，实际 NCC=${score}`);
+});
+
+test('局部裁切：投影相关仅 0.76 时仍能通过预筛命中', async () => {
+  const sharp = require('sharp');
+  const cfg = makeCfg();
+  const width = 240, height = 120;
+  const raw = Buffer.alloc(width * height * 3);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 3;
+      raw[i] = Math.round(255 * x / width);
+      raw[i + 1] = Math.round(255 * y / height);
+      raw[i + 2] = Math.round(128 + 64 * Math.sin(x / 12) * Math.cos(y / 9));
+    }
+  }
+  const buf = await sharp(raw, { raw: { width, height, channels: 3 } }).png().toBuffer();
+  const cropBuf = await sharp(buf).extract({ left: 73, top: 0, width: 80, height: 120 }).png().toBuffer();
+  const A = await dedup.cropHashesOf(buf, cfg);
+  const B = await dedup.cropHashesOf(cropBuf, cfg);
+  // 构造零均值、单位方差的投影，相关系数约 0.76（低于旧预筛 0.9，高于当前 0.7）
+  const norm = (arr) => {
+    const mean = arr.reduce((s, v) => s + v, 0) / arr.length;
+    const sd = Math.sqrt(arr.reduce((s, v) => s + (v - mean) ** 2, 0) / arr.length) || 1;
+    return arr.map((v) => (v - mean) / sd);
+  };
+  const p = norm(Array.from({ length: 32 }, (_, i) => Math.sin(i / 3)));
+  const q = norm(Array.from({ length: 32 }, (_, i) => Math.sin(i / 3) + 0.8 * Math.cos(i * 1.7)));
+  const a = { rel: 'wallpapers&illustration/heng/a.png', w: width, h: height, ...A, rowProf: p, colProf: p };
+  const b = { rel: 'wallpapers&illustration/shu/b.png', w: 80, h: 120, ...B, rowProf: q, colProf: q };
+
+  const pc = Math.max(dedup.profileCorr(p, q), dedup.profileCorr(p, q));
+  assert.ok(pc >= 0.7 && pc < 0.9, `构造的投影相关应落在 0.7~0.9，实际 ${pc}`);
+  const score = dedup.nccCropMatch(a, b, new Map(), cfg);
+  assert.ok(score !== null && score >= 0.9, `低投影真裁切应命中，实际 NCC=${score}`);
+});
+
+test('局部裁切：二维缩放+平移的裁切可从灰区命中', () => {
+  const cfg = makeCfg();
+  const FW = 72, FH = 41;
+  let seed = 12345;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  const full = new Uint8Array(FW * FH);
+  for (let y = 0; y < FH; y++) {
+    for (let x = 0; x < FW; x++) {
+      let v = 30 + 150 * (x / FW) + 40 * Math.sin(y / 3);
+      if (((x >> 3) + (y >> 2)) % 2 === 0) v += 30;
+      full[y * FW + x] = Math.max(0, Math.min(255, Math.round(v)));
+    }
+  }
+  for (let k = 0; k < 25; k++) {
+    const bx = Math.floor(rnd() * FW), by = Math.floor(rnd() * FH);
+    const bw = 3 + Math.floor(rnd() * 10), bh = 3 + Math.floor(rnd() * 8);
+    const val = Math.floor(rnd() * 255);
+    for (let y = by; y < Math.min(FH, by + bh); y++) {
+      for (let x = bx; x < Math.min(FW, bx + bw); x++) full[y * FW + x] = val;
+    }
+  }
+  const resize = (src, sw, sh, tw, th) => {
+    const out = new Uint8Array(tw * th);
+    for (let y = 0; y < th; y++) {
+      const sy = (y + 0.5) * sh / th - 0.5;
+      const y0 = Math.max(0, Math.min(sh - 1, Math.floor(sy)));
+      const y1 = Math.min(sh - 1, y0 + 1);
+      const fy = Math.max(0, Math.min(1, sy - y0));
+      for (let x = 0; x < tw; x++) {
+        const sx = (x + 0.5) * sw / tw - 0.5;
+        const x0 = Math.max(0, Math.min(sw - 1, Math.floor(sx)));
+        const x1 = Math.min(sw - 1, x0 + 1);
+        const fx = Math.max(0, Math.min(1, sx - x0));
+        const a = src[y0 * sw + x0], b = src[y0 * sw + x1];
+        const c = src[y1 * sw + x0], d = src[y1 * sw + x1];
+        out[y * tw + x] = Math.round(
+          a * (1 - fx) * (1 - fy) + b * fx * (1 - fy) +
+          c * (1 - fx) * fy + d * fx * fy
+        );
+      }
+    }
+    return out;
+  };
+  // 从完整图截取 24×34 的竖图，再放大到 48×72：同时存在缩放和横/纵偏移
+  const rw = 24, rh = 34, ox = 30, oy = 4;
+  const region = Buffer.alloc(rw * rh);
+  for (let y = 0; y < rh; y++) {
+    for (let x = 0; x < rw; x++) region[y * rw + x] = full[(y + oy) * FW + (x + ox)];
+  }
+  const crop = resize(region, rw, rh, 48, 72);
+  const profile = Array.from({ length: 32 }, (_, i) => i);
+  const mk = (rel, w, h, data, tw, th) => ({
+    rel, w, h, chash: '0'.repeat(16), crops: [], cropVersion: dedup.CROP_VERSION,
+    thumb: { w: tw, h: th, data: Buffer.from(data).toString('base64') },
+    rowProf: profile, colProf: profile
+  });
+  const a = mk('wallpapers&illustration/heng/a.png', 1920, 1080, full, FW, FH);
+  const b = mk('wallpapers&illustration/shu/b.png', 1242, 1863, crop, 48, 72);
+
+  const base = dedup.nccScore(a, b, new Map());
+  assert.ok(base >= 0.78 && base < 0.9, `固定尺度应落在二维复核区间，实际 NCC=${base}`);
+  const score = dedup.nccCropMatch(a, b, new Map(), cfg);
+  assert.ok(score !== null && score >= 0.9, `二维缩放+平移应命中，实际 NCC=${score}`);
+  const rel = dedup.cropRelationOf(a, b, 5, cfg);
+  assert.ok(rel);
+  assert.strictEqual(rel.cropRel, b.rel);
+  assert.strictEqual(rel.fullRel, a.rel);
+});
+
+test('同方向细节裁切：约 10% 面积的小裁切可命中', () => {
+  const cfg = makeCfg();
+  const FW = 96, FH = 54;
+  let seed = 12345;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  const full = new Uint8Array(FW * FH);
+  for (let y = 0; y < FH; y++) {
+    for (let x = 0; x < FW; x++) {
+      let v = 30 + 150 * (x / FW) + 40 * Math.sin(y / 3);
+      if (((x >> 3) + (y >> 2)) % 2 === 0) v += 30;
+      full[y * FW + x] = Math.max(0, Math.min(255, Math.round(v)));
+    }
+  }
+  for (let k = 0; k < 30; k++) {
+    const bx = Math.floor(rnd() * FW), by = Math.floor(rnd() * FH);
+    const bw = 3 + Math.floor(rnd() * 12), bh = 3 + Math.floor(rnd() * 9);
+    const val = Math.floor(rnd() * 255);
+    for (let y = by; y < Math.min(FH, by + bh); y++) {
+      for (let x = bx; x < Math.min(FW, bx + bw); x++) full[y * FW + x] = val;
+    }
+  }
+  const resize = (src, sw, sh, tw, th) => {
+    const out = new Uint8Array(tw * th);
+    for (let y = 0; y < th; y++) {
+      const sy = (y + 0.5) * sh / th - 0.5;
+      const y0 = Math.max(0, Math.min(sh - 1, Math.floor(sy)));
+      const y1 = Math.min(sh - 1, y0 + 1);
+      const fy = Math.max(0, Math.min(1, sy - y0));
+      for (let x = 0; x < tw; x++) {
+        const sx = (x + 0.5) * sw / tw - 0.5;
+        const x0 = Math.max(0, Math.min(sw - 1, Math.floor(sx)));
+        const x1 = Math.min(sw - 1, x0 + 1);
+        const fx = Math.max(0, Math.min(1, sx - x0));
+        const a = src[y0 * sw + x0], b = src[y0 * sw + x1];
+        const c = src[y1 * sw + x0], d = src[y1 * sw + x1];
+        out[y * tw + x] = Math.round(
+          a * (1 - fx) * (1 - fy) + b * fx * (1 - fy) +
+          c * (1 - fx) * fy + d * fx * fy
+        );
+      }
+    }
+    return out;
+  };
+  // 从完整图截取 30×17（约 10% 面积），放大到 96×53 作为竖缩略图
+  const rw = 30, rh = 17, ox = 55, oy = 10;
+  const region = Buffer.alloc(rw * rh);
+  for (let y = 0; y < rh; y++) {
+    for (let x = 0; x < rw; x++) region[y * rw + x] = full[(y + oy) * FW + (x + ox)];
+  }
+  const crop = resize(region, rw, rh, 96, 53);
+  const mean = 15.5;
+  const sd = Math.sqrt(Array.from({ length: 32 }, (_, i) => (i - mean) ** 2).reduce((s, v) => s + v, 0) / 32) || 1;
+  const profile = Array.from({ length: 32 }, (_, i) => (i - mean) / sd);
+  const mk = (rel, w, h, data, tw, th) => ({
+    rel, w, h, chash: '0'.repeat(16), crops: [], cropVersion: dedup.CROP_VERSION,
+    thumb: { w: tw, h: th, data: Buffer.from(data).toString('base64') },
+    rowProf: profile, colProf: profile
+  });
+  const a = mk('wallpapers&illustration/heng/a.png', 7700, 4332, full, FW, FH);
+  const b = mk('wallpapers&illustration/heng/b.png', 2475, 1360, crop, 96, 53);
+
+  const score = dedup.smallCropMatch(a, b, new Map(), cfg);
+  assert.ok(score !== null && score >= 0.9, `小裁切应命中，实际 NCC=${score}`);
+
+  // 无关纹理不命中
+  const other = new Uint8Array(FW * FH);
+  for (let i = 0; i < other.length; i++) other[i] = (i * 37) % 251;
+  const c = mk('wallpapers&illustration/heng/c.png', 2475, 1360, other, 96, 53);
+  assert.strictEqual(dedup.smallCropMatch(a, c, new Map(), cfg), null);
 });
 
 // ---------------- 12. 裁切方向：保留完整原图 ----------------
