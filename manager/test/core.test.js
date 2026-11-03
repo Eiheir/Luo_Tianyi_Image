@@ -244,6 +244,15 @@ test('回收站：整批恢复与彻底删除', async () => {
 
     // purge 非法批次 ID 必须拒绝
     assert.rejects(() => storage.purgeTrash(cfg, '../escape'));
+
+    // flats 不是数组时必须拒绝，且不能把批次当成"整批清空"误删
+    const b3 = await storage.moveToTrash(cfg, ['avatar/0002.jpg']);
+    await assert.rejects(() => storage.purgeTrash(cfg, b3.batchId, 'not-an-array'), /非法文件列表/);
+    assert.strictEqual(await fileExists(path.join(cfg._paths.trashDir, b3.batchId)), true, '畸形 flats 不应清空批次');
+    // 显式空数组 = 无操作，同样不能清空批次
+    const r0 = await storage.purgeTrash(cfg, b3.batchId, []);
+    assert.strictEqual(r0.removed, 0);
+    assert.strictEqual(await fileExists(path.join(cfg._paths.trashDir, b3.batchId)), true);
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
   }
@@ -363,6 +372,86 @@ test('buildLink：jsDelivr 镜像域名', () => {
 const dedup = require('../core/dedup');
 const organize = require('../core/organize');
 
+test('对账：扫描期间的增量上传保留、扫描期间的删除剔除', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'lti-reconcile-'));
+  const imageRoot = path.join(root, 'LTYpicture');
+  const cfg = { _paths: { imageRoot } };
+  try {
+    await fsp.mkdir(path.join(imageRoot, 'avatar'), { recursive: true });
+    await fsp.writeFile(path.join(imageRoot, 'avatar', '0001.jpg'), 'a');
+    // 0002 是扫描期间新上传的：内存索引有、快照没有，文件存在
+    await fsp.writeFile(path.join(imageRoot, 'avatar', '0002.jpg'), 'b');
+    // 0003 在快照里，但扫描期间被删除：内存索引没有、文件不存在
+    const scan = {
+      'avatar/0001.jpg': { mtime: 1, size: 1 },
+      'avatar/0003.jpg': { mtime: 3, size: 3 }
+    };
+    const live = {
+      'avatar/0001.jpg': { mtime: 1, size: 1 },
+      'avatar/0002.jpg': { mtime: 2, size: 1 }
+    };
+    const r = await dedup.reconcileScan(cfg, scan, live);
+    assert.ok(r.items['avatar/0001.jpg']);
+    assert.ok(r.items['avatar/0002.jpg'], '扫描期间新增的文件应保留');
+    assert.strictEqual(r.items['avatar/0003.jpg'], undefined, '扫描期间删除的文件应剔除');
+    assert.strictEqual(r.changed, true);
+
+    const same = await dedup.reconcileScan(cfg,
+      { 'avatar/0001.jpg': { mtime: 1, size: 1 } },
+      { 'avatar/0001.jpg': { mtime: 1, size: 1 } });
+    assert.strictEqual(same.changed, false, '两边一致时不应标记变更');
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('hammingDistance：十六进制查表与已知值一致', () => {
+  assert.strictEqual(dedup.hammingDistance('0000000000000000', '0000000000000000'), 0);
+  assert.strictEqual(dedup.hammingDistance('ffffffffffffffff', '0000000000000000'), 64);
+  assert.strictEqual(dedup.hammingDistance('0f0f0f0f0f0f0f0f', 'f0f0f0f0f0f0f0f0'), 64);
+  assert.strictEqual(dedup.hammingDistance('1234567890abcdef', '1234567890abcdee'), 1);
+  assert.strictEqual(dedup.hammingDistance('abcdef', 'abcde'), 64, '长度不一致按最不相似');
+});
+
+test('scanLibrary：并发扫描生成完整索引，二次扫描复用缓存', async () => {
+  const sharp = require('sharp');
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'lti-scan-'));
+  const imageRoot = path.join(root, 'LTYpicture');
+  const cfg = {
+    classify: { ...DEFAULTS.classify },
+    naming: { ...DEFAULTS.naming, allowedExt: ['png', 'jpg'] },
+    _paths: { imageRoot, indexFile: path.join(root, 'index.json') }
+  };
+  try {
+    const files = [
+      ['wallpapers&illustration/avatar/0001.png', 100, 100],
+      ['wallpapers&illustration/heng/0001.jpg', 200, 100],
+      ['emoticon/主题/001.png', 50, 50]
+    ];
+    for (const [rel, width, height] of files) {
+      const abs = path.join(imageRoot, rel);
+      await fsp.mkdir(path.dirname(abs), { recursive: true });
+      await sharp({ create: { width, height, channels: 3, background: { r: 20, g: 40, b: 60 } } })
+        .toFormat(rel.endsWith('.jpg') ? 'jpeg' : 'png')
+        .toFile(abs);
+    }
+    const first = await dedup.scanLibrary(cfg, { deep: false, concurrency: 3 });
+    assert.strictEqual(Object.keys(first.items).length, 3);
+    for (const [rel, it] of Object.entries(first.items)) {
+      assert.match(it.md5, /^[0-9a-f]{32}$/, `${rel} 应有 md5`);
+      assert.match(it.dhash, /^[0-9a-f]{16}$/, `${rel} 应有 dHash`);
+      assert.ok(it.w > 0 && it.h > 0, `${rel} 应有宽高`);
+    }
+    assert.strictEqual(await fileExists(cfg._paths.indexFile), true, '扫描后应落盘索引');
+
+    const second = await dedup.scanLibrary(cfg, { deep: false });
+    assert.strictEqual(second.changed, false, '文件未变时二次扫描不应重写索引');
+    assert.deepStrictEqual(Object.keys(second.items).sort(), Object.keys(first.items).sort());
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
 /** 构造带最小索引的整理测试环境 */
 async function makeOrgEnv() {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'lti-org-test-'));
@@ -418,6 +507,23 @@ test('organize：移动批次失败时全部回滚', async () => {
     assert.strictEqual(results.every((r) => !r.ok), true);
     assert.strictEqual((await fsp.readFile(good)).toString(), 'good', '文件应被回滚回原目录');
     assert.ok(index.items['avatar/0001.jpg'], '索引应回滚');
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('organize：拒绝把图库外的文件移动到图库内（路径穿越）', async () => {
+  const { root, cfg, index } = await makeOrgEnv();
+  try {
+    const outside = path.join(root, 'secret.txt');
+    await fsp.writeFile(outside, 'TOP-SECRET');
+    await assert.rejects(
+      () => organize.moveImages(cfg, index, ['../secret.txt'], { category: 'avatar' }),
+      /非法路径/
+    );
+    assert.strictEqual((await fsp.readFile(outside)).toString(), 'TOP-SECRET', '越界文件不应被移动');
+    assert.strictEqual(await fileExists(
+      path.join(cfg._paths.imageRoot, 'wallpapers&illustration', 'avatar', '0001.txt')), false);
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
   }

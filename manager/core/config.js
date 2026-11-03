@@ -112,14 +112,22 @@ function loadConfig() {
       // exe 首次运行：把内置配置模板释放到 exe 旁，方便用户直接修改。
       // 关键修正：模板中的 repoRoot 是源码态相对路径（'..'），exe 态必须
       // 改写为 '.'（exe 与图库根同级），否则图库会定位到错误目录。
+      // 优先使用 config.example.json（仓库不再跟踪 config.json，避免把 accessToken
+      // 打进 exe 或提交进仓库）；旧版快照仍回退 config.json。
       try {
-        fs.copyFileSync(path.join(ASSET_ROOT, 'config.json'), file);
+        const template = [path.join(ASSET_ROOT, 'config.example.json'), path.join(ASSET_ROOT, 'config.json')]
+          .find((p) => fs.existsSync(p));
+        if (!template) throw new Error('内置配置模板缺失');
+        fs.copyFileSync(template, file);
         const patch = JSON.parse(fs.readFileSync(file, 'utf8'));
         patch.repoRoot = '.';
         fs.writeFileSync(file, JSON.stringify(patch, null, 2), 'utf8');
         user = JSON.parse(fs.readFileSync(file, 'utf8'));
         console.log(`[配置] 已在 ${file} 生成默认配置，可按需修改`);
       } catch (e2) { /* 释放失败则使用内置默认值 */ }
+    } else if (e.code === 'ENOENT') {
+      // 源码模式未复制 config.json：使用默认值（仓库信息自动从 git remote 探测）
+      console.log('[配置] 未找到 config.json，使用默认配置（需要自定义时复制 config.example.json）');
     } else {
       // 配置损坏时退回默认值并记录告警，绝不因配置问题崩溃退出
       console.warn('[配置] config.json 读取失败，使用默认配置：', e.message);

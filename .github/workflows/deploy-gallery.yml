@@ -60,6 +60,25 @@ jobs:
           rm -rf blog-repo
           ls -la worker/
 
+      - name: Compute gallery tree hash
+        id: gallery
+        # 只对 git 树（路径 + blob SHA）做哈希，不读取 2.65GB 图片内容。
+        # 图库内容变化时 blob SHA 变化 → 换 key；图片没变时直接命中已有缓存。
+        run: echo "key=$(git ls-tree -r HEAD LTYpicture | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache generated thumbs and large previews
+        # 缩略图/高清图文件名带源内容哈希：图库没变的图片可以跨运行复用。
+        # 主 key = 图库 git 树哈希；restore-keys 前缀找回上一版缓存（图库小改时
+        # 复用绝大部分旧变体），本次只重新生成新增/变化的图片。
+        uses: actions/cache@v4
+        with:
+          path: |
+            worker/assets/thumbs
+            worker/assets/large
+          key: gallery-variants-${{ steps.gallery.outputs.key }}
+          restore-keys: |
+            gallery-variants-
+
       - name: Generate thumbs, large previews and manifest
         # 原图平铺进 Worker assets，再用 build-manifest.mjs 生成：
         #   thumbs/**  640 宽 WebP（网格卡片）

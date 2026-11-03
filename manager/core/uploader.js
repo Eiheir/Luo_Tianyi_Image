@@ -59,12 +59,7 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
     result.converted = processed.converted;
     if (processed.notice) result.notice = processed.notice;
 
-    // ---------- 3. 指纹计算（基于最终字节：MD5 精确 + dHash 感知） ----------
-    const md5 = dedup.md5Of(processed.buffer);
-    let dhash = '';
-    try { dhash = await dedup.dhashOf(processed.buffer); } catch (e) { dhash = ''; /* 指纹失败不阻断上传 */ }
-
-    // ---------- 4. 分类决策（提前，便于判断是否需要局部裁切指纹） ----------
+    // ---------- 3. 分类决策（提前，便于判断是否需要局部裁切指纹） ----------
     let category = opts.category;
     if (!category || category === 'auto') {
       // 自动分类：动图与静图统一按宽高比判定（长边/短边≤1.2 → avatar）
@@ -75,11 +70,15 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
     // 目标目录提前算出：查重需要用它限定表情包的同主题作用域
     const relDir = classify.categoryDir(category, opts.theme, cfg);
 
-    // 壁纸类补充局部裁切指纹：上传时即可识别"竖图是横图的局部截取"
-    let cropData = null;
-    if (['heng', 'shu', 'avatar'].includes(category)) {
-      try { cropData = await dedup.cropHashesOf(processed.buffer, cfg); } catch (e) { cropData = null; }
-    }
+    // ---------- 4. 指纹计算（基于最终字节：MD5 精确 + dHash 感知 + 裁切指纹） ----------
+    // dHash 与裁切指纹各自需要解码一次原图；两者互不依赖，并行执行可缩短单张
+    // 上传的墙钟时间（服务端仍按批次串行，编号分配不受影响）。
+    const md5 = dedup.md5Of(processed.buffer);
+    const isWallpaper = ['heng', 'shu', 'avatar'].includes(category);
+    const [dhash, cropData] = await Promise.all([
+      dedup.dhashOf(processed.buffer).catch(() => ''), // 指纹失败不阻断上传
+      isWallpaper ? dedup.cropHashesOf(processed.buffer, cfg).catch(() => null) : Promise.resolve(null)
+    ]);
 
     // ---------- 5. 查重比对 ----------
     // 说明：手动忽略对是"库内两图"之间的记录，新上传文件不可能已有忽略记录，
@@ -109,7 +108,8 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
         result.rel = dup.exact[0];
         result.assignedName = path.basename(result.rel);
         result.category = storage.categoryOf(result.rel, cfg);
-        result.url = buildLink(cfg, result.rel, opts.linkType || cfg.linkFormat);
+        // 链接配置缺失（owner/name 未探测到）不应把"库内已有"误标成失败
+        try { result.url = buildLink(cfg, result.rel, opts.linkType || cfg.linkFormat); } catch (e) { result.url = ''; }
         const existing = index.items[result.rel];
         result.mtime = existing ? existing.mtime : 0;
         result.error = `与库内 ${result.assignedName} 完全相同，已按策略跳过`;
@@ -150,7 +150,8 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
     result.assignedName = allocated.fileName;
     result.size = st.size;
     result.mtime = st.mtimeMs;
-    result.url = buildLink(cfg, rel, opts.linkType || cfg.linkFormat);
+    // 文件已落盘并写入索引，链接生成失败只留空 URL，不能把成功标成失败
+    try { result.url = buildLink(cfg, rel, opts.linkType || cfg.linkFormat); } catch (e) { result.url = ''; }
     result.status = 'ok';
     dedup.setIndexItem(index, rel, {
       mtime: st.mtimeMs, size: st.size, w: processed.width, h: processed.height, md5, dhash,

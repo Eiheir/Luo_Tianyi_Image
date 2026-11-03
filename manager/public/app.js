@@ -27,11 +27,23 @@ function saveToken(t) { try { localStorage.setItem(TOKEN_KEY, t); } catch (e) { 
 /**
  * 弹出令牌输入框。用户输入并保存 → resolve(token)；关闭弹窗 → reject。
  * 弹窗无关闭按钮（必须给出令牌才能继续操作），Esc 关闭等同于放弃。
+ *
+ * 并发复用：刷新图片库时 /api/images 与 /api/stats 并行发出，启用令牌后两个请求
+ * 会同时 401。旧实现每次调用都新建 Promise，但弹窗只会打开一次、保存按钮的
+ * onclick 被后一次覆盖，第一个 Promise 永远不 resolve → Promise.all 卡死。
+ * 这里让所有并发调用共享同一个在途 Promise。
  */
+let tokenPromise = null;
 function askToken() {
-  return new Promise((resolve, reject) => {
+  if (tokenPromise) return tokenPromise;
+  tokenPromise = new Promise((resolve, reject) => {
     let done = false;
-    const finish = (fn, v) => { if (done) return; done = true; fn(v); };
+    const finish = (fn, v) => {
+      if (done) return;
+      done = true;
+      tokenPromise = null; // 完成后允许下一次 401 重新弹窗
+      fn(v);
+    };
     $('tokenInput').value = getToken();
     $('tokenMsg').hidden = true;
     onModalClose('tokenPanel', () => finish(reject, new Error('需要访问令牌才能继续使用')));
@@ -52,8 +64,12 @@ function askToken() {
 }
 
 /** 统一请求封装：后端约定 {ok:true,data} / {ok:false,error}；非成功时抛中文错误。
- *  自动携带访问令牌；401 时弹出让用户输入一次后重试。 */
+ *  自动携带访问令牌；401 时弹出让用户输入一次后重试。
+ *  默认 5 分钟超时：服务端长时间无响应（查重/同步卡住）时不会让界面无限等待；
+ *  可用 options.timeoutMs 覆盖（0 = 不超时）。 */
+const API_TIMEOUT_MS = 5 * 60 * 1000;
 async function api(url, options = {}) {
+  const timeoutMs = options.timeoutMs != null ? Number(options.timeoutMs) : API_TIMEOUT_MS;
   const authed = (opts) => {
     const t = getToken();
     if (!t) return opts;
@@ -61,10 +77,29 @@ async function api(url, options = {}) {
     headers.set('Authorization', `Bearer ${t}`);
     return { ...opts, headers };
   };
-  let res = await fetch(url, authed(options));
+  const request = (opts) => {
+    // 自定义字段不传给 fetch（fetch 会忽略，但保持请求对象干净）
+    const { timeoutMs: _timeout, _retried, ...fetchOpts } = opts;
+    if (timeoutMs > 0 && !fetchOpts.signal && typeof AbortSignal.timeout === 'function') {
+      fetchOpts.signal = AbortSignal.timeout(timeoutMs);
+    }
+    return fetch(url, authed(fetchOpts));
+  };
+  let res;
+  try {
+    res = await request(options);
+  } catch (e) {
+    if (e.name === 'TimeoutError' || e.name === 'AbortError') throw new Error('请求超时，请稍后重试');
+    throw e;
+  }
   if (res.status === 401 && !options._retried) {
     await askToken(); // 用户放弃时抛错，调用方按普通错误提示
-    res = await fetch(url, authed({ ...options, _retried: true }));
+    try {
+      res = await request({ ...options, _retried: true });
+    } catch (e) {
+      if (e.name === 'TimeoutError' || e.name === 'AbortError') throw new Error('请求超时，请稍后重试');
+      throw e;
+    }
   }
   if (res.status === 401) {
     try { localStorage.removeItem(TOKEN_KEY); } catch (e) { /* 忽略 */ }
@@ -1992,7 +2027,8 @@ $('btnDupScan').addEventListener('click', async () => {
     const r = await api('/api/duplicates/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ deep: true })
+      body: JSON.stringify({ deep: true }),
+      timeoutMs: 10 * 60 * 1000 // 首次建裁切指纹可能较久，放宽到 10 分钟
     });
     $('dupMeta').textContent =
       `已扫描 ${r.scanned} 张 · 完全重复组 ${r.exactGroups.length} · 相似组 ${r.similarGroups.length}` +

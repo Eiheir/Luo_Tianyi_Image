@@ -1,5 +1,5 @@
 {
-  "_说明": "以下为本模块独立配置文件，仅被 manager 模块读取，与原有图床零耦合",
+  "_说明": "配置模板：复制为 config.json 后按需修改。config.json 已被 gitignore，避免把 accessToken 等本地配置提交进仓库；源码运行不复制也能启动（使用默认值并自动探测 git remote）。",
   "port": 3210,
   "host": "127.0.0.1",
   "repoRoot": "..",

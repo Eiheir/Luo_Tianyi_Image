@@ -23,6 +23,8 @@
 ```
 
 > 配置文件位于 `manager/config.json`（exe 运行时生成在 exe 旁），根目录不放配置。
+> `config.json` 已加入 `.gitignore`（可能含 accessToken），仓库提供模板 `manager/config.example.json`；
+> 首次源码运行可复制一份并按需修改，不复制也能用默认值启动（仓库信息自动从 git remote 探测）。
 
 ## 快速开始（使用管理工具）
 

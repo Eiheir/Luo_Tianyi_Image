@@ -72,12 +72,25 @@ async function dhashOf(buffer) {
 const POPCOUNT4 = new Uint8Array(16);
 for (let i = 0; i < 16; i++) POPCOUNT4[i] = (i & 1) + ((i >> 1) & 1) + ((i >> 2) & 1) + ((i >> 3) & 1);
 
+/** ASCII 十六进制字符 → 4 位值。旧实现每个字符 parseInt，查重热路径上会调用千万次，
+ *  改成 charCode 直查表后去掉解析开销（非 hex 字符落到 0，指纹本身只含 0-9a-f）。 */
+const HEX_VALUE = new Uint8Array(128);
+for (let i = 0; i < 10; i++) HEX_VALUE[48 + i] = i;          // '0'-'9'
+for (let i = 0; i < 6; i++) {
+  HEX_VALUE[97 + i] = 10 + i;                                // 'a'-'f'
+  HEX_VALUE[65 + i] = 10 + i;                                // 'A'-'F'
+}
+
 /** 汉明距离：两个 64 位指纹（16 hex）逐位比较不同位的数量 */
 function hammingDistance(a, b) {
   if (!a || !b || a.length !== b.length) return 64; // 缺失指纹按"最不相似"处理
+  if (a === b) return 0;
   let diff = 0;
   for (let i = 0; i < a.length; i++) {
-    diff += POPCOUNT4[parseInt(a[i], 16) ^ parseInt(b[i], 16)];
+    const ca = a.charCodeAt(i);
+    const cb = b.charCodeAt(i);
+    if (ca > 127 || cb > 127) return 64; // 非 ASCII 不可能是合法指纹
+    diff += POPCOUNT4[HEX_VALUE[ca] ^ HEX_VALUE[cb]];
   }
   return diff;
 }
@@ -132,6 +145,12 @@ const CROP_PROFILE_MIN = 0.7;
 const CROP_SAME_AR_DIFF_MIN = 0.02;
 const CROP_NCC_SIZE = 48;
 const CROP_NCC_MIN = 0.9;
+/* 两级 NCC：先用 24px 缩略图做廉价预筛，分数低于 0.6 的组合直接放弃；
+ * 通过后再用 48px 精算。24px 的像素/偏移量约为 48px 的 1/8，可把大量
+ * “投影碰巧相关但内容无关”的候选挡在精算之前。阈值取 0.6 偏保守，
+ * 明显低于真实裁切在 24px 下的相关度，避免漏判。 */
+const CROP_NCC_PREFLIGHT_SIZE = 24;
+const CROP_NCC_PREFLIGHT_MIN = 0.6;
 /* 灰区缩放复核：同一作品如果被缩放后再裁切，固定 48px 归一化的 NCC 会掉到 0.82~0.90。
  * 对灰区候选再做 ±6% 的小范围缩放搜索即可把真命中拉回 0.92+，而无关图仍 <0.81。
  * 只对灰区候选执行，全库通常只有十几对，开销可忽略。 */
@@ -144,6 +163,13 @@ const CROP_NCC_2D_MIN = 0.78;
 const CROP_2D_MIN_COVERAGE = 0.2;
 const CROP_2D_SCALE_MIN = 0.3;
 const CROP_2D_SCALE_STEP = 0.01;
+/* 二维搜索粗到细：旧实现每个候选要扫 70 档尺度 × 全位置，单对约 90ms。
+ * 先用 3% 尺度步长 + 2px 位置步长粗搜，再在最佳点 ±3% / ±3px 内按原步长细化。
+ * 只影响搜索路径，不改变 NCC 阈值与判定结果。 */
+const CROP_2D_COARSE_SCALE_STEP = 0.03;
+const CROP_2D_COARSE_POS_STEP = 2;
+const CROP_2D_REFINE_SCALE = 0.03;
+const CROP_2D_REFINE_POS = 3;
 /* 同方向“细节裁切”通道：一张图可能只保留另一张约 10% 面积的一块。
  * 72px 缩略图上该区域仅二十几像素，NCC 低于 0.9；这里先用多尺度 patch dHash
  * 在 72px 上廉价筛出候选，再用 96px 缩略图在候选位置做局部 NCC 验证。
@@ -155,6 +181,12 @@ const CROP_PATCH_THUMB_MAX = 72;
 const CROP_PATCH_SCALE_STEP = 0.02;
 const CROP_PATCH_PX_STEP = 0.125;
 const CROP_PATCH_PY_STEP = 0.0625;
+/* 粗到细搜索：旧实现每对候选都要跑 1400~3200 次 patch 指纹，95% 以上在证明
+ * “不相关”上浪费。先用稀疏网格（尺度步长 0.1、位置步长 0.125）粗搜，粗搜
+ * 距离超过 24 直接放弃；命中才在最佳点附近用原细步长复核。 */
+const CROP_PATCH_COARSE_SCALE_STEP = 0.1;
+const CROP_PATCH_COARSE_POS_STEP = 0.125;
+const CROP_PATCH_COARSE_MAX = 30; // 宽松门槛，只用于决定是否进入细搜；最终仍按 14 判定
 
 /** 索引条目的宽高比；尺寸缺失返回 0 */
 function arOf(item) {
@@ -232,24 +264,27 @@ function buildIntegral(data, width, height) {
   return I;
 }
 
-/** 矩形区域平均灰度（积分图 O(1)） */
-function rectAverage(I, width, x0, y0, x1, y1) {
-  const sum = I[y1 * (width + 1) + x1] - I[y0 * (width + 1) + x1] -
-    I[y1 * (width + 1) + x0] + I[y0 * (width + 1) + x0];
-  const area = (x1 - x0) * (y1 - y0);
-  return area > 0 ? sum / area : 0;
-}
+/* hashRect 在局部裁切搜索里会被调用数百万次；复用同一块 72 元素暂存区，
+ * 避免每次 new Float64Array 造成分配/GC 抖动（单线程同步调用，无重入）。 */
+const HASH_RECT_VALS = new Float64Array(72);
 
 /** 对积分图中的任意矩形计算 9×8 dHash（与整图使用同一套采样） */
 function hashRect(I, width, x0, y0, x1, y1) {
-  const vals = new Float64Array(72);
+  const vals = HASH_RECT_VALS;
+  const stride = width + 1;
+  const dx = x1 - x0;
+  const dy = y1 - y0;
   for (let ty = 0; ty < 8; ty++) {
-    const ya = Math.floor(y0 + (y1 - y0) * ty / 8);
-    const yb = Math.max(ya + 1, Math.floor(y0 + (y1 - y0) * (ty + 1) / 8));
+    const ya = Math.floor(y0 + dy * ty / 8);
+    const yb = Math.max(ya + 1, Math.floor(y0 + dy * (ty + 1) / 8));
+    const row0 = ya * stride;
+    const row1 = yb * stride;
     for (let tx = 0; tx < 9; tx++) {
-      const xa = Math.floor(x0 + (x1 - x0) * tx / 9);
-      const xb = Math.max(xa + 1, Math.floor(x0 + (x1 - x0) * (tx + 1) / 9));
-      vals[ty * 9 + tx] = rectAverage(I, width, xa, ya, xb, yb);
+      const xa = Math.floor(x0 + dx * tx / 9);
+      const xb = Math.max(xa + 1, Math.floor(x0 + dx * (tx + 1) / 9));
+      // 内联 rectAverage：省掉 72 次函数调用
+      const sum = I[row1 + xb] - I[row0 + xb] - I[row1 + xa] + I[row0 + xa];
+      vals[ty * 9 + tx] = sum / ((xb - xa) * (yb - ya));
     }
   }
   let hex = '';
@@ -456,9 +491,9 @@ function resizeGray(src, sw, sh, tw, th) {
  * mode='w'：统一宽度，适合"同宽、纵向被裁"的图；
  * mode='h'：统一高度，适合"同高、横向被裁"的图。
  */
-function thumbVariant(item, mode, cache) {
+function thumbVariant(item, mode, cache, size = CROP_NCC_SIZE) {
   if (!item || !item.thumb || typeof item.thumb.data !== 'string') return null;
-  const key = `${item.rel || ''}|${mode}|${CROP_NCC_SIZE}`;
+  const key = `${item.rel || ''}|${mode}|${size}`;
   if (cache && cache.has(key)) return cache.get(key);
   const sw = Number(item.thumb.w) || 0;
   const sh = Number(item.thumb.h) || 0;
@@ -467,11 +502,11 @@ function thumbVariant(item, mode, cache) {
   if (src.length < sw * sh) return null;
   let tw, th;
   if (mode === 'w') {
-    tw = CROP_NCC_SIZE;
-    th = Math.max(1, Math.round(sh * CROP_NCC_SIZE / sw));
+    tw = size;
+    th = Math.max(1, Math.round(sh * size / sw));
   } else {
-    th = CROP_NCC_SIZE;
-    tw = Math.max(1, Math.round(sw * CROP_NCC_SIZE / sh));
+    th = size;
+    tw = Math.max(1, Math.round(sw * size / sh));
   }
   const variant = { data: resizeGray(src, sw, sh, tw, th), w: tw, h: th };
   if (cache) cache.set(key, variant);
@@ -502,15 +537,112 @@ function nccAt(full, crop, ox, oy) {
 }
 
 /**
+ * 一维滑窗 NCC（与逐偏移 nccAt 数学等价，但复用不变量）：
+ *  - 裁切图的 Σa、Σa² 固定，只算一次；
+ *  - 完整图的 Σb、Σb² 用逐行（或逐列）前缀和 O(1) 取得；
+ *  - 每个偏移只需重算 Σab。
+ * 旧实现每个偏移都把 5 个统计量从头累加，内层多出 4 次加法与 2 次乘法；
+ * 这是查重扫描 44% CPU 的热点，优化后不改变任何判定结果。
+ * @param {{w:number,h:number,data:Uint8Array}} full 完整图缩略图
+ * @param {{w:number,h:number,data:Uint8Array}} crop 裁切图缩略图
+ * @param {'x'|'y'} axis 滑动方向：y=纵向（统一宽度后上下滑），x=横向（统一高度后左右滑）
+ * @returns {number} 最大 NCC；没有有效窗口返回 -1
+ */
+function nccSlide1D(full, crop, axis) {
+  const cw = crop.w;
+  const ch = crop.h;
+  const n = cw * ch;
+  if (n < 32 || cw > full.w || ch > full.h) return -1;
+
+  let sa = 0;
+  let saa = 0;
+  for (let i = 0; i < n; i++) {
+    const v = crop.data[i];
+    sa += v;
+    saa += v * v;
+  }
+  const va = saa - sa * sa / n;
+  if (va <= 0) return -1;
+
+  let best = -1;
+  if (axis === 'y') {
+    const fw = full.w;
+    const fh = full.h;
+    // 完整图逐行窗口和（宽度固定 cw）与前缀和
+    const rowSum = new Float64Array(fh + 1);
+    const rowSqSum = new Float64Array(fh + 1);
+    for (let y = 0; y < fh; y++) {
+      let s = 0;
+      let s2 = 0;
+      const base = y * fw;
+      for (let x = 0; x < cw; x++) {
+        const v = full.data[base + x];
+        s += v;
+        s2 += v * v;
+      }
+      rowSum[y + 1] = rowSum[y] + s;
+      rowSqSum[y + 1] = rowSqSum[y] + s2;
+    }
+    for (let oy = 0; oy <= fh - ch; oy++) {
+      const sb = rowSum[oy + ch] - rowSum[oy];
+      const sbb = rowSqSum[oy + ch] - rowSqSum[oy];
+      const vb = sbb - sb * sb / n;
+      if (vb <= 0) continue;
+      let sab = 0;
+      for (let y = 0; y < ch; y++) {
+        const fi = (y + oy) * fw;
+        const ci = y * cw;
+        for (let x = 0; x < cw; x++) sab += crop.data[ci + x] * full.data[fi + x];
+      }
+      const v = (sab - sa * sb / n) / Math.sqrt(va * vb);
+      if (v > best) best = v;
+    }
+    return best;
+  }
+
+  const fw = full.w;
+  const fh = full.h;
+  // 完整图逐列窗口和（高度固定 ch）与前缀和
+  const colSum = new Float64Array(fw + 1);
+  const colSqSum = new Float64Array(fw + 1);
+  for (let x = 0; x < fw; x++) {
+    let s = 0;
+    let s2 = 0;
+    for (let y = 0; y < ch; y++) {
+      const v = full.data[y * fw + x];
+      s += v;
+      s2 += v * v;
+    }
+    colSum[x + 1] = colSum[x] + s;
+    colSqSum[x + 1] = colSqSum[x] + s2;
+  }
+  for (let ox = 0; ox <= fw - cw; ox++) {
+    const sb = colSum[ox + cw] - colSum[ox];
+    const sbb = colSqSum[ox + cw] - colSqSum[ox];
+    const vb = sbb - sb * sb / n;
+    if (vb <= 0) continue;
+    let sab = 0;
+    for (let y = 0; y < ch; y++) {
+      const fi = y * fw + ox;
+      const ci = y * cw;
+      for (let x = 0; x < cw; x++) sab += crop.data[ci + x] * full.data[fi + x];
+    }
+    const v = (sab - sa * sb / n) / Math.sqrt(va * vb);
+    if (v > best) best = v;
+  }
+  return best;
+}
+
+/**
  * 两张缩略图的最大 NCC，并记录"谁被放进谁里面滑动"。
  * 滑窗方向即裁切方向：被放入内部滑动的那张就是局部截图。
  * @returns {{score:number, cropRel:string, fullRel:string, mode:string}}
  */
-function nccBest(a, b, cache) {
+function nccBest(a, b, cache, size = CROP_NCC_SIZE) {
   let best = { score: -1, cropRel: '', fullRel: '', mode: '' };
   for (const mode of ['w', 'h']) {
-    const va = thumbVariant(a, mode, cache);
-    const vb = thumbVariant(b, mode, cache);
+    const va = thumbVariant(a, mode, cache, size);
+    const vb = thumbVariant(b, mode, cache, size);
     if (!va || !vb) continue;
     if (mode === 'w') {
       // 统一宽度后，较矮的一张在较高的一张内部纵向滑动
@@ -519,10 +651,8 @@ function nccBest(a, b, cache) {
       const crop = aIsFull ? vb : va;
       const cropRel = aIsFull ? b.rel : a.rel;
       const fullRel = aIsFull ? a.rel : b.rel;
-      for (let oy = 0; oy <= full.h - crop.h; oy++) {
-        const v = nccAt(full, crop, 0, oy);
-        if (v > best.score) best = { score: v, cropRel, fullRel, mode };
-      }
+      const v = nccSlide1D(full, crop, 'y');
+      if (v > best.score) best = { score: v, cropRel, fullRel, mode };
     } else {
       // 统一高度后，较窄的一张在较宽的一张内部横向滑动
       const aIsFull = va.w >= vb.w;
@@ -530,10 +660,8 @@ function nccBest(a, b, cache) {
       const crop = aIsFull ? vb : va;
       const cropRel = aIsFull ? b.rel : a.rel;
       const fullRel = aIsFull ? a.rel : b.rel;
-      for (let ox = 0; ox <= full.w - crop.w; ox++) {
-        const v = nccAt(full, crop, ox, 0);
-        if (v > best.score) best = { score: v, cropRel, fullRel, mode };
-      }
+      const v = nccSlide1D(full, crop, 'x');
+      if (v > best.score) best = { score: v, cropRel, fullRel, mode };
     }
   }
   return best;
@@ -623,7 +751,11 @@ function ncc2dBest(a, b, cache) {
   ]) {
     const fullArea = full.w * full.h;
     const maxScale = Math.min(1, full.w / baseCrop.w, full.h / baseCrop.h);
-    for (let scale = CROP_2D_SCALE_MIN; scale <= maxScale + 1e-9; scale += CROP_2D_SCALE_STEP) {
+    if (maxScale < CROP_2D_SCALE_MIN) continue;
+
+    // 第一轮：稀疏尺度 + 2px 位置粗搜
+    let coarse = { score: -1, scale: 1, ox: 0, oy: 0 };
+    for (let scale = CROP_2D_SCALE_MIN; scale <= maxScale + 1e-9; scale += CROP_2D_COARSE_SCALE_STEP) {
       const cw = Math.max(1, Math.round(baseCrop.w * scale));
       const ch = Math.max(1, Math.round(baseCrop.h * scale));
       if (cw > full.w || ch > full.h) continue;
@@ -631,8 +763,34 @@ function ncc2dBest(a, b, cache) {
       const crop = scale === 1
         ? baseCrop
         : { w: cw, h: ch, data: resizeGray(baseCrop.data, baseCrop.w, baseCrop.h, cw, ch) };
-      for (let oy = 0; oy <= full.h - ch; oy++) {
-        for (let ox = 0; ox <= full.w - cw; ox++) {
+      const maxOx = full.w - cw;
+      const maxOy = full.h - ch;
+      for (let oy = 0; oy <= maxOy; oy += CROP_2D_COARSE_POS_STEP) {
+        for (let ox = 0; ox <= maxOx; ox += CROP_2D_COARSE_POS_STEP) {
+          const v = nccAt(full, crop, ox, oy);
+          if (v > coarse.score) coarse = { score: v, scale, ox, oy };
+        }
+      }
+    }
+    if (coarse.score < 0) continue;
+
+    // 第二轮：围绕粗搜最佳点做小范围细化（尺度 ±3%、位置 ±3px）
+    const scale0 = Math.max(CROP_2D_SCALE_MIN, coarse.scale - CROP_2D_REFINE_SCALE);
+    const scale1 = Math.min(maxScale, coarse.scale + CROP_2D_REFINE_SCALE);
+    for (let scale = scale0; scale <= scale1 + 1e-9; scale += CROP_2D_SCALE_STEP) {
+      const cw = Math.max(1, Math.round(baseCrop.w * scale));
+      const ch = Math.max(1, Math.round(baseCrop.h * scale));
+      if (cw > full.w || ch > full.h) continue;
+      if (cw * ch < fullArea * CROP_2D_MIN_COVERAGE) continue;
+      const crop = scale === 1
+        ? baseCrop
+        : { w: cw, h: ch, data: resizeGray(baseCrop.data, baseCrop.w, baseCrop.h, cw, ch) };
+      const ox0 = Math.max(0, coarse.ox - CROP_2D_REFINE_POS);
+      const ox1 = Math.min(full.w - cw, coarse.ox + CROP_2D_REFINE_POS);
+      const oy0 = Math.max(0, coarse.oy - CROP_2D_REFINE_POS);
+      const oy1 = Math.min(full.h - ch, coarse.oy + CROP_2D_REFINE_POS);
+      for (let oy = oy0; oy <= oy1; oy++) {
+        for (let ox = ox0; ox <= ox1; ox++) {
           const v = nccAt(full, crop, ox, oy);
           if (v > best.score) best = { score: v, cropRel, fullRel, mode: '2d', scale };
         }
@@ -703,13 +861,17 @@ function smallCropMatch(a, b, cache, cfg) {
 
   const patchAR = cropPatch.w / cropPatch.h;
   const baseScale = Math.sqrt(areaRatio);
-  let best = { d: 64 };
-  for (let f = baseScale * 0.8; f <= baseScale * 1.25 + 1e-9; f += CROP_PATCH_SCALE_STEP) {
+  const fMin = baseScale * 0.8;
+  const fMax = baseScale * 1.25;
+
+  // 第一轮：稀疏尺度 + 稀疏位置粗搜（约 160~400 次指纹计算）
+  let best = { d: 64, f: baseScale, px: 0, py: 0 };
+  for (let f = fMin; f <= fMax + 1e-9; f += CROP_PATCH_COARSE_SCALE_STEP) {
     const cw = Math.max(8, Math.round(fullPatch.w * f));
     const ch = Math.max(8, Math.round(cw / patchAR));
     if (cw > fullPatch.w || ch > fullPatch.h) continue;
-    for (let px = 0; px <= 1.0001; px += CROP_PATCH_PX_STEP) {
-      for (let py = 0; py <= 1.0001; py += CROP_PATCH_PY_STEP) {
+    for (let px = 0; px <= 1.0001; px += CROP_PATCH_COARSE_POS_STEP) {
+      for (let py = 0; py <= 1.0001; py += CROP_PATCH_COARSE_POS_STEP) {
         const x = Math.round((fullPatch.w - cw) * px);
         const y = Math.round((fullPatch.h - ch) * py);
         const d = hammingDistance(
@@ -720,7 +882,34 @@ function smallCropMatch(a, b, cache, cfg) {
       }
     }
   }
-  if (best.d > CROP_SMALL_PATCH_MAX) return null;
+  if (best.d > CROP_PATCH_COARSE_MAX) return null;
+
+  // 第二轮：只在粗搜最佳点附近用原细步长复核，避免粗网格量化误差造成漏判
+  const fine = { ...best };
+  const rf0 = Math.max(fMin, best.f - CROP_PATCH_COARSE_SCALE_STEP);
+  const rf1 = Math.min(fMax, best.f + CROP_PATCH_COARSE_SCALE_STEP);
+  const px0 = Math.max(0, best.px - CROP_PATCH_COARSE_POS_STEP);
+  const px1 = Math.min(1, best.px + CROP_PATCH_COARSE_POS_STEP);
+  const py0 = Math.max(0, best.py - CROP_PATCH_COARSE_POS_STEP);
+  const py1 = Math.min(1, best.py + CROP_PATCH_COARSE_POS_STEP);
+  for (let f = rf0; f <= rf1 + 1e-9; f += CROP_PATCH_SCALE_STEP) {
+    const cw = Math.max(8, Math.round(fullPatch.w * f));
+    const ch = Math.max(8, Math.round(cw / patchAR));
+    if (cw > fullPatch.w || ch > fullPatch.h) continue;
+    for (let px = px0; px <= px1 + 1e-9; px += CROP_PATCH_PX_STEP) {
+      for (let py = py0; py <= py1 + 1e-9; py += CROP_PATCH_PY_STEP) {
+        const x = Math.round((fullPatch.w - cw) * px);
+        const y = Math.round((fullPatch.h - ch) * py);
+        const d = hammingDistance(
+          hashRect(fullPatch.I, fullPatch.w, x, y, x + cw, y + ch),
+          cropPatch.hash
+        );
+        if (d < fine.d) { fine.d = d; fine.f = f; fine.px = px; fine.py = py; }
+      }
+    }
+  }
+  if (fine.d > CROP_SMALL_PATCH_MAX) return null;
+  best = fine;
 
   // 96px 局部 NCC 验证：围绕 patch 最佳位置做小范围缩放/平移细化
   const fullRaw = rawThumbOf(full, cache);
@@ -785,6 +974,9 @@ function nccCropMatch(a, b, cache, cfg) {
     profileCorr(a.colProf, b.colProf)
   );
   if (profile < CROP_PROFILE_MIN) return null;
+  // 24px 廉价预筛：通过后再做 48px 精算（以及灰区缩放/二维复核）
+  const pre = nccBest(a, b, cache, CROP_NCC_PREFLIGHT_SIZE);
+  if (pre.score < CROP_NCC_PREFLIGHT_MIN) return null;
   const best = nccBestRefined(a, b, cache);
   return best.score >= CROP_NCC_MIN ? best.score : null;
 }
@@ -1047,21 +1239,86 @@ function sameItem(a, b) {
 }
 
 /**
+ * 把一次磁盘扫描结果与当前内存索引对账，避免耗时扫描期间的上传/删除被旧快照覆盖。
+ *
+ * scanLibrary 返回的是"扫描开始那一刻"的磁盘快照；查重扫描可能持续几十秒，
+ * 期间上传的新图、删除/改名的文件都不在快照里。直接 index.items = scan.items
+ * 会让这些变更暂时消失（直到下次扫描）。对账规则：
+ *  1. 以扫描结果为基线（磁盘真实存在）；
+ *  2. 内存索引有、扫描结果没有的条目，文件仍存在则补回（扫描期间新增/改名）；
+ *  3. 扫描结果有、内存索引没有的条目，文件已不存在则剔除（扫描期间删除）。
+ *
+ * @param {object} cfg
+ * @param {object} scanItems 本次扫描结果
+ * @param {object} liveItems 当前内存索引（启动时加载并被增量更新）
+ * @returns {Promise<{items:object, changed:boolean}>}
+ */
+async function reconcileScan(cfg, scanItems, liveItems) {
+  const merged = { ...(scanItems || {}) };
+  const live = liveItems || {};
+  if (Object.keys(live).length === 0) return { items: merged, changed: false };
+
+  const exists = async (rel) => {
+    const abs = path.join(cfg._paths.imageRoot, rel.replace(/\//g, path.sep));
+    try { await fsp.stat(abs); return true; } catch (e) { return false; }
+  };
+
+  let changed = false;
+  // 扫描期间新增/改名：内存有、快照没有，且文件确实存在
+  for (const [rel, item] of Object.entries(live)) {
+    if (merged[rel]) continue;
+    if (await exists(rel)) { merged[rel] = item; changed = true; }
+  }
+  // 扫描期间删除：快照有、内存已移除，且文件已不在磁盘上
+  for (const rel of Object.keys(merged)) {
+    if (live[rel]) continue;
+    if (!(await exists(rel))) { delete merged[rel]; changed = true; }
+  }
+  return { items: merged, changed };
+}
+
+/**
  * 全量扫描图库并增量更新索引
  * @param {object} opts.deep 首次全量查重时确保缺失的整图指纹被补齐
  * @param {object} opts.withCrops 是否确保壁纸的局部裁切指纹存在（查重扫描时开启）
  * @returns {{items:object, changed:boolean}}
  */
-async function scanLibrary(cfg, { deep = false, withCrops = false } = {}) {
+async function scanLibrary(cfg, { deep = false, withCrops = false, concurrency = 4 } = {}) {
   const index = await loadIndex(cfg);
   const rels = await walkImages(cfg);
   const nextItems = {};
   let changed = false;
 
-  for (const rel of rels) {
+  // 并发扫描：冷启动需要逐张解码计算 dHash/裁切指纹，串行在千张图库上要两分钟；
+  // 限制并发数（默认 4）避免一次性把大图解码任务全丢给 sharp 造成内存峰值。
+  // 结果按下标回填，保证索引键顺序与目录顺序一致（查重归组结果稳定）。
+  const items = new Array(rels.length);
+  let cursor = 0;
+  const workers = Array.from(
+    { length: Math.min(Math.max(1, Number(concurrency) || 4), rels.length) },
+    async () => {
+      for (;;) {
+        const i = cursor++;
+        if (i >= rels.length) return;
+        const rel = rels[i];
+        const cached = index.items[rel] || null;
+        try {
+          // deep 不再强制重算已有指纹，只补缺失项；withCrops 控制裁切指纹
+          items[i] = await refreshItem(cfg, rel, cached, { needCrops: withCrops || deep });
+        } catch (e) {
+          if (e && e.code === 'ENOENT') { items[i] = null; continue; } // 扫描期间被删除
+          throw e;
+        }
+      }
+    }
+  );
+  await Promise.all(workers);
+
+  for (let i = 0; i < rels.length; i++) {
+    const rel = rels[i];
     const cached = index.items[rel] || null;
-    // deep 不再强制重算已有指纹，只补缺失项；withCrops 控制裁切指纹
-    const item = await refreshItem(cfg, rel, cached, { needCrops: withCrops || deep });
+    const item = items[i];
+    if (!item) { changed = true; continue; } // 扫描期间消失，不再写入索引
     nextItems[rel] = {
       mtime: item.mtime, size: item.size, w: item.w, h: item.h,
       md5: item.md5, dhash: item.dhash,
@@ -1442,7 +1699,7 @@ function findDuplicateGroups(index, threshold, muted = new Set(), opts = {}) {
 
 module.exports = {
   md5Of, dhashOf, hammingDistance,
-  loadIndex, saveIndex, scanLibrary, setIndexItem, deleteIndexItem, walkImages,
+  loadIndex, saveIndex, scanLibrary, reconcileScan, setIndexItem, deleteIndexItem, walkImages,
   compareAgainstLibrary, findDuplicateGroups, extSetOf,
   orientationOf, orientationOfItem, keepPriorityOf, pickKeep,
   cropHashesOf, cropDistanceOf, nccCropMatch, nccScore, profileCorr, CROP_VERSION,

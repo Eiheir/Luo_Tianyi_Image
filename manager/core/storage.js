@@ -404,11 +404,13 @@ async function purgeTrash(cfg, batchId, flats) {
     throw new Error('非法批次标识');
   }
 
-  // 未指定条目 = 整批清空
-  if (!Array.isArray(flats) || flats.length === 0) {
+  // 未指定条目 = 整批清空；显式空数组 = 没有要删的条目（不能误清空整批）
+  if (flats == null) {
     await fsp.rm(batchDir, { recursive: true, force: true });
     return { removed: -1 }; // 整批模式，调用方无需精确计数
   }
+  if (!Array.isArray(flats)) throw new Error('非法文件列表');
+  if (flats.length === 0) return { removed: 0 };
 
   let manifest = {};
   try {

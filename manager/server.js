@@ -128,23 +128,32 @@ function withProcessLock(fn) {
 //  - TTL 窗口内的结果：直接复用，不再触发新的全库 stat
 // 注意：promise 解析出的正是 index 对象引用，因此上传/转换/删除对内存索引的增量修改
 // 会即时反映，TTL 仅用于"省掉重复的磁盘扫描"。
-let scanCache = { at: 0, promise: null };
-const SCAN_TTL_MS = 1500; // 扫描结果复用窗口（毫秒）
+const scanCache = { at: 0, promise: null, inFlight: null };
+const SCAN_TTL_MS = 1500; // 扫描结果复用窗口（毫秒，从扫描完成时刻开始计）
 
 /** 获取最新索引：带 TTL 复用与并发合并，确保同一时刻只扫描一次图库 */
 function getIndex() {
+  // 在途扫描永远复用：TTL 若从扫描开始计时，扫描超过 1.5 秒时后续请求会重复起扫，
+  // 两个全库 stat 互相覆盖索引。这里用独立的 inFlight 标志，TTL 只在完成后生效。
+  if (scanCache.inFlight) return scanCache.inFlight;
   const now = Date.now();
   if (scanCache.promise && now - scanCache.at < SCAN_TTL_MS) return scanCache.promise;
-  scanCache.at = now;
-  scanCache.promise = dedup.scanLibrary(cfg, { deep: false }).then((scan) => {
-    index.items = scan.items;
+  scanCache.inFlight = dedup.scanLibrary(cfg, { deep: false }).then(async (scan) => {
+    // 与内存索引对账：扫描期间完成的上传/删除不能被旧快照覆盖
+    const merged = await dedup.reconcileScan(cfg, scan.items, index.items);
+    index.items = merged.items;
+    if (merged.changed) await dedup.saveIndex(cfg, index);
+    scanCache.at = Date.now(); // TTL 从扫描完成时刻开始计
+    scanCache.promise = Promise.resolve(index);
     return index;
   }).catch((e) => {
     // 扫描失败：清空缓存，避免把失败状态缓存住导致后续请求持续异常
     scanCache.promise = null;
     throw e;
+  }).finally(() => {
+    scanCache.inFlight = null;
   });
-  return scanCache.promise;
+  return scanCache.inFlight;
 }
 
 /** 统一成功响应 */
@@ -155,8 +164,14 @@ function fail(res, status, error) { res.status(status).json({ ok: false, error }
 /** 异步路由包装：捕获业务异常 → 统一 JSON 错误，防止进程崩溃 */
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).catch(async (e) => {
   await logError(req.path, e);
-  fail(res, 500, e.message || '服务器内部错误');
+  // 流式响应（如 ZIP 下载）可能已发送响应头/部分数据，此时不能再写 JSON 错误
+  if (!res.headersSent) fail(res, 500, e.message || '服务器内部错误');
 });
+
+/** 生成链接；仓库归属信息缺失时返回空串，避免"文件已成功落盘却被标成失败" */
+function safeLink(rel, type) {
+  try { return links.buildLink(cfg, rel, type); } catch (e) { return ''; }
+}
 
 /** 路径参数安全解析：非法立即 400 */
 function requireSafePath(req, res) {
@@ -346,6 +361,30 @@ app.get('/api/raw', wrap(async (req, res) => {
 
 /* ---------- 重复图片检测 ---------- */
 
+/**
+ * 查重结果缓存。findDuplicateGroups 是 O(n²) 的重计算（当前千张图库约十几秒），
+ * 而用户经常连续点几次扫描。这里以"索引全部条目的 rel/mtime/size/指纹 + 阈值 +
+ * 忽略集合"为 key：图库、阈值、忽略项任一变化都会换 key，缓存自然失效。
+ * 只缓存最后一次结果，内存开销可控；进程重启后自动清空。
+ */
+let dupScanCache = { key: '', data: null };
+
+function dupScanCacheKey(index, cfg, muted) {
+  const parts = [];
+  // 排序保证 key 与对象键顺序无关
+  for (const rel of Object.keys(index.items).sort()) {
+    const it = index.items[rel] || {};
+    parts.push(`${rel}|${it.mtime || 0}|${it.size || 0}|${it.w || 0}|${it.h || 0}|${it.md5 || ''}|${it.dhash || ''}|${it.cropVersion || 0}`);
+  }
+  parts.push(
+    `t=${cfg.dedup.hammingThreshold}|c=${cfg.dedup.cropThreshold}|cv=${dedup.CROP_VERSION}` +
+    `|k=${dedup.keepPriorityOf(cfg).join(',')}|a=${cfg.classify.avatarRatioMax}` +
+    `|wd=${cfg.classify.wallpaperDir}|ed=${cfg.classify.emoticonDir}`
+  );
+  parts.push(`m=${[...muted].sort().join('||')}`);
+  return crypto.createHash('sha1').update(parts.join('\n')).digest('hex');
+}
+
 app.post('/api/duplicates/scan', wrap(async (req, res) => {
   const deep = !!(req.body && req.body.deep);
   // deep=true 时补齐缺失的整图指纹；withCrops 确保壁纸拥有局部裁切指纹（首次会慢一些）
@@ -353,11 +392,20 @@ app.post('/api/duplicates/scan', wrap(async (req, res) => {
     deep: deep || Object.values(index.items).every((i) => !i.dhash),
     withCrops: true
   });
-  index.items = scan.items;
+  // 与内存索引对账：查重扫描可能持续几十秒，期间上传的新图/删除的文件
+  // 不能被扫描开始时的旧快照覆盖（否则新图会在索引里暂时消失）。
+  const merged = await dedup.reconcileScan(cfg, scan.items, index.items);
+  index.items = merged.items;
+  if (merged.changed) await dedup.saveIndex(cfg, index);
   const threshold = Number(cfg.dedup.hammingThreshold) || 5;
   const cropThreshold = Number(cfg.dedup.cropThreshold) || 5;
   // 手动忽略：用户确认"看着像但不是重复"的图片，相似归组时彻底跳过
   const muted = await dedup.loadIgnoreSet(cfg);
+  // 图库/阈值/忽略集合都没变时直接复用上次分组结果，避免重复十几秒的重计算
+  const cacheKey = dupScanCacheKey(index, cfg, muted);
+  if (dupScanCache.key === cacheKey && dupScanCache.data) {
+    return ok(res, dupScanCache.data);
+  }
   const groups = dedup.findDuplicateGroups(index, threshold, muted, { cfg, cropThreshold });
   // 组内附带缩略图信息 + 方向 + 默认保留标记，前端直接渲染
   const decorate = (group) => {
@@ -391,14 +439,16 @@ app.post('/api/duplicates/scan', wrap(async (req, res) => {
     }
     return items;
   };
-  ok(res, {
+  const data = {
     exactGroups: groups.exactGroups.map(decorate),
     similarGroups: groups.similarGroups.map(decorate),
     keepPriority: dedup.keepPriorityOf(cfg),
     cropThreshold,
     scanned: Object.keys(index.items).length,
     ignoredPairs: muted.size
-  });
+  };
+  dupScanCache = { key: cacheKey, data };
+  ok(res, data);
 }));
 
 /* ---------- 查重手动忽略 ---------- */
@@ -452,7 +502,7 @@ app.post('/api/convert', wrap(async (req, res) => {
         results.push({
           rel, ok: true, skipped: true, converted: false,
           notice: processed.notice || '已跳过',
-          url: links.buildLink(cfg, rel, chosenLinkType)
+          url: safeLink(rel, chosenLinkType)
         });
         continue;
       }
@@ -472,12 +522,15 @@ app.post('/api/convert', wrap(async (req, res) => {
         return { newRel: `${relDir}/${allocated.fileName}`, st: await fsp.stat(allocated.absPath) };
       });
       const md5 = dedup.md5Of(processed.buffer);
-      const dhash = await dedup.dhashOf(processed.buffer).catch(() => '');
-      // 壁纸类补充局部裁切指纹，转换后的新文件同样参与跨方向裁切匹配
-      let cropData = null;
-      if (['heng', 'shu', 'avatar'].includes(storage.categoryOf(newRel, cfg))) {
-        try { cropData = await dedup.cropHashesOf(processed.buffer, cfg); } catch (e) { cropData = null; }
-      }
+      // 壁纸类补充局部裁切指纹，转换后的新文件同样参与跨方向裁切匹配；
+      // dHash 与裁切指纹互不依赖，并行解码缩短转换单张的墙钟时间
+      const newCat = storage.categoryOf(newRel, cfg);
+      const [dhash, cropData] = await Promise.all([
+        dedup.dhashOf(processed.buffer).catch(() => ''),
+        ['heng', 'shu', 'avatar'].includes(newCat)
+          ? dedup.cropHashesOf(processed.buffer, cfg).catch(() => null)
+          : Promise.resolve(null)
+      ]);
       dedup.setIndexItem(index, newRel, {
         mtime: st.mtimeMs, size: st.size, w: processed.width, h: processed.height, md5, dhash,
         chash: cropData && cropData.chash,
@@ -498,7 +551,7 @@ app.post('/api/convert', wrap(async (req, res) => {
       results.push({
         rel, ok: true, newRel, converted: processed.converted,
         notice: processed.notice || '', trashed,
-        url: links.buildLink(cfg, newRel, chosenLinkType)
+        url: safeLink(newRel, chosenLinkType)
       });
     } catch (e) {
       results.push({ rel, ok: false, error: e.message }); // 单文件失败不阻断批次
@@ -786,6 +839,10 @@ app.post('/api/trash/restore-batch', wrap(async (req, res) => {
 app.post('/api/trash/purge', wrap(async (req, res) => {
   const { batchId, flats } = req.body || {};
   if (!batchId || !/^[\w-]+$/.test(batchId)) return fail(res, 400, '非法批次标识');
+  // flats 缺省=整批清空；一旦提供必须是字符串数组，避免畸形请求被当成"整批清空"
+  if (flats != null && (!Array.isArray(flats) || flats.some((f) => typeof f !== 'string'))) {
+    return fail(res, 400, '非法文件列表');
+  }
   const result = await storage.purgeTrash(cfg, batchId, flats);
   await history.record(cfg, 'purge',
     Array.isArray(flats) && flats.length ? `彻底删除回收站 ${flats.length} 条` : '清空回收站批次');
@@ -798,6 +855,11 @@ app.post('/api/trash/purge', wrap(async (req, res) => {
 app.post('/api/move', wrap(async (req, res) => {
   const { paths, category, theme } = req.body || {};
   if (!Array.isArray(paths) || paths.length === 0) return fail(res, 400, '未指定图片');
+  // 全部路径必须合法（防穿越），任一非法则整批拒绝——移动会重命名文件，
+  // 不能让 "../xxx" 把图库外的文件搬进图库。
+  for (const rel of paths) {
+    if (!safeJoinImage(cfg, rel)) return fail(res, 400, `非法路径：${rel}`);
+  }
   if (!classify.CATEGORIES.includes(category) || category === 'auto') {
     return fail(res, 400, `无效分类：${category}`);
   }

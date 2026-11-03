@@ -37,6 +37,17 @@ async function moveImages(cfg, index, rels, target) {
   if (!classify.CATEGORIES.includes(category) || category === 'auto') {
     throw new Error(`无效分类：${category}`);
   }
+  // 防御性校验：移动操作会重命名文件，源路径必须全部落在图库根目录内。
+  // 路由层已用 safeJoinImage 预校验（返回 400），这里再兜一层，避免其他调用方
+  // 传入 "../xxx" 时把图库外的任意文件移进图库。
+  const root = path.resolve(cfg._paths.imageRoot);
+  for (const rel of rels) {
+    if (typeof rel !== 'string' || !rel.trim()) throw new Error('非法路径参数');
+    const abs = path.resolve(root, rel.replace(/\//g, path.sep));
+    if (abs === root || !abs.startsWith(root + path.sep)) {
+      throw new Error(`非法路径：${rel}`);
+    }
+  }
   const relDir = classify.categoryDir(category, target.theme, cfg);
   const dirAbs = path.join(cfg._paths.imageRoot, relDir.replace(/\//g, path.sep));
   const padding = category === 'emoticon' ? cfg.naming.emoticonPadding : cfg.naming.padding;
@@ -76,7 +87,8 @@ async function moveImages(cfg, index, rels, target) {
       r.newRel = toRel;
       r.assignedName = fileName;
       r.category = category;
-      r.url = buildLink(cfg, toRel, cfg.linkFormat);
+      // 文件已移动成功：链接生成失败（仓库归属缺失）只留空 URL，不污染 success 结果
+      try { r.url = buildLink(cfg, toRel, cfg.linkFormat); } catch (e) { r.url = ''; }
     } catch (e) {
       r.error = e.message;
     }

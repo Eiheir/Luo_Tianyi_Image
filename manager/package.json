@@ -1,6 +1,6 @@
 {
   "name": "lti-manager",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "description": "洛佬の美图 - 智能图床管理器（独立模块，不侵入原有图床目录结构与代码逻辑）",
   "main": "server.js",
   "bin": "server.js",
@@ -25,7 +25,7 @@
     "outputPath": "dist",
     "assets": [
       "public/**/*",
-      "config.json",
+      "config.example.json",
       "node_modules/@img/**/*",
       "node_modules/libheif-js/**/*.wasm"
     ]

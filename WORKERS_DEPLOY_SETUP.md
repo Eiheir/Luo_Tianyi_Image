@@ -1,6 +1,6 @@
-# R2 图床同步接入说明
+# Workers Static Assets 图床部署说明
 
-## 更新（2026-10-17）：方案由 R2 改为 Workers Static Assets
+## 历史（2026-10-17）：方案由 R2 改为 Workers Static Assets
 
 R2 激活强制绑定境外银行卡无法开通，图片托管改为 **Workers Static Assets**
 （免费档：静态资产请求免费不限量、单版本 20,000 文件、单文件 25MiB，均够用）。
@@ -22,8 +22,10 @@ Action 现在会为每张原图生成两种变体，并把 `_headers` 一并部�
 - 构建脚本与 `_headers` 在本仓库 `scripts/gallery-assets/` 留有 CI 副本；
   博客仓库的 `cloudflare/gallery-assets/build-manifest.mjs` 更新后需同步该副本
   （博客仓库的 `assets/` 被 gitignore，`_headers` 无法随骨架进入 CI）。
-- 当前约 2500+ 个文件（909 原图 + 909 缩略图 + 741 高清图 + 清单/头；168 张 GIF 不生成 large），
+- 当前约 3080 个文件（1083 原图 + 1083 缩略图 + 915 高清图 + 清单/头；168 张 GIF 不生成 large），
   低于 Workers 每版本 20,000 文件限制。
+- Action 会缓存 `thumbs/` 与 `large/`（key 为图库内容哈希，未变图片直接复用变体），
+  每次部署只重新生成新增/变化的图片。
 
 ## 首次启用配置（一次性）
 
