@@ -91,6 +91,10 @@
         <svg class="icon" aria-hidden="true"><use href="#i-sync"></use></svg>
         <span>同步状态</span> <span class="badge" id="gitCount">…</span>
       </button>
+      <button class="btn ghost" id="btnGitPush" type="button" title="只推送本地已提交但未推送的提交" disabled>
+        <svg class="icon" aria-hidden="true"><use href="#i-upload"></use></svg>
+        <span id="gitPushLabel">推送</span> <span class="badge" id="gitAhead" hidden>0</span>
+      </button>
       <button class="btn primary" id="btnGitSync" type="button">
         <svg class="icon" aria-hidden="true"><use href="#i-sync"></use></svg><span id="gitSyncLabel">同步到 GitHub</span>
       </button>

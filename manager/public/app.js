@@ -350,6 +350,7 @@ const state = {
   lb: { list: [], pos: -1, zoom: 1, x: 0, y: 0, drag: null, rows: null },
   order: { dir: '', items: [], original: [], dragging: '', duplicate: false },
   gitSyncing: false,
+  gitPushing: false,
   convert: { running: false, stop: false },
   dragRels: null // 网格拖拽移动中的图片路径集合
 };
@@ -3242,24 +3243,50 @@ $('btnSaveSettings').addEventListener('click', async () => {
 
 async function refreshGitStatus() {
   const badge = $('gitCount');
+  const aheadBadge = $('gitAhead');
+  const pushBtn = $('btnGitPush');
   try {
     const st = await api('/api/git/status');
     if (st.enabled === false) {
       badge.textContent = '—';
       badge.classList.add('warn');
+      aheadBadge.hidden = true;
+      pushBtn.disabled = true;
+      pushBtn.title = '同步功能已在配置中关闭';
       $('btnGitSync').disabled = true;
       $('btnGitSync').title = '同步功能已在配置中关闭';
       return;
     }
+    if (st.ok === false) {
+      badge.textContent = '!';
+      badge.classList.add('warn');
+      aheadBadge.hidden = true;
+      pushBtn.disabled = true;
+      pushBtn.title = `无法读取同步状态：${st.error || '未知错误'}`;
+      $('btnGitSync').title = `无法读取同步状态：${st.error || '未知错误'}`;
+      return;
+    }
+    const ahead = Number(st.ahead) || 0;
+    const behind = Number(st.behind) || 0;
     badge.textContent = st.count;
     badge.classList.toggle('warn', st.count > 0);
+    aheadBadge.textContent = `↑${ahead}`;
+    aheadBadge.hidden = ahead <= 0;
+    aheadBadge.classList.toggle('warn', ahead > 0);
+    pushBtn.disabled = !!state.gitPushing || !!state.gitSyncing || ahead <= 0;
+    pushBtn.title = ahead > 0
+      ? `${ahead} 个本地提交待推送；只执行 push，不会重新提交`
+      : '没有待推送的提交';
     $('btnGitSync').disabled = !!state.gitSyncing;
     $('btnGitSync').title = st.count
-      ? `${st.count} 项变更待同步`
-      : '没有本地变更；同步仍会先拉取远端更新';
+      ? `${st.count} 项变更待同步${behind > 0 ? `；远端领先 ${behind} 个提交` : ''}`
+      : (ahead > 0 ? `没有本地变更；有 ${ahead} 个提交待推送` : '没有本地变更；同步仍会先拉取远端更新');
   } catch (e) {
     badge.textContent = '!';
     badge.classList.add('warn');
+    aheadBadge.hidden = true;
+    pushBtn.disabled = true;
+    pushBtn.title = `无法读取同步状态：${e.message}`;
     $('btnGitSync').title = `无法读取同步状态：${e.message}`;
   }
 }
@@ -3313,6 +3340,58 @@ async function runGitSync(auto = false) {
 }
 
 $('btnGitSync').addEventListener('click', () => runGitSync(false));
+
+/* 只推送已提交但未推送的提交：commit 成功、push 因网络失败的补救入口 */
+async function runGitPush() {
+  if (state.gitPushing || state.gitSyncing) return;
+  if (state.cfg && state.cfg.git && state.cfg.git.enabled === false) {
+    return toast('同步功能已在配置中关闭', 'warn');
+  }
+
+  let st;
+  try {
+    st = await api('/api/git/status');
+  } catch (e) {
+    return toast(`无法读取同步状态：${e.message}`, 'err');
+  }
+  if (st.ok === false) return toast(`无法读取同步状态：${st.error || '未知错误'}`, 'err');
+  const ahead = Number(st.ahead) || 0;
+  if (ahead <= 0) return toast('本地没有待推送的提交', 'warn');
+
+  const ok = await confirmDialog({
+    title: '推送到 GitHub',
+    message: `将本地 ${ahead} 个已提交的变更推送到 GitHub？`,
+    detail: '只执行 push，不会重新提交或修改本地文件。网络失败时提交会保留在本地，可随时重试。',
+    okText: '推送',
+    danger: false
+  });
+  if (!ok) return;
+
+  state.gitPushing = true;
+  const btn = $('btnGitPush');
+  const label = $('gitPushLabel');
+  btn.disabled = true;
+  label.textContent = '推送中…';
+  try {
+    const r = await api('/api/git/push', { method: 'POST' });
+    const rows = (r.steps || []).map((s) => ({
+      status: s.ok ? 'ok' : 'fail',
+      title: s.step,
+      note: s.detail || ''
+    }));
+    toast(r.message, r.ok ? 'ok' : 'err');
+    showResult('Git 推送结果', rows.length ? rows : `<div class="empty">${r.ok ? '推送完成' : '推送失败'}</div>`);
+  } catch (e) {
+    toast(`推送失败：${e.message}`, 'err');
+  } finally {
+    state.gitPushing = false;
+    btn.disabled = false;
+    label.textContent = '推送';
+    refreshGitStatus();
+  }
+}
+
+$('btnGitPush').addEventListener('click', runGitPush);
 
 /* ---------------- 图片库数据加载 ---------------- */
 

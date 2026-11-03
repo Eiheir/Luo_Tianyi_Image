@@ -902,7 +902,12 @@ function deepMergeInto(target, patch) {
 /* ---------- Git 手动同步 ---------- */
 
 app.get('/api/git/status', wrap(async (req, res) => {
-  if (cfg.git.enabled === false) return ok(res, { enabled: false, count: 0, entries: [] });
+  if (cfg.git.enabled === false) {
+    return ok(res, {
+      enabled: false, ok: false, count: 0, entries: [],
+      branch: '', upstream: '', ahead: 0, behind: 0, pendingPush: false, lastCommit: ''
+    });
+  }
   ok(res, { enabled: true, ...(await gitops.status(cfg)) });
 }));
 
@@ -910,6 +915,17 @@ app.post('/api/git/sync', wrap(async (req, res) => {
   if (cfg.git.enabled === false) return fail(res, 403, '同步功能已在配置中关闭');
   const result = await gitops.sync(cfg);
   await history.record(cfg, 'sync', `Git 同步${result.ok ? '成功' : '失败'}${result.detail ? '：' + String(result.detail).slice(0, 120) : ''}`);
+  ok(res, result);
+}));
+
+// 只推送本地已提交但未推送的提交：用于 commit 成功、push 因网络失败后的补救
+app.post('/api/git/push', wrap(async (req, res) => {
+  if (cfg.git.enabled === false) return fail(res, 403, '同步功能已在配置中关闭');
+  const result = await gitops.pushOnly(cfg);
+  // 没有待推送提交时不写历史，避免手动调用产生噪音
+  if (!result.ok || (Number(result.ahead) || 0) > 0) {
+    await history.record(cfg, 'sync', `Git 推送${result.ok ? '成功' : '失败'}：${String(result.message || '').slice(0, 120)}`);
+  }
   ok(res, result);
 }));
 
