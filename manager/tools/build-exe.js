@@ -19,6 +19,11 @@ const path = require('path');
 
 const MODULE_ROOT = path.resolve(__dirname, '..');
 const OUT_NAME = 'LTY-图床管理器.exe';
+/**
+ * 固定 pkg 版本：6.26 在当前环境会尝试从源码编译 Node（缺 NASM 直接失败），
+ * 6.23.0 可直接使用 ~/.pkg-cache 中的预编译 win-x64 运行时。
+ */
+const PKG_VERSION = '6.23.0';
 
 /** 依次尝试的 Node 目标版本（首个可用者胜出） */
 const TARGETS = ['node24-win-x64', 'node22-win-x64', 'node20-win-x64'];
@@ -37,7 +42,7 @@ function main() {
   for (const target of TARGETS) {
     try {
       execSync(
-        `npx --yes @yao-pkg/pkg server.js --config package.json --target ${target} --compress GZip --output "dist/${OUT_NAME}"`,
+        `npx --yes @yao-pkg/pkg@${PKG_VERSION} server.js --config package.json --target ${target} --compress GZip --output "dist/${OUT_NAME}"`,
         { cwd: MODULE_ROOT, stdio: 'inherit' }
       );
       done = true;
