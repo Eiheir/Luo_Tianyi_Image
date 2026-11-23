@@ -121,6 +121,7 @@ async function processOne(cfg, index, tmpPath, originalName, opts) {
       const simText = `疑似相似：${dup.similar.map((s) => {
         if (s.via === 'crop') return `${path.basename(s.rel)}(局部裁切 距离${s.distance})`;
         if (s.via === 'ncc') return `${path.basename(s.rel)}(裁切 NCC ${Number(s.score).toFixed(3)})`;
+        if (s.via === 'text') return `${path.basename(s.rel)}(同图异字 ${Number(s.score).toFixed(3)})`;
         return `${path.basename(s.rel)}(距离${s.distance})`;
       }).join('、')}`;
       result.notice = result.notice ? `${result.notice}；${simText}` : simText;

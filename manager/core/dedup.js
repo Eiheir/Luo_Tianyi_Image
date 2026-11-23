@@ -14,7 +14,8 @@
  * 局部裁切识别：跨方向（竖图是横图的一部分截取）和同方向（横图被二次裁切后
  * 宽高比明显变化，如 4800×2620 → 1852×1080）都会在整图 dHash 不命中时，
  * 用多位置裁切指纹 / 缩略图滑窗 NCC 兜底；只剩约 10% 面积的同方向细节裁切，
- * 另走 patch dHash 粗筛 + 96px 局部 NCC 复核。
+ * 另走 patch dHash 粗筛 + 96px 局部 NCC 复核；同图异字/局部覆盖（同一海报的
+ * 有字/无字版）用 8×4 分块灰度相关中位数识别，文字/Logo 只破坏部分区块也能归组。
  *
  * 保留规则（清理相似/重复组时的默认决策）：
  *  - 跨方向局部裁切组：智能识别哪张是被截取的图，保留完整原图、去除截取版本，
@@ -187,6 +188,14 @@ const CROP_PATCH_PY_STEP = 0.0625;
 const CROP_PATCH_COARSE_SCALE_STEP = 0.1;
 const CROP_PATCH_COARSE_POS_STEP = 0.125;
 const CROP_PATCH_COARSE_MAX = 30; // 宽松门槛，只用于决定是否进入细搜；最终仍按 14 判定
+/* 同图异字/局部覆盖版本：同方向、同构图，但一张图带 Logo/文字/大色块。
+ * 文字只破坏部分区块，把 96px 缩略图切成 8×4 格，逐格算灰度相关并取中位数；
+ * 实测真对（有字/无字海报）中位数 0.995，同构图无关对最高仅 0.529。 */
+const CROP_TEXT_AR_DIFF = 0.02;
+const CROP_TEXT_COLS = 8;
+const CROP_TEXT_ROWS = 4;
+const CROP_TEXT_MEDIAN_MIN = 0.9;
+const CROP_TEXT_MIN_CELLS = 16; // 8×4=32 格，至少一半有效格（排除大面积纯色）
 
 /** 索引条目的宽高比；尺寸缺失返回 0 */
 function arOf(item) {
@@ -937,6 +946,66 @@ function smallCropMatch(a, b, cache, cfg) {
 }
 
 /**
+ * 同图异字/局部覆盖版本识别（例如同一张海报的有字版与无字版）。
+ * 文字、Logo、大色块只会破坏部分 8×4 区块；未被覆盖区块的灰度相关仍很高，
+ * 因此取逐格 Pearson 相关的中位数作为鲁棒分数。纯色区块方差为 0，直接跳过；
+ * 有效区块少于一半时不做判断，避免误报。
+ * @returns {number|null} 命中返回中位数分数
+ */
+function textVariantMatch(a, b, cache, cfg) {
+  if (!a || !b || !a.rel || !b.rel) return null;
+  if (!isWallpaperRel(a.rel, cfg) || !isWallpaperRel(b.rel, cfg)) return null;
+  const orientA = orientationOfItem(a, cfg);
+  const orientB = orientationOfItem(b, cfg);
+  if (!orientA || !orientB || orientA !== orientB) return null;
+  const arA = arOf(a);
+  const arB = arOf(b);
+  if (!arA || !arB) return null;
+  if (Math.abs(arA - arB) / Math.max(arA, arB) > CROP_TEXT_AR_DIFF) return null;
+
+  const va = rawThumbOf(a, cache);
+  const vb = rawThumbOf(b, cache);
+  if (!va || !vb) return null;
+  // 两张缩略图可能因取整差 1px，取公共区域，避免越界
+  const w = Math.min(va.w, vb.w);
+  const h = Math.min(va.h, vb.h);
+  const cw = Math.floor(w / CROP_TEXT_COLS);
+  const ch = Math.floor(h / CROP_TEXT_ROWS);
+  if (cw < 3 || ch < 3) return null;
+
+  const vals = [];
+  for (let ry = 0; ry < CROP_TEXT_ROWS; ry++) {
+    for (let rx = 0; rx < CROP_TEXT_COLS; rx++) {
+      let n = 0;
+      let sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+      for (let y = ry * ch; y < (ry + 1) * ch; y++) {
+        const ai = y * va.w;
+        const bi = y * vb.w;
+        for (let x = rx * cw; x < (rx + 1) * cw; x++) {
+          const av = va.data[ai + x];
+          const bv = vb.data[bi + x];
+          n++; sa += av; sb += bv; saa += av * av; sbb += bv * bv; sab += av * bv;
+        }
+      }
+      if (n < 16) continue;
+      const cov = sab - sa * sb / n;
+      const vaa = saa - sa * sa / n;
+      const vbb = sbb - sb * sb / n;
+      // 纯色/近纯色区块无法计算相关，跳过（常见于海报的纯色文字条）
+      if (vaa <= 1e-6 || vbb <= 1e-6) continue;
+      vals.push(cov / Math.sqrt(vaa * vbb));
+    }
+  }
+  if (vals.length < CROP_TEXT_MIN_CELLS) return null;
+  vals.sort((x, y) => x - y);
+  const mid = vals.length >> 1;
+  const median = vals.length % 2
+    ? vals[mid]
+    : (vals[mid - 1] + vals[mid]) / 2;
+  return median >= CROP_TEXT_MEDIAN_MIN ? median : null;
+}
+
+/**
  * 先固定尺度求 NCC；灰区先做一维缩放复核，仍不足时再做二维缩放+平移复核。
  * 返回最优的方向与分数，供归组（只关心分数）和保留决策（关心方向）共用。
  */
@@ -1479,32 +1548,39 @@ function compareAgainstLibrary(index, md5, dhash, threshold, opts = {}) {
       const d = hammingDistance(dhash, item.dhash);
       if (d <= threshold) { distance = d; via = 'dhash'; }
     }
-    // 整图不像时，检查新图是否为库内某图的局部裁切：
-    // 跨方向先试固定位置裁切指纹，再试任意位置滑窗 NCC；同方向直接走 NCC。
+    // 整图不像时，先看是否为"同图异字/局部覆盖"版本（同方向、同构图，文字只破坏部分区块）；
+    // 再看新图是否为库内某图的局部裁切。
     if (!via && incoming) {
       const inItem = { rel: '', ...incoming };
       const libItem = { rel, ...item };
-      const d = cropDistanceOf(inItem, libItem, cropThreshold, cfg);
-      if (d !== null) {
-        distance = d;
-        via = 'crop';
+      const text = textVariantMatch(inItem, libItem, nccCache, cfg);
+      if (text !== null) {
+        score = text;
+        distance = Math.round((1 - text) * 64);
+        via = 'text';
       } else {
-        const ncc = nccCropMatch(inItem, libItem, nccCache, cfg);
-        if (ncc !== null) {
-          score = ncc;
-          distance = Math.round((1 - ncc) * 64); // 伪距离：NCC 越高越靠前
-          via = 'ncc';
+        const d = cropDistanceOf(inItem, libItem, cropThreshold, cfg);
+        if (d !== null) {
+          distance = d;
+          via = 'crop';
         } else {
-          const small = smallCropMatch(inItem, libItem, nccCache, cfg);
-          if (small !== null) {
-            score = small;
-            distance = Math.round((1 - small) * 64);
+          const ncc = nccCropMatch(inItem, libItem, nccCache, cfg);
+          if (ncc !== null) {
+            score = ncc;
+            distance = Math.round((1 - ncc) * 64); // 伪距离：NCC 越高越靠前
             via = 'ncc';
+          } else {
+            const small = smallCropMatch(inItem, libItem, nccCache, cfg);
+            if (small !== null) {
+              score = small;
+              distance = Math.round((1 - small) * 64);
+              via = 'ncc';
+            }
           }
         }
       }
     }
-    if (via) similar.push({ rel, distance, via, ...(via === 'ncc' ? { score } : {}) });
+    if (via) similar.push({ rel, distance, via, ...(via === 'ncc' || via === 'text' ? { score } : {}) });
   }
   similar.sort((a, b) => a.distance - b.distance);
   return { exact, similar: similar.slice(0, 8) }; // 相似列表最多提示 8 条，避免刷屏
@@ -1671,21 +1747,26 @@ function findDuplicateGroups(index, threshold, muted = new Set(), opts = {}) {
       if (!sameEmoticonScope(pivot.rel, other.rel)) continue;
       let d = pivot.dhash && other.dhash ? hammingDistance(pivot.dhash, other.dhash) : 64;
       if (d > threshold) {
-        // 整图不像时，再看"一张图是否为另一张图的局部裁切"：
-        // 跨方向先试固定位置裁切指纹（快），未命中再用投影预筛 + 滑窗 NCC；
-        // 同方向没有对应宽高比的裁切指纹，直接走 NCC（仅宽高比差异明显时）
-        const cropD = cropDistanceOf(pivot, other, cropThreshold, cfg);
-        if (cropD !== null) {
-          d = cropD;
+        // 整图不像时，先看是否为"同图异字/局部覆盖"版本；再走局部裁切链路。
+        const textD = textVariantMatch(pivot, other, nccCache, cfg);
+        if (textD !== null) {
+          d = Math.round((1 - textD) * 64);
         } else {
-          const nccD = nccCropMatch(pivot, other, nccCache, cfg);
-          if (nccD !== null) {
-            d = nccD;
+          // 跨方向先试固定位置裁切指纹（快），未命中再用投影预筛 + 滑窗 NCC；
+          // 同方向没有对应宽高比的裁切指纹，直接走 NCC（仅宽高比差异明显时）
+          const cropD = cropDistanceOf(pivot, other, cropThreshold, cfg);
+          if (cropD !== null) {
+            d = cropD;
           } else {
-            // 同方向细节裁切：整图 NCC 失效时用 patch 粗筛 + 96px 局部验证兜底
-            const smallD = smallCropMatch(pivot, other, nccCache, cfg);
-            if (smallD === null) continue;
-            d = smallD;
+            const nccD = nccCropMatch(pivot, other, nccCache, cfg);
+            if (nccD !== null) {
+              d = nccD;
+            } else {
+              // 同方向细节裁切：整图 NCC 失效时用 patch 粗筛 + 96px 局部验证兜底
+              const smallD = smallCropMatch(pivot, other, nccCache, cfg);
+              if (smallD === null) continue;
+              d = smallD;
+            }
           }
         }
       }
@@ -1703,7 +1784,7 @@ module.exports = {
   compareAgainstLibrary, findDuplicateGroups, extSetOf,
   orientationOf, orientationOfItem, keepPriorityOf, pickKeep,
   cropHashesOf, cropDistanceOf, nccCropMatch, nccScore, profileCorr, CROP_VERSION,
-  cropRelationOf, pickCropKeeper, pickOriginal, smallCropMatch,
+  cropRelationOf, pickCropKeeper, pickOriginal, smallCropMatch, textVariantMatch,
   KEEP_PRIORITY, ORIENTATION_LABELS,
   loadIgnoreSet, saveIgnoreSet, addIgnorePairs, removeIgnorePairs, pruneIgnorePairs
 };

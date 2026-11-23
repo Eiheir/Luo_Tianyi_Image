@@ -1615,6 +1615,67 @@ test('同方向细节裁切：约 10% 面积的小裁切可命中', () => {
   assert.strictEqual(dedup.smallCropMatch(a, c, new Map(), cfg), null);
 });
 
+test('同图异字：有字/无字版本凭 8×4 分块相关命中', () => {
+  const cfg = makeCfg();
+  const FW = 96, FH = 54;
+  const base = new Uint8Array(FW * FH);
+  for (let y = 0; y < FH; y++) {
+    for (let x = 0; x < FW; x++) {
+      let v = 30 + 150 * (x / FW) + 40 * Math.sin(y / 3);
+      if (((x >> 3) + (y >> 2)) % 2 === 0) v += 30;
+      base[y * FW + x] = Math.max(0, Math.min(255, Math.round(v)));
+    }
+  }
+  // 有字版：顶部 Logo、底部色条、几个大文字块
+  const text = new Uint8Array(base);
+  const fill = (x0, y0, x1, y1, v) => {
+    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) text[y * FW + x] = v;
+  };
+  fill(2, 2, 30, 7, 245);
+  fill(0, 51, FW, 54, 25);
+  fill(60, 2, 90, 7, 240);
+
+  const other = new Uint8Array(FW * FH);
+  for (let i = 0; i < other.length; i++) other[i] = (i * 37) % 251;
+
+  const mk = (rel, w, h, data) => ({
+    rel, w, h, chash: '0'.repeat(16), crops: [], cropVersion: dedup.CROP_VERSION,
+    thumb: { w: FW, h: FH, data: Buffer.from(data).toString('base64') },
+    rowProf: [], colProf: []
+  });
+  const a = mk('wallpapers&illustration/heng/a.jpg', 7200, 4050, base);
+  const b = mk('wallpapers&illustration/heng/b.jpg', 2560, 1440, text);
+  const c = mk('wallpapers&illustration/heng/c.jpg', 2560, 1440, other);
+
+  const score = dedup.textVariantMatch(a, b, new Map(), cfg);
+  assert.ok(score !== null && score >= 0.9, `同图异字应命中，实际 ${score}`);
+  assert.strictEqual(dedup.textVariantMatch(a, c, new Map(), cfg), null, '无关图不应命中');
+
+  // 集成：整图 dHash 不命中时，仍应凭分块相关归组
+  const index = { items: {
+    [a.rel]: { w: a.w, h: a.h, dhash: '0000000000000000', chash: '0'.repeat(16), crops: [], cropVersion: dedup.CROP_VERSION, thumb: a.thumb, rowProf: [], colProf: [] },
+    [b.rel]: { w: b.w, h: b.h, dhash: 'ffffffffffffffff', chash: '1'.repeat(16), crops: [], cropVersion: dedup.CROP_VERSION, thumb: b.thumb, rowProf: [], colProf: [] }
+  } };
+  const g = dedup.findDuplicateGroups(index, 3, new Set(), { cfg, cropThreshold: 5 });
+  assert.strictEqual(g.similarGroups.length, 1);
+  assert.deepStrictEqual(g.similarGroups[0].slice().sort(), [a.rel, b.rel].sort());
+
+  // 上传前查重同样应标记 via=text
+  const cmp = dedup.compareAgainstLibrary(
+    { items: { [a.rel]: index.items[a.rel] } },
+    'new-md5', 'ffffffffffffffff', 3,
+    {
+      item: {
+        rel: 'wallpapers&illustration/heng/incoming.jpg',
+        w: b.w, h: b.h, thumb: b.thumb
+      },
+      cfg, cropThreshold: 5
+    }
+  );
+  assert.strictEqual(cmp.similar.length, 1);
+  assert.strictEqual(cmp.similar[0].via, 'text');
+});
+
 // ---------------- 12. 裁切方向：保留完整原图 ----------------
 test('裁切方向：固定裁切指纹能指出被截取的图', () => {
   const cfg = makeCfg();
