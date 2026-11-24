@@ -25,6 +25,7 @@ const links = require('./core/links');
 const gitops = require('./core/gitops');
 const uploader = require('./core/uploader');
 const converter = require('./core/converter');
+const rotate = require('./core/rotate');
 const organize = require('./core/organize');
 const settings = require('./core/settings');
 const history = require('./core/history');
@@ -563,6 +564,39 @@ app.post('/api/convert', wrap(async (req, res) => {
   await history.record(cfg, 'convert',
     `批量转换 ${convOk} 张为 ${target.toUpperCase()}${replaceOriginal ? '（原图已入回收站）' : ''}`,
     { target, ok: convOk, skipped: results.filter((r) => r.skipped).length, failed: results.filter((r) => !r.ok).length });
+  ok(res, { results });
+}));
+
+/* ---------- 图片旋转（修正物理方向 + 可选自动归类） ---------- */
+
+app.post('/api/rotate', wrap(async (req, res) => {
+  const { paths, angle, reclassify } = req.body || {};
+  if (!Array.isArray(paths) || paths.length === 0) return fail(res, 400, '未指定图片');
+  for (const rel of paths) {
+    if (!safeJoinImage(cfg, rel)) return fail(res, 400, `非法路径：${rel}`);
+  }
+  const deg = Number(angle);
+  if (![90, -90, 180].includes(deg)) return fail(res, 400, '旋转角度无效（仅支持 90° / -90° / 180°）');
+
+  // 旋转后可能移动分类并重新分配编号，与上传/转换共用同一把编号锁
+  const results = await withProcessLock(() => rotate.rotateImages(cfg, index, paths, {
+    angle: deg,
+    reclassify: reclassify !== false,
+    quality: cfg.upload.quality
+  }));
+
+  const okResults = results.filter((r) => r.ok && !r.skipped);
+  if (okResults.length > 0) {
+    await dedup.saveIndex(cfg, index);
+    if (okResults.some((r) => r.moved)) await dedup.pruneIgnorePairs(cfg, index);
+  }
+  const movedN = okResults.filter((r) => r.moved).length;
+  const skippedN = results.filter((r) => r.skipped).length;
+  const failedN = results.filter((r) => !r.ok).length;
+  const angleLabel = deg === 90 ? '顺时针 90°' : deg === -90 ? '逆时针 90°' : '180°';
+  await history.record(cfg, 'rotate',
+    `旋转 ${okResults.length} 张（${angleLabel}）${movedN ? ` · ${movedN} 张已归类` : ''}${skippedN ? ` · 跳过 ${skippedN} 张` : ''}${failedN ? ` · 失败 ${failedN} 张` : ''}`,
+    { angle: deg, ok: okResults.length, moved: movedN, skipped: skippedN, failed: failedN });
   ok(res, { results });
 }));
 

@@ -387,6 +387,7 @@ const state = {
   gitSyncing: false,
   gitPushing: false,
   convert: { running: false, stop: false },
+  rotate: { rels: [], fromLightbox: false },
   dragRels: null // 网格拖拽移动中的图片路径集合
 };
 
@@ -1646,6 +1647,14 @@ function lbResetZoom() {
 $('lbPrev').addEventListener('click', () => lbStep(-1));
 $('lbNext').addEventListener('click', () => lbStep(1));
 $('lbClose').addEventListener('click', closeLightbox);
+$('lbRotateLeft').addEventListener('click', () => {
+  const rel = state.lb.list[state.lb.pos];
+  if (rel) openRotatePanel([rel], { angle: -90, fromLightbox: true });
+});
+$('lbRotateRight').addEventListener('click', () => {
+  const rel = state.lb.list[state.lb.pos];
+  if (rel) openRotatePanel([rel], { angle: 90, fromLightbox: true });
+});
 $('lbZoomIn').addEventListener('click', () => lbZoom(1.25));
 $('lbZoomOut').addEventListener('click', () => lbZoom(0.8));
 $('lbZoomReset').addEventListener('click', lbResetZoom);
@@ -1699,6 +1708,12 @@ $('lbDownload').addEventListener('click', () => {
 $('lbOpen').addEventListener('click', () => {
   const rel = state.lb.list[state.lb.pos];
   if (rel) window.open(rawUrl(rel), '_blank', 'noopener');
+});
+
+$('lbSwap').addEventListener('click', () => {
+  const rel = state.lb.list[state.lb.pos];
+  if (!rel) return;
+  openSwapPanel(rel, { fromLightbox: true }).catch((e) => toast(e.message, 'err'));
 });
 
 $('lbTrash').addEventListener('click', async () => {
@@ -1891,6 +1906,115 @@ $('btnMoveConfirm').addEventListener('click', async () => {
     refreshLibrary();
     refreshGitStatus();
   } catch (e) { toast(e.message, 'err'); }
+});
+
+/* ---------------- 图片旋转 ---------------- */
+
+/** 按宽高推断横/方/竖（与后端 classify.decideCategory 规则一致，仅用于弹窗预览） */
+function targetCategoryForSize(w, h) {
+  const width = Number(w) || 0;
+  const height = Number(h) || 0;
+  if (!width || !height) return '';
+  const limit = Number(state.cfg && state.cfg.classify && state.cfg.classify.avatarRatioMax) || 1.2;
+  const ratio = Math.max(width, height) / Math.min(width, height);
+  if (ratio <= limit) return 'avatar';
+  return width > height ? 'heng' : 'shu';
+}
+
+/** 旋转弹窗里的“预计移动/保持”提示 */
+function updateRotatePreview() {
+  const box = $('rotatePreview');
+  const rels = state.rotate.rels || [];
+  if (!rels.length) { box.innerHTML = ''; return; }
+  const angle = Number($('rotateAngle').value);
+  if (!$('rotateReclassify').checked) {
+    box.innerHTML = `${icon('info', 'sm')}<span>将原地旋转 ${rels.length} 张，不改变分类和文件路径。</span>`;
+    return;
+  }
+  let moveN = 0;
+  let keepN = 0;
+  for (const rel of rels) {
+    const row = state.libAll.find((r) => r.rel === rel);
+    if (!row || !['heng', 'shu', 'avatar'].includes(row.category)) { keepN += 1; continue; }
+    const swap = angle !== 180;
+    const target = targetCategoryForSize(swap ? row.h : row.w, swap ? row.w : row.h);
+    if (target && target !== row.category) moveN += 1;
+    else keepN += 1;
+  }
+  const parts = [];
+  if (moveN) parts.push(`<b>${moveN}</b> 张方向改变，将移动到对应分类并重新编号（旧链接失效）`);
+  if (keepN) parts.push(`${keepN} 张保持原分类或原目录`);
+  box.innerHTML = `${icon('info', 'sm')}<span>${parts.join('；')}</span>`;
+}
+
+/**
+ * 打开旋转弹窗。
+ * @param {string[]} rels 要旋转的图片
+ * @param {object} [opts] { angle: 90|-90|180, fromLightbox: boolean }
+ */
+function openRotatePanel(rels, opts = {}) {
+  const list = [...new Set((rels || []).filter((r) => typeof r === 'string' && r))];
+  if (!list.length) return toast('请先选择图片', 'warn');
+  state.rotate = { rels: list, fromLightbox: !!opts.fromLightbox };
+  const angle = [-90, 180].includes(Number(opts.angle)) ? Number(opts.angle) : 90;
+  $('rotateAngle').value = String(angle);
+  $('rotateReclassify').checked = true;
+  $('rotateInfo').textContent = `已选 ${list.length} 张图片。旋转会重新编码并剥离 EXIF。`;
+  // 从灯箱进入时弹窗要盖在灯箱之上（灯箱 z-index 130）
+  $('rotatePanel').style.zIndex = opts.fromLightbox ? '135' : '';
+  updateRotatePreview();
+  openModal('rotatePanel');
+}
+
+$('btnRotateSel').addEventListener('click', () => {
+  if (!state.selected.size) return toast('请先选择图片', 'warn');
+  openRotatePanel(selRels());
+});
+$('rotateAngle').addEventListener('change', updateRotatePreview);
+$('rotateReclassify').addEventListener('change', updateRotatePreview);
+
+$('btnRotateConfirm').addEventListener('click', async () => {
+  const { rels, fromLightbox } = state.rotate;
+  if (!rels.length) return;
+  const angle = Number($('rotateAngle').value);
+  const reclassify = $('rotateReclassify').checked;
+  const btn = $('btnRotateConfirm');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '旋转中…';
+  try {
+    const { results } = await api('/api/rotate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths: rels, angle, reclassify }),
+      timeoutMs: 10 * 60 * 1000
+    });
+    closeModal('rotatePanel');
+    const moved = results.filter((r) => r.ok && !r.skipped && r.newRel !== r.rel);
+    const fails = results.filter((r) => !r.ok);
+    const skipped = results.filter((r) => r.skipped);
+    if (moved.length || fails.length || skipped.length) {
+      showResult('图片旋转结果', results.map((r) => {
+        if (!r.ok) return { status: 'fail', title: r.rel, note: r.error || '旋转失败' };
+        if (r.skipped) return { status: 'skip', title: r.rel, note: r.notice || '已跳过' };
+        const dims = r.w && r.h ? ` · ${r.w}×${r.h}` : '';
+        return { status: 'ok', title: r.rel, note: `→ ${r.newRel}${dims}${r.notice ? ` · ${r.notice}` : ''}` };
+      }));
+    } else {
+      toast(`已旋转 ${results.length} 张`, 'ok');
+    }
+    if (fromLightbox) closeLightbox();
+    state.selected.clear();
+    syncGridSelection();
+    updateBulkbar();
+    refreshLibrary();
+    refreshGitStatus();
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
 });
 
 /* ---------------- 格式转换 ---------------- */
@@ -2594,10 +2718,11 @@ $('btnOrganize').addEventListener('click', () => {
     </div>
     <div class="callout warn" style="margin-top:12px">
       ${icon('warning', 'sm')}
-      <span>只有被移动去填补空位的文件会改名，其余文件的旧链接保持不变。建议先同步 Git，确认无误后再操作。</span>
+      <span>只有被移动去填补空位的文件会改名，其余文件的旧链接保持不变。建议先同步 Git，确认无误后再操作；「一键规整全部目录」会逐个目录执行，某个目录失败时停止，已完成目录不回滚。</span>
     </div>
     <div class="queue-actions">
       <button class="btn warn" id="btnRenumber" type="button">填补空位（最小改动）</button>
+      <button class="btn ghost" id="btnRenumberAll" type="button">一键规整全部目录</button>
     </div>
 
     <h4 class="org-title" style="margin-top:22px">表情包主题改名</h4>
@@ -2669,6 +2794,10 @@ $('btnOrganize').addEventListener('click', () => {
     } catch (e) { toast(e.message, 'err'); }
   });
 
+  $('btnRenumberAll').addEventListener('click', () => {
+    quickRenumber({ all: true }).catch((e) => toast(e.message, 'err'));
+  });
+
   $('btnRenameTheme').addEventListener('click', async () => {
     const from = $('orgTheme').value;
     const to = $('orgNewTheme').value.trim();
@@ -2700,6 +2829,121 @@ $('btnOrganize').addEventListener('click', () => {
   });
 
   openModal('organizePanel');
+});
+
+/* ---------------- 一键编号规整 ---------------- */
+
+function renumberDirLabel(dir) {
+  const wp = (state.cfg && state.cfg.classify && state.cfg.classify.wallpaperDir) || 'wallpapers&illustration';
+  const s = String(dir || '');
+  return s.startsWith(`${wp}/`) ? s.slice(wp.length + 1) : s;
+}
+
+/** 参与编号规整的标准目录/表情包主题（只保留含数字编号图片的目录） */
+function renumberEligibleDirs() {
+  const c = (state.cfg && state.cfg.classify) || {};
+  const wp = c.wallpaperDir || 'wallpapers&illustration';
+  const em = c.emoticonDir || 'emoticon';
+  const known = new Set([
+    `${wp}/heng`, `${wp}/shu`, `${wp}/avatar`,
+    c.temporaryDir || `${wp}/temporary`
+  ]);
+  const dirs = [...new Set((state.libAll || []).map((r) => dirOf(r.rel)).filter(Boolean))]
+    .filter((d) => known.has(d) || d.startsWith(`${em}/`))
+    .filter((d) => (state.libAll || []).some((r) => dirOf(r.rel) === d && /^\d+\.\w+$/.test(r.name)));
+  return sortDirsForSelect(dirs);
+}
+
+/** 预估一个目录按“末尾编号回填空位”会改多少张 */
+function renumberPlanOf(dir) {
+  const nums = (state.libAll || [])
+    .filter((r) => dirOf(r.rel) === dir && /^\d+\.\w+$/.test(r.name))
+    .map((r) => parseInt(r.name, 10))
+    .filter((n) => Number.isFinite(n));
+  const total = nums.length;
+  if (!total) return { dir, total: 0, gaps: 0, rename: 0, kept: 0 };
+  const occupied = new Set();
+  let kept = 0;
+  for (const n of nums) {
+    if (n >= 1 && n <= total && !occupied.has(n)) {
+      occupied.add(n);
+      kept += 1;
+    }
+  }
+  const gaps = total - occupied.size;
+  return { dir, total, gaps, rename: gaps, kept };
+}
+
+/**
+ * 一键编号规整：
+ *  - 指定目录/父目录时规整该范围内目录；
+ *  - 未指定目录或 opts.all=true 时规整全部标准目录；
+ *  - 逐目录调用 /api/renumber（最小改动），失败停止并汇报已完成部分。
+ */
+async function quickRenumber(opts = {}) {
+  if (!state.libAll.length) return toast('图片库尚未加载完成，请稍后重试', 'warn');
+  const allDirs = renumberEligibleDirs();
+  let dirs;
+  if (opts.all || !state.dir) {
+    dirs = allDirs;
+  } else {
+    dirs = allDirs.filter((d) => d === state.dir || d.startsWith(`${state.dir}/`));
+  }
+  const plans = dirs.map(renumberPlanOf).filter((p) => p.rename > 0);
+  if (!plans.length) {
+    return toast(opts.all || !state.dir ? '全部目录编号已连续，无需规整' : '当前范围编号已连续，无需规整', 'warn');
+  }
+
+  const totalRename = plans.reduce((s, p) => s + p.rename, 0);
+  const totalKept = plans.reduce((s, p) => s + p.kept, 0);
+  const preview = plans.slice(0, 6)
+    .map((p) => `${renumberDirLabel(p.dir)}：改名 ${p.rename} / 保持 ${p.kept}`)
+    .join('；') + (plans.length > 6 ? `；等共 ${plans.length} 个目录` : '');
+  const scope = plans.length === 1
+    ? `「${renumberDirLabel(plans[0].dir)}」`
+    : (opts.all || !state.dir ? `全部 ${plans.length} 个目录` : `${plans.length} 个目录`);
+  const ok = await confirmDialog({
+    title: '一键编号规整',
+    message: `规整${scope}的编号？`,
+    detail: `${preview}。合计预计重命名 ${totalRename} 张、保持 ${totalKept} 张；只有需填补空位的文件会改名，旧链接可能失效。逐目录执行，某个目录失败时停止，已完成目录不回滚。`,
+    okText: '开始规整'
+  });
+  if (!ok) return;
+
+  const results = [];
+  try {
+    toast('正在规整…', 'info');
+    for (const p of plans) {
+      const r = await api('/api/renumber', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dir: p.dir })
+      });
+      results.push({ dir: p.dir, ...r });
+    }
+    const renamed = results.reduce((s, r) => s + (r.renumbered || 0), 0);
+    const filled = results.reduce((s, r) => s + (r.filled || 0), 0);
+    const kept = results.reduce((s, r) => s + (r.alreadyInPlace || 0), 0);
+    toast(`规整完成：${results.length} 个目录，填补 ${filled} 个空位，重命名 ${renamed} 张，保持 ${kept} 张`, 'ok');
+    closeModal('organizePanel');
+    await refreshLibrary();
+    refreshGitStatus();
+  } catch (e) {
+    const failed = plans[results.length];
+    const done = results.length;
+    let msg = e.message;
+    if (failed && /目标文件名已被占用/.test(msg)) {
+      msg = `${renumberDirLabel(failed.dir)}：${msg}`;
+    }
+    toast(`规整中断${failed ? `（${renumberDirLabel(failed.dir)}）` : ''}：${msg}${done ? `；已完成 ${done} 个目录` : ''}`, 'err');
+    closeModal('organizePanel');
+    await refreshLibrary();
+    refreshGitStatus();
+  }
+}
+
+$('btnQuickRenumber').addEventListener('click', () => {
+  quickRenumber().catch((e) => toast(e.message, 'err'));
 });
 
 /* ---------------- 图片顺序管理 ---------------- */
@@ -2749,6 +2993,8 @@ function renderOrderList() {
     updateOrderStats();
     return;
   }
+  const moved = orderMovedCount();
+  const canQuickSwap = moved === 0 && !state.order.duplicate;
   list.innerHTML = items.map((it, i) => {
     const v = it.mtime ? `&v=${Math.round(it.mtime)}` : '';
     const thumb = `/api/thumb?p=${encodeURIComponent(it.rel)}&w=160${v}`;
@@ -2765,6 +3011,9 @@ function renderOrderList() {
         <div class="muted">${dim}${fmtSize(it.size || 0)}</div>
       </div>
       <div class="order-btns">
+        <button class="icon-btn" type="button" data-order-swap
+          title="${canQuickSwap ? '与另一张交换位置' : '请先保存/重置顺序或整理重复编号，再使用快捷交换'}"
+          ${canQuickSwap ? '' : 'disabled'}>${icon('swap', 'sm')}</button>
         <button class="icon-btn" type="button" data-order-move="-1" title="上移" ${i === 0 ? 'disabled' : ''}>↑</button>
         <button class="icon-btn" type="button" data-order-move="1" title="下移" ${i === items.length - 1 ? 'disabled' : ''}>↓</button>
       </div>
@@ -2932,10 +3181,15 @@ function setupOrderDrag() {
   });
 
   list.addEventListener('click', (e) => {
+    const row = e.target.closest('.order-row');
+    if (!row) return;
+    if (e.target.closest('[data-order-swap]')) {
+      const item = state.order.items.find((it) => it.name === row.dataset.name);
+      if (item) openSwapPanel(item.rel).catch((err) => toast(err.message, 'err'));
+      return;
+    }
     const btn = e.target.closest('[data-order-move]');
     if (!btn) return;
-    const row = btn.closest('.order-row');
-    if (!row) return;
     const idx = state.order.items.findIndex((it) => it.name === row.dataset.name);
     const to = idx + Number(btn.dataset.orderMove);
     if (idx < 0 || to < 0 || to >= state.order.items.length) return;
@@ -2974,7 +3228,7 @@ async function openOrderPanel() {
     </div>
     <div class="callout warn" style="margin-top:12px">
       ${icon('warning', 'sm')}
-      <span>拖动行、使用 ↑/↓，或直接修改每行左侧序号后按回车与目标位置交换（只改两张图）。保存后按新顺序改写编号，旧链接可能变化；位置未变的图片保持原名。</span>
+      <span>拖动行、使用 ↑/↓、点每行 ⇄ 与同目录另一张立即交换（二次确认并展示两张预览），或直接修改每行左侧序号后按回车与目标位置交换（只改两张图）。保存后按新顺序改写编号，旧链接可能变化；位置未变的图片保持原名。</span>
     </div>
     <div class="order-list" id="orderList" aria-label="图片顺序列表"></div>
     <div class="queue-actions">
@@ -3028,6 +3282,293 @@ async function openOrderPanel() {
 
 $('btnOrder').addEventListener('click', () => {
   openOrderPanel().catch((e) => toast(e.message, 'err'));
+});
+
+/* ---------------- 快捷交换顺序 ---------------- */
+
+let swapState = null;
+
+/** 当前图片的元数据：优先当前图库列表，其次灯箱自定义行，最后按路径兜底 */
+function swapRowOf(rel) {
+  const fromLib = (state.libAll || []).find((r) => r.rel === rel);
+  if (fromLib) return fromLib;
+  const lb = state.lb && state.lb.rows ? state.lb.rows.get(rel) : null;
+  return lb || { rel, name: String(rel || '').split('/').pop() };
+}
+
+function swapDirOf(rel) {
+  return String(rel || '').split('/').slice(0, -1).join('/');
+}
+
+/** 同目录全部数字编号图片，按当前编号升序 */
+function swapDirRows(dir) {
+  return (state.libAll || [])
+    .filter((r) => swapDirOf(r.rel) === dir && /^\d+\.\w+$/.test(r.name))
+    .sort((a, b) => {
+      const na = parseInt(a.name, 10);
+      const nb = parseInt(b.name, 10);
+      return na - nb || a.name.localeCompare(b.name);
+    });
+}
+
+function swapMeta(row) {
+  const bits = [];
+  const no = parseInt(row && row.name, 10);
+  if (Number.isFinite(no)) bits.push(`序号 ${no}`);
+  if (row && row.w && row.h) bits.push(`${row.w}×${row.h}`);
+  if (row && row.size) bits.push(fmtSize(row.size));
+  return bits.join(' · ') || '—';
+}
+
+function swapTargetCardHtml() {
+  const target = swapState.rows.find((r) => r.rel === swapState.targetRel);
+  if (!target) {
+    return `<div class="swap-card target-empty" id="swapTargetCard">
+      <div class="swap-card-title"><span>交换对象</span><span class="flex-sp"></span><span>未选择</span></div>
+      <div class="swap-holder">从下方选择另一张同目录图片…</div>
+    </div>`;
+  }
+  return `<div class="swap-card" id="swapTargetCard">
+    <div class="swap-card-title"><span>交换对象</span><span class="flex-sp"></span><span>${escapeHtml(swapMeta(target))}</span></div>
+    <img src="${previewUrl(target.rel, 720)}" alt="${escapeHtml(target.name)}" />
+    <div class="swap-name">${escapeHtml(target.name)}</div>
+    <div class="muted">${escapeHtml(swapMeta(target))}</div>
+  </div>`;
+}
+
+function updateSwapTargetCard() {
+  const card = $('swapTargetCard');
+  if (card) card.outerHTML = swapTargetCardHtml();
+  const next = $('swapNext');
+  if (next) next.disabled = !swapState.targetRel || swapState.sourceIdx < 0 || swapState.duplicate;
+}
+
+function filterSwapCandidates() {
+  const q = String((swapState && swapState.search) || '').trim().toLowerCase();
+  document.querySelectorAll('#swapCandidates .swap-candidate').forEach((el) => {
+    el.hidden = !!q && !String(el.dataset.search || '').includes(q);
+  });
+}
+
+function renderSwapPick() {
+  const s = swapState;
+  if (!s) return;
+  const src = s.rows.find((r) => r.rel === s.sourceRel) || s.source;
+  const candidates = s.rows.filter((r) => r.rel !== s.sourceRel);
+  const canSwap = s.sourceIdx >= 0 && !s.duplicate && candidates.length > 0;
+  const cards = candidates.map((r) => `
+    <button type="button" class="swap-candidate${r.rel === s.targetRel ? ' selected' : ''}"
+      data-swap-target="${escapeHtml(r.rel)}"
+      aria-pressed="${r.rel === s.targetRel ? 'true' : 'false'}"
+      data-search="${escapeHtml(`${r.name} ${r.rel}`.toLowerCase())}">
+      <img loading="lazy" src="${previewUrl(r.rel, 240)}" alt="" />
+      <span class="name">${escapeHtml(r.name)}</span>
+      <span class="muted">${escapeHtml(swapMeta(r))}</span>
+    </button>`).join('');
+
+  let warning = '';
+  if (s.sourceIdx < 0) {
+    warning = `<div class="callout warn">${icon('warning', 'sm')}<span>当前图片不是数字编号（或目录中已找不到），无法参与顺序交换。请先把它整理为 4 位数字编号。</span></div>`;
+  } else if (s.duplicate) {
+    warning = `<div class="callout warn">${icon('warning', 'sm')}<span>目录内存在重复编号，请先在“整理 → 填补空位”中整理编号后再交换。</span></div>`;
+  } else if (!candidates.length) {
+    warning = `<div class="callout warn">${icon('warning', 'sm')}<span>同目录没有其他数字编号图片，无需交换。</span></div>`;
+  }
+
+  $('swapBody').innerHTML = `
+    <div class="swap-pair">
+      <div class="swap-card">
+        <div class="swap-card-title"><span>当前图片</span><span class="flex-sp"></span><span>${escapeHtml(s.dir)}</span></div>
+        <img src="${previewUrl(s.sourceRel, 720)}" alt="${escapeHtml(src.name || '')}" />
+        <div class="swap-name">${escapeHtml(src.name || s.sourceRel)}</div>
+        <div class="muted">${escapeHtml(swapMeta(src))}</div>
+      </div>
+      <div class="swap-arrow" aria-hidden="true">⇄</div>
+      ${swapTargetCardHtml()}
+    </div>
+    ${warning}
+    ${canSwap ? `<div class="swap-candidates">
+      <div class="swap-candidates-head">
+        <span>选择同目录的另一张图片</span>
+        <span class="muted">共 ${candidates.length} 张</span>
+        <span class="flex-sp"></span>
+        ${candidates.length > 12 ? `<input type="search" id="swapSearch" class="search swap-search"
+          placeholder="搜索文件名或序号…" value="${escapeHtml(s.search || '')}" />` : ''}
+      </div>
+      <div class="swap-candidate-grid" id="swapCandidates">${cards}</div>
+    </div>` : ''}`;
+
+  $('swapFoot').innerHTML = `
+    <button class="btn ghost" id="swapCancel" type="button">取消</button>
+    <button class="btn primary" id="swapNext" type="button"${canSwap && s.targetRel ? '' : ' disabled'}>下一步：确认交换</button>`;
+  filterSwapCandidates();
+}
+
+function renderSwapConfirm() {
+  const s = swapState;
+  if (!s) return;
+  const src = s.rows.find((r) => r.rel === s.sourceRel) || s.source;
+  const target = s.rows.find((r) => r.rel === s.targetRel);
+  if (!target) { s.step = 'pick'; renderSwapPick(); return; }
+  const card = (label, row) => `<div class="swap-confirm-card">
+    <div class="swap-card-title"><span>${label}</span></div>
+    <img src="${previewUrl(row.rel, 1200)}" alt="${escapeHtml(row.name)}" />
+    <div class="name">${escapeHtml(row.name)}</div>
+    <div class="muted">${escapeHtml(swapMeta(row))}</div>
+    <div class="muted">${escapeHtml(row.rel)}</div>
+  </div>`;
+  $('swapBody').innerHTML = `
+    <div class="swap-confirm-grid">
+      ${card('图片 A（当前）', src)}
+      <div class="swap-confirm-arrow" aria-hidden="true">⇄</div>
+      ${card('图片 B（交换对象）', target)}
+    </div>
+    <div class="callout warn">
+      ${icon('warning', 'sm')}
+      <span>确认后两张图片的编号/文件名互换，其他图片保持原名；这两张图片的旧链接会失效。操作会立即写入磁盘并记录到操作历史。</span>
+    </div>`;
+  $('swapFoot').innerHTML = `
+    <button class="btn ghost" id="swapBack" type="button">返回重选</button>
+    <button class="btn primary" id="swapConfirm" type="button">确认交换</button>`;
+  $('swapBody').scrollTop = 0;
+  setTimeout(() => { if ($('swapConfirm')) $('swapConfirm').focus(); }, 0);
+}
+
+function renderSwapPanel() {
+  if (!swapState) return;
+  if (swapState.step === 'confirm') renderSwapConfirm();
+  else renderSwapPick();
+}
+
+/**
+ * 打开“交换顺序”面板：选定同目录另一张图片 → 二次确认 → 立即交换编号。
+ * @param {string} rel 当前图片
+ * @param {object} [opts] { fromLightbox:boolean, targetRel?:string }
+ */
+async function openSwapPanel(rel, opts = {}) {
+  if (!rel) return toast('请先选择图片', 'warn');
+  try {
+    await refreshLibrary();
+  } catch (e) {
+    return toast(`图片库加载失败：${e.message}`, 'err');
+  }
+  const dir = swapDirOf(rel);
+  const rows = swapDirRows(dir);
+  const sourceIdx = rows.findIndex((r) => r.rel === rel);
+  const source = sourceIdx >= 0 ? rows[sourceIdx] : swapRowOf(rel);
+  const numbers = rows.map((r) => parseInt(r.name, 10));
+  const duplicate = new Set(numbers).size !== numbers.length;
+  let targetRel = opts.targetRel || '';
+  if (targetRel && !rows.some((r) => r.rel === targetRel && r.rel !== rel)) targetRel = '';
+
+  swapState = {
+    dir,
+    rows,
+    sourceRel: rel,
+    source: { ...source, rel },
+    sourceIdx,
+    duplicate,
+    targetRel,
+    search: '',
+    step: 'pick',
+    busy: false
+  };
+  $('swapPanel').style.zIndex = opts.fromLightbox ? '135' : '';
+  $('swapDir').textContent = dir || '—';
+  renderSwapPanel();
+  onModalClose('swapPanel', () => {
+    swapState = null;
+    $('swapPanel').style.zIndex = '';
+  });
+  openModal('swapPanel');
+}
+
+async function executeSwap() {
+  const s = swapState;
+  if (!s || s.busy) return;
+  const a = s.rows.findIndex((r) => r.rel === s.sourceRel);
+  const b = s.rows.findIndex((r) => r.rel === s.targetRel);
+  if (a < 0 || b < 0 || a === b) {
+    return toast('图片信息已变化，请返回重选', 'warn');
+  }
+  const order = s.rows.map((r) => r.name);
+  [order[a], order[b]] = [order[b], order[a]];
+  const srcName = s.rows[a].name;
+  const targetName = s.rows[b].name;
+  s.busy = true;
+  const btn = $('swapConfirm');
+  if (btn) { btn.disabled = true; btn.textContent = '交换中…'; }
+
+  const wasLb = !$('lightbox').hidden;
+  const lbRel = wasLb ? state.lb.list[state.lb.pos] : '';
+  try {
+    const r = await api('/api/reorder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dir: s.dir, order })
+    });
+    const mapping = new Map((r.mapping || []).map(([from, to]) => [from, to]));
+    closeModal('swapPanel');
+    toast(`交换完成：${srcName} ↔ ${targetName}（重命名 ${r.renumbered} 张）`, 'ok');
+    await refreshLibrary();
+    refreshGitStatus();
+    if (!$('orderPanel').hidden && state.order && state.order.dir === s.dir) {
+      loadOrderDir(s.dir);
+    }
+    if (wasLb) {
+      // 当前大图若正好是被交换的图片，按 mapping 跟随到新路径；
+      // 若映射缺失且旧路径已不存在，则只关闭灯箱，避免停留在失效链接。
+      const mapped = lbRel ? mapping.get(lbRel) : '';
+      const stillThere = lbRel && (state.libAll || []).some((r) => r.rel === lbRel);
+      const nextRel = mapped || (stillThere ? lbRel : '');
+      closeLightbox();
+      if (nextRel) setTimeout(() => openLightbox(nextRel), 0);
+    }
+  } catch (e) {
+    s.busy = false;
+    if (btn) { btn.disabled = false; btn.textContent = '确认交换'; }
+    let msg = e.message;
+    if (/必须包含目录内全部编号图片|无效或重复文件/.test(msg)) {
+      msg = '目录内容已变化（可能有新图、删图或改名），请返回重选或刷新后重试';
+    } else if (/重复编号/.test(msg)) {
+      msg = '目录内存在重复编号，请先在“整理 → 填补空位”中整理编号';
+    }
+    toast(msg, 'err');
+  }
+}
+
+$('swapBody').addEventListener('click', (e) => {
+  const cand = e.target.closest('[data-swap-target]');
+  if (!cand || !swapState || swapState.step !== 'pick') return;
+  swapState.targetRel = cand.dataset.swapTarget;
+  $('swapBody').querySelectorAll('.swap-candidate').forEach((el) => {
+    const on = el === cand;
+    el.classList.toggle('selected', on);
+    el.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+  updateSwapTargetCard();
+});
+
+$('swapBody').addEventListener('input', (e) => {
+  if (e.target.id !== 'swapSearch' || !swapState) return;
+  swapState.search = e.target.value;
+  filterSwapCandidates();
+});
+
+$('swapFoot').addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if (!btn || !swapState) return;
+  if (btn.id === 'swapCancel') closeModal('swapPanel');
+  else if (btn.id === 'swapNext') {
+    if (!swapState.targetRel) return toast('请先选择交换对象', 'warn');
+    swapState.step = 'confirm';
+    renderSwapPanel();
+  } else if (btn.id === 'swapBack') {
+    swapState.step = 'pick';
+    renderSwapPanel();
+  } else if (btn.id === 'swapConfirm') {
+    executeSwap();
+  }
 });
 
 /* ================================================================
@@ -3471,7 +4012,16 @@ document.addEventListener('keydown', (e) => {
   // 单图快捷菜单优先收回
   if (!$('cellMenu').hidden && e.key === 'Escape') { e.preventDefault(); closeCellMenu(); return; }
 
-  // 灯箱优先
+  // 模态框优先：同级可能叠加（顺序面板 + 交换面板），Esc/Tab 只作用于最上层
+  const openModals = [...document.querySelectorAll('.modal')].filter((m) => !m.hidden);
+  const openModalEl = openModals[openModals.length - 1];
+  if (openModalEl) {
+    if (e.key === 'Escape') { e.preventDefault(); closeModal(openModalEl.id); }
+    else if (e.key === 'Tab') trapFocus(openModalEl, e);
+    return;
+  }
+
+  // 灯箱
   if (!$('lightbox').hidden) {
     if (e.key === 'Escape') { e.preventDefault(); closeLightbox(); }
     else if (e.key === 'ArrowLeft') { e.preventDefault(); lbStep(-1); }
@@ -3480,14 +4030,6 @@ document.addEventListener('keydown', (e) => {
     else if (e.key === '-') { e.preventDefault(); lbZoom(0.8); }
     else if (e.key === '0') { e.preventDefault(); lbResetZoom(); }
     else if (e.key === 'i' || e.key === 'I') { e.preventDefault(); toggleLbInfo(); }
-    return;
-  }
-
-  // 模态框：Esc 关闭 + Tab 焦点锁定
-  const openModalEl = [...document.querySelectorAll('.modal')].find((m) => !m.hidden);
-  if (openModalEl) {
-    if (e.key === 'Escape') { e.preventDefault(); closeModal(openModalEl.id); }
-    else if (e.key === 'Tab') trapFocus(openModalEl, e);
     return;
   }
 
@@ -3558,6 +4100,10 @@ $('cellMenu').addEventListener('click', async (e) => {
       a.href = rawUrl(rel) + (getToken() ? `&token=${encodeURIComponent(getToken())}` : '');
       a.download = row.name || '';
       document.body.appendChild(a); a.click(); a.remove();
+    } else if (btn.dataset.act === 'rotate') {
+      openRotatePanel([rel]);
+    } else if (btn.dataset.act === 'swap') {
+      await openSwapPanel(rel);
     } else if (btn.dataset.act === 'move') {
       // 复用移动弹窗：把选区收敛到当前这一张
       state.selected = new Set([rel]);
@@ -3640,7 +4186,8 @@ $('btnSpeed').addEventListener('click', runSpeedTest);
 /* ---------- 操作历史 ---------- */
 const HISTORY_TYPES = {
   upload: '上传', trash: '回收站', restore: '恢复', purge: '彻底删除',
-  move: '移动', convert: '转换', renumber: '规整', reorder: '排序', 'rename-theme': '改名', sync: '同步'
+  move: '移动', convert: '转换', rotate: '旋转', renumber: '规整', reorder: '排序',
+  'rename-theme': '改名', sync: '同步'
 };
 let historyOffset = 0;
 

@@ -16,12 +16,17 @@
  * 用多位置裁切指纹 / 缩略图滑窗 NCC 兜底；只剩约 10% 面积的同方向细节裁切，
  * 另走 patch dHash 粗筛 + 96px 局部 NCC 复核；同图异字/局部覆盖（同一海报的
  * 有字/无字版）用 8×4 分块灰度相关中位数识别，文字/Logo 只破坏部分区块也能归组。
+ * 跨方向裁切若因缩放/水印/重绘导致一维 NCC 只有 0.5~0.7，再用 72px 多尺度
+ * patch dHash 粗筛 + 96px 二维缩放/平移 NCC 对齐 + 8×4 分块相关兜底；
+ * 若竖图是横图去水印/局部重绘后再裁切，则用 3×3 局部分块的一致变换识别。
  *
  * 保留规则（清理相似/重复组时的默认决策）：
- *  - 跨方向局部裁切组：智能识别哪张是被截取的图，保留完整原图、去除截取版本，
+ *  - 跨方向局部裁切组、以及宽高比差异明显（≥2%）的同方向裁切组：
+ *    智能识别哪张是被截取的图，保留完整原图、去除截取版本，
  *    不再按方向强制保留（完整图可能是横图，也可能是竖图/方图）
- *  - 其他组：横图 > 方图 > 竖图；同方向内保留像素面积最大的一张，
- *    面积相同再比较文件体积。可通过 dedup.keepPriority 覆盖顺序。
+ *  - 其他组：横图 > 方图 > 竖图；同方向面积差 >1% 时保留面积更大者，
+ *    面积差 ≤1% 时优先文件体积更大（质量更高）的一张。
+ *    可通过 dedup.keepPriority 覆盖顺序。
  *
  * 索引缓存（.cache/index.json）：
  *  - 记录每个图库文件的 mtime/size/宽高/md5/dhash
@@ -196,6 +201,53 @@ const CROP_TEXT_COLS = 8;
 const CROP_TEXT_ROWS = 4;
 const CROP_TEXT_MEDIAN_MIN = 0.9;
 const CROP_TEXT_MIN_CELLS = 16; // 8×4=32 格，至少一半有效格（排除大面积纯色）
+/* 跨方向低分裁切兜底：真实竖图/横图裁切可能经过缩放、加字或重新渲染，一维 NCC 只有
+ * 0.5~0.7，二维 NCC 也达不到 0.9，但对应窗口的局部结构仍然高度一致。
+ *  1. 多尺度 patch dHash 廉价筛出“完整图里确实存在相似窗口”的候选；
+ *  2. 二维 NCC 在完整图内对齐缩放比例与偏移；
+ *  3. 在最佳对齐处做 8×4 分块灰度相关，取中位数与 ≥0.8 块占比。
+ * 实测 竖0027+横0552：patch 距离 1，二维 NCC 0.812，分块中位数 0.887、≥0.8 块占 75%；
+ * 其余 29 对 patch 距离 ≤10 的候选分块中位数均 ≤0.355、≥0.8 块占比 ≤0.04。
+ * 分块指标只统计有效块（纯色块方差为 0 时跳过），因此文字/水印/大色块只破坏局部。 */
+const CROSS_PREFLIGHT_MIN = 0.55; // 24px 一维 NCC 下限（低于常规 0.6 预筛）
+const CROSS_NCC_MIN = 0.5; // 48px 一维 NCC 下限，避免对完全无关的图做 patch 搜索
+const CROSS_PATCH_SCALES = [0.5, 0.6, 0.7, 0.8, 0.9, 1];
+const CROSS_PATCH_POSITIONS = [0, 0.25, 0.5, 0.75, 1];
+const CROSS_PATCH_MAX = 10; // patch dHash 最大汉明距离；真命中实测 1~3
+const CROSS_PATCH_MIN_AREA = 0.03; // 小于 3% 面积的裁切交给其他通道/不处理
+const CROSS_2D_MIN = 0.75; // 二维 NCC 仅作粗对齐门槛，最终由分块指标判定
+const CROSS_BLOCK_COLS = 8;
+const CROSS_BLOCK_ROWS = 4;
+const CROSS_BLOCK_MEDIAN_MIN = 0.75;
+const CROSS_BLOCK_FRAC_MIN = 0.5;
+const CROSS_BLOCK_MIN_CELLS = 16;
+/* 同作品“去水印/局部重绘 + 竖裁切”衍生版本：
+ * 横图去掉水印后裁成竖图时，水印区/脸部可能被重绘，整图 NCC 只有 0.60~0.75，
+ * 但身体、服装、背景仍能在同一变换下对齐。这里把竖图切成 3×3 块，逐块在横图中
+ * 搜索最佳 NCC，并把每块的最佳位置换算成“整张竖图”的缩放/平移；若至少 5 块
+ * 指向同一变换（其中至少 4 块 NCC ≥0.75），判定为同作品衍生裁切。
+ * 仅处理 2:3 左右的竖图、面积占横图 3%~12% 的低分候选，避免全库高开销搜索。
+ * 实测 横0589+竖0008：8 块有效，5 块一致（4 块强相关）；无关的横0061+竖0308
+ * 只有 4 块一致（3 块强相关），会被拒绝。 */
+const WM_PROFILE_MIN = 0.9;
+const WM_AREA_MIN = 0.03;
+const WM_AREA_MAX = 0.12;
+const WM_CROP_AR_MIN = 0.55;
+const WM_CROP_AR_MAX = 0.8;
+const WM_NCC_MIN = 0.6;
+const WM_NCC_MAX = 0.75;
+const WM_PATCH_COLS = 3;
+const WM_PATCH_ROWS = 3;
+const WM_PATCH_SCALE_MIN = 0.4;
+const WM_PATCH_SCALE_MAX = 0.85;
+const WM_PATCH_SCALE_STEP = 0.02;
+const WM_PATCH_SCORE_MIN = 0.7;
+const WM_PATCH_STRONG_MIN = 0.75;
+const WM_CONSENSUS_SCALE = 0.09;
+const WM_CONSENSUS_TX = 4;
+const WM_CONSENSUS_TY = 5;
+const WM_CONSENSUS_MIN = 5;
+const WM_STRONG_MIN = 4;
 
 /** 索引条目的宽高比；尺寸缺失返回 0 */
 function arOf(item) {
@@ -750,7 +802,7 @@ function rawThumbOf(item, cache) {
  * @returns {{score:number, cropRel:string, fullRel:string, mode:string, scale:number}}
  */
 function ncc2dBest(a, b, cache) {
-  let best = { score: -1, cropRel: '', fullRel: '', mode: '2d', scale: 1 };
+  let best = { score: -1, cropRel: '', fullRel: '', mode: '2d', scale: 1, ox: 0, oy: 0 };
   const va = rawThumbOf(a, cache);
   const vb = rawThumbOf(b, cache);
   if (!va || !vb) return best;
@@ -801,7 +853,7 @@ function ncc2dBest(a, b, cache) {
       for (let oy = oy0; oy <= oy1; oy++) {
         for (let ox = ox0; ox <= ox1; ox++) {
           const v = nccAt(full, crop, ox, oy);
-          if (v > best.score) best = { score: v, cropRel, fullRel, mode: '2d', scale };
+          if (v > best.score) best = { score: v, cropRel, fullRel, mode: '2d', scale, ox, oy };
         }
       }
     }
@@ -946,6 +998,311 @@ function smallCropMatch(a, b, cache, cfg) {
 }
 
 /**
+ * 跨方向低分裁切的多尺度 patch 粗筛：
+ * 在完整图的 72px patch 缩略图上，按固定比例和位置枚举与裁切图同宽高比的窗口，
+ * 取整图 9×8 dHash 的最小汉明距离。只做廉价筛选，最终由二维 NCC + 分块相关判定。
+ */
+function crossPatchDistance(fullPatch, cropPatch) {
+  const cropAR = cropPatch.w / cropPatch.h;
+  let best = 64;
+  const seen = new Set();
+  for (const scale of CROSS_PATCH_SCALES) {
+    let ch = Math.round(fullPatch.h * scale);
+    let cw = Math.round(ch * cropAR);
+    if (cw > fullPatch.w) {
+      // 宽裁切放在竖图里时，按宽度缩放才会出现有效窗口
+      cw = Math.round(fullPatch.w * scale);
+      ch = Math.round(cw / cropAR);
+    }
+    if (cw < 8 || ch < 8 || cw > fullPatch.w || ch > fullPatch.h) continue;
+    const key = `${cw}x${ch}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    for (const px of CROSS_PATCH_POSITIONS) {
+      for (const py of CROSS_PATCH_POSITIONS) {
+        const x = Math.round((fullPatch.w - cw) * px);
+        const y = Math.round((fullPatch.h - ch) * py);
+        const d = hammingDistance(
+          hashRect(fullPatch.I, fullPatch.w, x, y, x + cw, y + ch),
+          cropPatch.hash
+        );
+        if (d < best) best = d;
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * 在已对齐的位置上计算 8×4 分块灰度相关。
+ * 只统计有效块（方差为 0 的纯色块跳过）；文字/Logo/大色块只会拉低少数块，
+ * 中位数和 ≥0.8 块占比仍能反映主体结构是否一致。
+ * @returns {{median:number, frac80:number, valid:number}|null}
+ */
+function crossBlockStats(full, crop, ox, oy) {
+  const cols = CROSS_BLOCK_COLS;
+  const rows = CROSS_BLOCK_ROWS;
+  const bw = Math.floor(crop.w / cols);
+  const bh = Math.floor(crop.h / rows);
+  if (bw < 3 || bh < 3) return null;
+  const vals = [];
+  for (let ry = 0; ry < rows; ry++) {
+    for (let rx = 0; rx < cols; rx++) {
+      let n = 0;
+      let sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+      for (let yy = 0; yy < bh; yy++) {
+        const y = ry * bh + yy;
+        const ai = y * crop.w + rx * bw;
+        const bi = (y + oy) * full.w + ox + rx * bw;
+        for (let xx = 0; xx < bw; xx++) {
+          const a = crop.data[ai + xx];
+          const b = full.data[bi + xx];
+          n++; sa += a; sb += b; saa += a * a; sbb += b * b; sab += a * b;
+        }
+      }
+      if (n < 16) continue;
+      const cov = sab - sa * sb / n;
+      const va = saa - sa * sa / n;
+      const vb = sbb - sb * sb / n;
+      if (va <= 1e-9 || vb <= 1e-9) continue;
+      vals.push(cov / Math.sqrt(va * vb));
+    }
+  }
+  if (vals.length < CROSS_BLOCK_MIN_CELLS) return null;
+  vals.sort((x, y) => x - y);
+  const mid = vals.length >> 1;
+  const median = vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
+  return {
+    median,
+    frac80: vals.filter((v) => v >= 0.8).length / vals.length,
+    valid: vals.length
+  };
+}
+
+/**
+ * 围绕二维 NCC 的最佳点做小范围分块相关细化。
+ * 二维 NCC 优化的是整窗相关，局部缩放/偏移略有误差时，分块中位数可能更高；
+ * 只在少量候选上执行（±2% 缩放、±2px 平移），开销可忽略。
+ */
+function crossBlockBest(full, crop, seed) {
+  const maxScale = Math.min(1, full.w / crop.w, full.h / crop.h);
+  if (maxScale < CROP_2D_SCALE_MIN) return null;
+  let best = null;
+  const scale0 = Math.max(CROP_2D_SCALE_MIN, (seed.scale || 1) - 0.02);
+  const scale1 = Math.min(maxScale, (seed.scale || 1) + 0.02);
+  for (let scale = scale0; scale <= scale1 + 1e-9; scale += CROP_2D_SCALE_STEP) {
+    const cw = Math.max(1, Math.round(crop.w * scale));
+    const ch = Math.max(1, Math.round(crop.h * scale));
+    if (cw > full.w || ch > full.h) continue;
+    const scaled = scale === 1
+      ? crop
+      : { w: cw, h: ch, data: resizeGray(crop.data, crop.w, crop.h, cw, ch) };
+    const ox0 = Math.max(0, (seed.ox || 0) - 2);
+    const ox1 = Math.min(full.w - cw, (seed.ox || 0) + 2);
+    const oy0 = Math.max(0, (seed.oy || 0) - 2);
+    const oy1 = Math.min(full.h - ch, (seed.oy || 0) + 2);
+    for (let oy = oy0; oy <= oy1; oy++) {
+      for (let ox = ox0; ox <= ox1; ox++) {
+        const st = crossBlockStats(full, scaled, ox, oy);
+        if (!st) continue;
+        if (!best || st.median > best.median ||
+            (st.median === best.median && st.frac80 > best.frac80)) {
+          best = { ...st, scale, ox, oy };
+        }
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * 跨方向低分裁切兜底（补一维/二维 NCC 都达不到 0.9 的真裁切）：
+ *  1. 仅不同方向、投影 ≥0.7、面积比 ≥3% 的壁纸对；
+ *  2. 72px 多尺度 patch dHash 粗筛，最小距离 ≤10 才继续；
+ *  3. 96px 二维缩放+平移 NCC 对齐（≥0.75 仅作粗对齐）；
+ *  4. 最佳对齐处 8×4 分块相关：中位数 ≥0.75 且 ≥0.8 块占比 ≥50% 才归组。
+ * 方向由二维 NCC 决定：被放进另一张内部滑动的图是截取图。
+ * @returns {{score:number, cropRel:string, fullRel:string, ...}|null}
+ */
+function crossCropMatch(a, b, cache, cfg) {
+  if (!a || !b || !a.rel || !b.rel) return null;
+  if (!isWallpaperRel(a.rel, cfg) || !isWallpaperRel(b.rel, cfg)) return null;
+  const orientA = orientationOfItem(a, cfg);
+  const orientB = orientationOfItem(b, cfg);
+  if (!orientA || !orientB || orientA === orientB) return null;
+  if (!Array.isArray(a.rowProf) || !Array.isArray(b.rowProf) ||
+      !Array.isArray(a.colProf) || !Array.isArray(b.colProf)) return null;
+  const profile = Math.max(
+    profileCorr(a.rowProf, b.rowProf),
+    profileCorr(a.colProf, b.colProf)
+  );
+  if (profile < CROP_PROFILE_MIN) return null;
+
+  const areaA = (Number(a.w) || 0) * (Number(a.h) || 0);
+  const areaB = (Number(b.w) || 0) * (Number(b.h) || 0);
+  if (!areaA || !areaB) return null;
+  const areaRatio = Math.min(areaA, areaB) / Math.max(areaA, areaB);
+  if (areaRatio < CROSS_PATCH_MIN_AREA || areaRatio > 0.95) return null;
+
+  // 先用面积较小的一张作为“裁切图”做 patch 粗筛（竖图通常是横图的一块）
+  const [fullIt, cropIt] = areaA >= areaB ? [a, b] : [b, a];
+  const fullPatch = patchThumbOf(fullIt, cache);
+  const cropPatch = patchThumbOf(cropIt, cache);
+  if (!fullPatch || !cropPatch) return null;
+  if (cropPatch.w < 8 || cropPatch.h < 8 || fullPatch.w < 16 || fullPatch.h < 16) return null;
+  const patchDistance = crossPatchDistance(fullPatch, cropPatch);
+  if (patchDistance > CROSS_PATCH_MAX) return null;
+
+  const twoD = ncc2dBest(a, b, cache);
+  if (twoD.score < CROSS_2D_MIN || !twoD.cropRel || !twoD.fullRel) return null;
+
+  const rawA = rawThumbOf(a, cache);
+  const rawB = rawThumbOf(b, cache);
+  const full = twoD.fullRel === a.rel ? rawA : rawB;
+  const crop = twoD.cropRel === a.rel ? rawA : rawB;
+  if (!full || !crop) return null;
+
+  const block = crossBlockBest(full, crop, twoD);
+  if (!block) return null;
+  if (block.median < CROSS_BLOCK_MEDIAN_MIN || block.frac80 < CROSS_BLOCK_FRAC_MIN) return null;
+
+  return {
+    score: block.median,
+    patchDistance,
+    twoD: twoD.score,
+    blockMedian: block.median,
+    blockFrac: block.frac80,
+    cropRel: twoD.cropRel,
+    fullRel: twoD.fullRel,
+    via: '2d-block',
+    scale: block.scale,
+    ox: block.ox,
+    oy: block.oy
+  };
+}
+
+/**
+ * 同作品“去水印/局部重绘 + 竖裁切”衍生版本识别。
+ * 与 crossCropMatch 的区别：不要求整图/分块高度一致，只要求竖图被切成 3×3 块后，
+ * 多数块能在横图中找到同一缩放/平移下的高相关位置。水印和脸部重绘只会让少数块
+ * 失配，身体/服装/背景仍会形成一致变换。
+ * @param {number} [score1d] 调用方已算出的 48px 一维 NCC，避免重复计算
+ * @returns {{score:number, cropRel:string, fullRel:string, ...}|null}
+ */
+function watermarkCropMatch(a, b, cache, cfg, score1d) {
+  if (!a || !b || !a.rel || !b.rel) return null;
+  if (!isWallpaperRel(a.rel, cfg) || !isWallpaperRel(b.rel, cfg)) return null;
+  const orientA = orientationOfItem(a, cfg);
+  const orientB = orientationOfItem(b, cfg);
+  if (!orientA || !orientB || orientA === orientB) return null;
+
+  const areaA = (Number(a.w) || 0) * (Number(a.h) || 0);
+  const areaB = (Number(b.w) || 0) * (Number(b.h) || 0);
+  if (!areaA || !areaB) return null;
+  const areaRatio = Math.min(areaA, areaB) / Math.max(areaA, areaB);
+  if (areaRatio < WM_AREA_MIN || areaRatio > WM_AREA_MAX) return null;
+  const [fullIt, cropIt] = areaA >= areaB ? [a, b] : [b, a];
+  if (orientationOfItem(cropIt, cfg) !== 'shu') return null;
+  if (orientationOfItem(fullIt, cfg) === 'shu') return null;
+  const cropAR = arOf(cropIt);
+  if (!cropAR || cropAR < WM_CROP_AR_MIN || cropAR > WM_CROP_AR_MAX) return null;
+
+  if (!Array.isArray(a.rowProf) || !Array.isArray(b.rowProf) ||
+      !Array.isArray(a.colProf) || !Array.isArray(b.colProf)) return null;
+  const profile = Math.max(
+    profileCorr(a.rowProf, b.rowProf),
+    profileCorr(a.colProf, b.colProf)
+  );
+  if (profile < WM_PROFILE_MIN) return null;
+
+  const ncc1d = Number.isFinite(Number(score1d))
+    ? Number(score1d)
+    : nccBest(a, b, cache).score;
+  if (ncc1d < WM_NCC_MIN || ncc1d > WM_NCC_MAX) return null;
+
+  const full = patchThumbOf(fullIt, cache);
+  const crop = patchThumbOf(cropIt, cache);
+  if (!full || !crop) return null;
+  const pw = Math.floor(crop.w / WM_PATCH_COLS);
+  const ph = Math.floor(crop.h / WM_PATCH_ROWS);
+  if (pw < 6 || ph < 6 || full.w < 16 || full.h < 12) return null;
+
+  const good = [];
+  for (let ry = 0; ry < WM_PATCH_ROWS; ry++) {
+    for (let rx = 0; rx < WM_PATCH_COLS; rx++) {
+      const patch = Buffer.alloc(pw * ph);
+      for (let y = 0; y < ph; y++) {
+        for (let x = 0; x < pw; x++) {
+          patch[y * pw + x] = crop.data[(ry * ph + y) * crop.w + rx * pw + x];
+        }
+      }
+      let best = { score: -1, f: 1, ox: 0, oy: 0 };
+      for (let f = WM_PATCH_SCALE_MIN; f <= WM_PATCH_SCALE_MAX + 1e-9; f += WM_PATCH_SCALE_STEP) {
+        const cw = Math.max(6, Math.round(pw * f));
+        const ch = Math.max(6, Math.round(ph * f));
+        if (cw > full.w || ch > full.h) continue;
+        const scaled = { w: cw, h: ch, data: resizeGray(patch, pw, ph, cw, ch) };
+        // 每个尺度先按 2px 步长粗搜，再在该尺度的最佳点 ±2px 内逐像素细化
+        let local = { score: -1, ox: 0, oy: 0 };
+        for (let oy = 0; oy <= full.h - ch; oy += 2) {
+          for (let ox = 0; ox <= full.w - cw; ox += 2) {
+            const v = nccAt(full, scaled, ox, oy);
+            if (v > local.score) local = { score: v, ox, oy };
+          }
+        }
+        if (local.score < 0) continue;
+        const ox0 = Math.max(0, local.ox - 2);
+        const ox1 = Math.min(full.w - cw, local.ox + 2);
+        const oy0 = Math.max(0, local.oy - 2);
+        const oy1 = Math.min(full.h - ch, local.oy + 2);
+        for (let oy = oy0; oy <= oy1; oy++) {
+          for (let ox = ox0; ox <= ox1; ox++) {
+            const v = nccAt(full, scaled, ox, oy);
+            if (v > local.score) local = { score: v, ox, oy };
+          }
+        }
+        if (local.score > best.score) best = { score: local.score, f, ox: local.ox, oy: local.oy };
+      }
+      if (best.score < WM_PATCH_SCORE_MIN) continue;
+      good.push({
+        rx, ry,
+        score: best.score,
+        f: best.f,
+        // 把“块在横图中的位置”换算成“整张竖图左上角”的位置
+        tx: best.ox - rx * pw * best.f,
+        ty: best.oy - ry * ph * best.f
+      });
+    }
+  }
+  if (good.length < WM_CONSENSUS_MIN) return null;
+
+  let group = { count: 0, members: [], anchor: null };
+  for (const anchor of good) {
+    const members = good.filter((p) =>
+      Math.abs(p.f - anchor.f) <= WM_CONSENSUS_SCALE &&
+      Math.abs(p.tx - anchor.tx) <= WM_CONSENSUS_TX &&
+      Math.abs(p.ty - anchor.ty) <= WM_CONSENSUS_TY
+    );
+    if (members.length > group.count) group = { count: members.length, members, anchor };
+  }
+  const strong = group.members.filter((p) => p.score >= WM_PATCH_STRONG_MIN).length;
+  if (group.count < WM_CONSENSUS_MIN || strong < WM_STRONG_MIN) return null;
+
+  const score = group.members.reduce((sum, p) => sum + p.score, 0) / group.members.length;
+  return {
+    score,
+    cropRel: cropIt.rel,
+    fullRel: fullIt.rel,
+    via: 'watermark',
+    consensus: group.count,
+    strong,
+    scale: group.anchor.f,
+    tx: group.anchor.tx,
+    ty: group.anchor.ty
+  };
+}
+
+/**
  * 同图异字/局部覆盖版本识别（例如同一张海报的有字版与无字版）。
  * 文字、Logo、大色块只会破坏部分 8×4 区块；未被覆盖区块的灰度相关仍很高，
  * 因此取逐格 Pearson 相关的中位数作为鲁棒分数。纯色区块方差为 0，直接跳过；
@@ -1045,9 +1402,29 @@ function nccCropMatch(a, b, cache, cfg) {
   if (profile < CROP_PROFILE_MIN) return null;
   // 24px 廉价预筛：通过后再做 48px 精算（以及灰区缩放/二维复核）
   const pre = nccBest(a, b, cache, CROP_NCC_PREFLIGHT_SIZE);
-  if (pre.score < CROP_NCC_PREFLIGHT_MIN) return null;
+  const crossOrientation = orientA !== orientB;
+  if (pre.score < CROP_NCC_PREFLIGHT_MIN) {
+    // 跨方向真裁切可能因缩放/水印导致一维 NCC 只有 0.55~0.6；
+    // 这类候选交给 patch 粗筛 + 二维 NCC + 分块相关兜底。
+    if (crossOrientation && pre.score >= CROSS_PREFLIGHT_MIN) {
+      const cross = crossCropMatch(a, b, cache, cfg);
+      if (cross) return cross.score;
+    }
+    return null;
+  }
   const best = nccBestRefined(a, b, cache);
-  return best.score >= CROP_NCC_MIN ? best.score : null;
+  if (best.score >= CROP_NCC_MIN) return best.score;
+  // 一维/二维 NCC 都不到 0.9 时，跨方向再用分块相关做最后复核
+  if (crossOrientation && best.score >= CROSS_NCC_MIN) {
+    const cross = crossCropMatch(a, b, cache, cfg);
+    if (cross) return cross.score;
+  }
+  // 去水印/局部重绘后裁切：整图相关低，但多个局部块能对齐到同一变换
+  if (crossOrientation) {
+    const wm = watermarkCropMatch(a, b, cache, cfg, best.score);
+    if (wm) return wm.score;
+  }
+  return null;
 }
 
 /**
@@ -1061,10 +1438,16 @@ function cropRelationOf(a, b, cropThreshold, cfg, cache) {
   if (!isWallpaperRel(a.rel, cfg) || !isWallpaperRel(b.rel, cfg)) return null;
   const orientA = orientationOfItem(a, cfg);
   const orientB = orientationOfItem(b, cfg);
-  if (!orientA || !orientB || orientA === orientB) return null;
+  if (!orientA || !orientB) return null;
 
   const arA = arOf(a);
   const arB = arOf(b);
+  if (orientA === orientB) {
+    // 同方向构图窗口相近时方向不可靠；只有宽高比差异明显才交给 NCC 判断
+    if (!arA || !arB) return null;
+    if (Math.abs(arA - arB) / Math.max(arA, arB) < CROP_SAME_AR_DIFF_MIN) return null;
+  }
+
   if (arA && arB && a.chash && b.chash && Array.isArray(a.crops) && Array.isArray(b.crops)) {
     const dA = bestCropMatch(a.chash, b.crops, arA); // A 整图 = B 的局部 → A 是截取图
     const dB = bestCropMatch(b.chash, a.crops, arB); // B 整图 = A 的局部 → B 是截取图
@@ -1080,7 +1463,30 @@ function cropRelationOf(a, b, cropThreshold, cfg, cache) {
   }
 
   const best = nccBestRefined(a, b, cache || new Map());
-  if (best.score < CROP_NCC_MIN) return null;
+  if (best.score < CROP_NCC_MIN) {
+    // 一维/二维 NCC 都不到 0.9：跨方向再走 patch + 分块相关兜底，
+    // 让保留决策也能识别“低分真裁切”的完整原图。
+    const cross = crossCropMatch(a, b, cache || new Map(), cfg);
+    if (cross) {
+      return {
+        cropRel: cross.cropRel,
+        fullRel: cross.fullRel,
+        via: 'ncc',
+        distance: Math.round((1 - cross.score) * 64),
+        score: cross.score
+      };
+    }
+    // 去水印/局部重绘后的竖裁切：多个局部块一致指向同一变换
+    const wm = watermarkCropMatch(a, b, cache || new Map(), cfg, best.score);
+    if (!wm) return null;
+    return {
+      cropRel: wm.cropRel,
+      fullRel: wm.fullRel,
+      via: 'ncc',
+      distance: Math.round((1 - wm.score) * 64),
+      score: wm.score
+    };
+  }
   return {
     cropRel: best.cropRel,
     fullRel: best.fullRel,
@@ -1091,10 +1497,10 @@ function cropRelationOf(a, b, cropThreshold, cfg, cache) {
 }
 
 /**
- * 跨方向裁切组的保留决策：智能识别完整原图，保留它并去掉被截取的图。
+ * 跨方向裁切组，以及同方向但宽高比差异明显（≥2%）的裁切组：
+ * 智能识别完整原图，保留它并去掉被截取的图。
  * 与方向优先级（横>方>竖）无关——完整图可能是竖图，也可能横图。
- * 同方向组不参与方向判断（构图窗口相同，谁更完整无法可靠判断），
- * 返回 null，由调用方回退 pickKeep() 按面积保留更高清的一张。
+ * 同方向且宽高比接近时方向不可靠，返回 null，由调用方回退 pickKeep()。
  *
  * @returns {{keepRel:string, cropRels:string[], via:string}|null}
  *   非裁切组（同方向/无裁切关系/方向成环）返回 null，调用方回退 pickKeep()
@@ -1148,8 +1554,8 @@ function pickCropKeeper(items, cfg, cropThreshold, cache) {
 /**
  * "保留原图"决策（一键批量清理用）：
  *  1. 能识别出裁切关系时，保留完整原图（与 pickCropKeeper 一致）；
- *  2. 否则保留像素面积最大的一张（面积相同比文件体积），不按方向优先——
- *     "原图"通常指分辨率最高、信息最全的版本。
+ *  2. 否则保留像素面积最大的一张；面积差 ≤1% 视为同尺寸，优先文件体积更大
+ *     （质量更高）的一张，不按方向优先——"原图"通常指信息最全、质量最高的版本。
  * @returns {{rel:string, reason:'crop'|'area', cropRels:string[]}}
  */
 function pickOriginal(items, cfg, cropThreshold, cache) {
@@ -1160,12 +1566,16 @@ function pickOriginal(items, cfg, cropThreshold, cache) {
     return { rel: cropInfo.keepRel, reason: 'crop', cropRels: cropInfo.cropRels };
   }
   const areaOf = (it) => (Number(it.w) || 0) * (Number(it.h) || 0);
+  const sizeOf = (it) => Number(it.size) || 0;
   let best = list[0];
   for (const it of list) {
     const area = areaOf(it);
     const bestArea = areaOf(best);
-    if (area > bestArea ||
-        (area === bestArea && (Number(it.size) || 0) > (Number(best.size) || 0))) {
+    const areaClose = bestArea > 0 &&
+      Math.abs(area - bestArea) / Math.max(area, bestArea) <= KEEP_AREA_TOLERANCE;
+    if (areaClose) {
+      if (sizeOf(it) > sizeOf(best)) best = it;
+    } else if (area > bestArea || (area === bestArea && sizeOf(it) > sizeOf(best))) {
       best = it;
     }
   }
@@ -1596,6 +2006,9 @@ const KEEP_PRIORITY = ['heng', 'avatar', 'shu'];
 /** 方向在默认规则中的权重：横图最高、方图次之、竖图最后 */
 const KEEP_RANK = { heng: 3, avatar: 2, shu: 1 };
 
+/** 同方向面积差 ≤1% 视为同尺寸，优先保留文件体积更大（质量更高）的一张 */
+const KEEP_AREA_TOLERANCE = 0.01;
+
 /** 方向中文名（服务端/前端提示共用语义） */
 const ORIENTATION_LABELS = { heng: '横图', avatar: '方图', shu: '竖图' };
 
@@ -1638,9 +2051,9 @@ function keepPriorityOf(cfg) {
 /**
  * 非裁切组的保留决策（同方向/无截取关系时使用）：
  *  1. 方向优先级：横图 > 方图 > 竖图（可由 dedup.keepPriority 调整）
- *  2. 同方向：像素面积更大者优先（保留更清晰的一张）
- *  3. 面积相同：文件体积更大者优先
- *  4. 仍相同：保持组内原顺序（稳定，避免每次扫描结果跳动）
+ *  2. 同方向：面积差 >1% 时保留面积更大者；面积差 ≤1% 视为同尺寸，
+ *     优先保留文件体积更大（质量更高）的一张
+ *  3. 面积与体积都相同：保持组内原顺序（稳定，避免每次扫描结果跳动）
  *
  * @param {Array<{rel:string,w?:number,h?:number,size?:number}>} items
  * @param {object} cfg
@@ -1663,10 +2076,13 @@ function pickKeep(items, cfg) {
     const r = rank.get(orientation) || 0;
     const area = (Number(item.w) || 0) * (Number(item.h) || 0);
     const size = Number(item.size) || 0;
-    // 逐级比较：方向 > 面积 > 体积；全部相同则保留先出现的一张
+    // 逐级比较：方向 > 面积（差 >1%）> 文件体积（面积几乎相同时）> 原顺序
+    const areaClose = bestArea > 0 &&
+      Math.abs(area - bestArea) / Math.max(area, bestArea) <= KEEP_AREA_TOLERANCE;
     const better = r > bestRank ||
-      (r === bestRank && area > bestArea) ||
-      (r === bestRank && area === bestArea && size > bestSize);
+      (r === bestRank && areaClose && size > bestSize) ||
+      (r === bestRank && areaClose && size === bestSize && area > bestArea) ||
+      (r === bestRank && !areaClose && area > bestArea);
     if (better) {
       bestIndex = index;
       bestRank = r;
@@ -1785,6 +2201,7 @@ module.exports = {
   orientationOf, orientationOfItem, keepPriorityOf, pickKeep,
   cropHashesOf, cropDistanceOf, nccCropMatch, nccScore, profileCorr, CROP_VERSION,
   cropRelationOf, pickCropKeeper, pickOriginal, smallCropMatch, textVariantMatch,
+  crossCropMatch, watermarkCropMatch,
   KEEP_PRIORITY, ORIENTATION_LABELS,
   loadIgnoreSet, saveIgnoreSet, addIgnorePairs, removeIgnorePairs, pruneIgnorePairs
 };

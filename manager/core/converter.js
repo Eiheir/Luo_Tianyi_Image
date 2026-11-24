@@ -28,6 +28,23 @@ function decodeHeic(buffer) {
   return heicConvert({ buffer, format: 'JPEG', quality: 0.92 }); // 返回 JPEG 编码的 Buffer
 }
 
+/** 识别真实图片格式：jpeg 归并为 jpg；heif 容器按压缩编码区分 avif / heic，
+ *  metadata 不可靠时再看原文件扩展名兜底（供上传与旋转共用）。 */
+function detectFormat(meta, sourceName) {
+  let ext = String((meta && meta.format) || 'jpg').toLowerCase();
+  if (ext === 'jpeg') ext = 'jpg';
+  if (ext === 'heif') {
+    const comp = String((meta && meta.compression) || '').toLowerCase();
+    if (comp === 'av1') ext = 'avif';
+    else if (comp === 'hevc') ext = 'heic';
+    else {
+      const srcExt = path.extname(sourceName || '').slice(1).toLowerCase();
+      ext = srcExt === 'avif' ? 'avif' : 'heic';
+    }
+  }
+  return ext;
+}
+
 /** 支持的转换目标格式（键=前端传入值，值=落盘扩展名） */
 const TARGETS = { keep: null, jpg: 'jpg', png: 'png', webp: 'webp', avif: 'avif' };
 
@@ -89,21 +106,7 @@ async function processImage(inputBuffer, opts = {}) {
   const animated = (meta.pages || 1) > 1;
 
   const targetKey = TARGETS[opts.target] !== undefined ? opts.target : 'keep';
-  let ext = (meta.format || 'jpg').toLowerCase();
-  // jpeg 统一记作 jpg，方便命名与统计
-  if (ext === 'jpeg') ext = 'jpg';
-  // sharp 对整个 heif 容器（avif 与 heic）的 format 都报 "heif"；
-  // 用容器内压缩编码区分：av1 = avif（可原样保留），hevc = heic（须转 jpg）。
-  // metadata 不可靠时再看原文件扩展名兜底。
-  if (ext === 'heif') {
-    const comp = String(meta.compression || '').toLowerCase();
-    if (comp === 'av1') ext = 'avif';
-    else if (comp === 'hevc') ext = 'heic';
-    else {
-      const srcExt = path.extname(opts.sourceName || '').slice(1).toLowerCase();
-      ext = srcExt === 'avif' ? 'avif' : 'heic';
-    }
-  }
+  let ext = detectFormat(meta, opts.sourceName);
 
   const quality = clampQuality(opts.quality);
   // stripMeta 默认 true：未显式传 false 即剥离 EXIF（防 GPS/拍摄参数外泄）
@@ -189,6 +192,112 @@ async function processImage(inputBuffer, opts = {}) {
   };
 }
 
+/* ---------------------------------------------------------------
+ * 手动旋转
+ * ---------------------------------------------------------------
+ * 用于修正"像素本身就是歪的、但缺少 EXIF 方向"的图片（上传时的 .rotate()
+ * 只能按 EXIF 转正，无法判断物理像素方向）。旋转会重新编码并剥离 EXIF，
+ * 保留 ICC 色彩配置；动图（多帧）sharp 不支持整体旋转，直接跳过并说明。
+ */
+
+/** 含镜像的 EXIF 方向：无法用纯角度表达，先自动转正到无损 PNG 再旋转 */
+const MIRROR_ORIENTATIONS = new Set([2, 4, 5, 7]);
+/** EXIF 方向 → 顺时针角度（仅非镜像方向） */
+const ORIENT_ANGLE = { 1: 0, 2: 0, 3: 180, 4: 0, 5: 90, 6: 90, 7: 270, 8: 270 };
+/** 允许的用户旋转角度（度，顺时针为正） */
+const ROTATE_ANGLES = new Set([0, 90, 180, 270, -90, -180, -270]);
+
+/** 旋转后的落盘格式：能原格式编码的保持原格式，bmp/heic 退化为 png/jpg */
+function outputExtFor(ext) {
+  switch (ext) {
+    case 'jpg': case 'jpeg': return 'jpg';
+    case 'png': return 'png';
+    case 'webp': return 'webp';
+    case 'avif': return 'avif';
+    case 'gif': return 'gif';
+    case 'bmp': return 'png';   // sharp 可读 BMP，但不能编码 BMP
+    case 'heic': case 'heif': return 'jpg';
+    default: return 'jpg';
+  }
+}
+
+/** 按目标扩展名编码旋转结果（与上传管道的编码参数保持一致） */
+async function encodeRotated(pipe, ext, quality) {
+  switch (ext) {
+    case 'png':
+      return pipe.png({ compressionLevel: 9 }).toBuffer({ resolveWithObject: true });
+    case 'webp':
+      return pipe.webp({ quality }).toBuffer({ resolveWithObject: true });
+    case 'avif':
+      return pipe.avif({ quality: Math.min(quality, 80) }).toBuffer({ resolveWithObject: true });
+    case 'gif':
+      return pipe.gif({ effort: 7 }).toBuffer({ resolveWithObject: true });
+    case 'jpg':
+    default:
+      return pipe.flatten({ background: '#ffffff' }).jpeg({ quality, mozjpeg: true })
+        .toBuffer({ resolveWithObject: true });
+  }
+}
+
+/**
+ * 旋转单张静态图片。
+ * @param {Buffer} inputBuffer 原始字节
+ * @param {object} opts { angle: 90|-90|180|270|0, quality, sourceName }
+ * @returns {Promise<{buffer:Buffer, ext:string, width:number, height:number,
+ *   animated:boolean, converted:boolean, skipped?:boolean, notice?:string}>}
+ *   skipped=true 表示动图不支持旋转，buffer 为原始字节、调用方不应落盘。
+ */
+async function rotateImage(inputBuffer, opts = {}) {
+  const angle = Number(opts.angle);
+  if (!ROTATE_ANGLES.has(angle)) throw new Error('旋转角度无效（仅支持 90° / -90° / 180°）');
+
+  let meta = await sharp(inputBuffer).metadata();
+  let format = detectFormat(meta, opts.sourceName);
+  const originalFormat = format;
+  if ((meta.pages || 1) > 1) {
+    return {
+      buffer: inputBuffer, ext: format, width: meta.width, height: meta.height,
+      animated: true, converted: false, skipped: true,
+      notice: '动图旋转暂不支持（多帧图像无法整体旋转），请先转为静态图片'
+    };
+  }
+
+  // HEIC/HEIF：sharp 无 HEVC 解码器，先解成 JPEG 再旋转
+  let input = inputBuffer;
+  if (format === 'heic' || format === 'heif') {
+    input = Buffer.from(await decodeHeic(inputBuffer));
+    meta = await sharp(input).metadata();
+    format = 'jpg';
+  }
+
+  const orientation = Number(meta.orientation) || 1;
+  // 镜像方向先自动转正（含镜像）到无损 PNG；普通方向直接把 EXIF 角度并入旋转角
+  let workInput = input;
+  if (MIRROR_ORIENTATIONS.has(orientation)) {
+    workInput = await sharp(input).rotate().png().toBuffer();
+  }
+  const base = MIRROR_ORIENTATIONS.has(orientation) ? 0 : (ORIENT_ANGLE[orientation] || 0);
+  const total = ((base + angle) % 360 + 360) % 360;
+
+  const outExt = outputExtFor(format);
+  const quality = clampQuality(opts.quality);
+  let pipe = sharp(workInput).keepIccProfile();
+  if (total !== 0) pipe = pipe.rotate(total);
+  const { data, info } = await encodeRotated(pipe, outExt, quality);
+  const converted = outExt !== originalFormat;
+  return {
+    buffer: data,
+    ext: outExt,
+    width: info.width,
+    height: info.height,
+    animated: false,
+    converted,
+    notice: converted
+      ? `原格式 ${originalFormat.toUpperCase()} 无法直接旋转，已转为 ${outExt.toUpperCase()}`
+      : undefined
+  };
+}
+
 /** 质量参数约束到合法区间 */
 function clampQuality(q) {
   const n = Number(q);
@@ -196,4 +305,4 @@ function clampQuality(q) {
   return Math.max(30, Math.min(100, Math.round(n)));
 }
 
-module.exports = { processImage, TARGETS, clampQuality };
+module.exports = { processImage, rotateImage, detectFormat, TARGETS, clampQuality };
