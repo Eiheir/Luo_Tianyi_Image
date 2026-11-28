@@ -5,13 +5,19 @@ name: Deploy images to Workers
 # 只处理 LTYpicture/** 下的图片文件；manager/（图床管理软件）、README、
 # config.json 等仓库代码不参与部署。
 #
-# Worker 配置（wrangler.toml）维护在博客仓库 XinChengP/OxygenBlogPlatform 的
-# cloudflare/gallery-assets/，本工作流每次部署时拉取，单一事实来源。
+# Worker 配置（wrangler.toml / wrangler.thumbs.toml / wrangler.large.toml）维护
+# 在博客仓库 XinChengP/OxygenBlogPlatform 的 cloudflare/gallery-assets/，本工作流
+# 每次部署时拉取，单一事实来源。
 #
-# 缩略图/高清预览图构建脚本与 _headers 在 scripts/gallery-assets/ 留了一份
-# CI 副本：博客仓库的 assets/ 被 gitignore（_headers 无法进入 CI 检出），
-# 且 Action 需要固定的 --large-width 行为，不能依赖博客仓库工作区的未提交改动。
-# 博客仓库的 cloudflare/gallery-assets/build-manifest.mjs 变更后，请同步本副本。
+# 单 Worker 单版本上限 20,000 文件，因此按资产类型拆三个 Worker：
+#   gallery-assets  LTYpicture/** + manifest.json + _headers（Custom Domain）
+#   gallery-thumbs  thumbs/**（Route /thumbs/*）
+#   gallery-large   large/**（Route /large/*）
+#
+# 缩略图/高清预览图构建脚本、split-assets.mjs 与 _headers 在
+# scripts/gallery-assets/ 留了一份 CI 副本：博客仓库的 assets/ 被 gitignore
+# （_headers 无法进入 CI 检出），且 Action 需要固定的 --large-width 行为，
+# 不能依赖博客仓库工作区的未提交改动。博客仓库对应脚本变更后，请同步本副本。
 #
 # 首次启用前需在仓库 Settings → Secrets and variables → Actions 配置：
 #   CLOUDFLARE_API_TOKEN  : API Token（模板 "Edit Cloudflare Workers"，限定本账号/zone）
@@ -52,12 +58,14 @@ jobs:
           git clone --depth 1 --filter=blob:none --sparse \
             https://x-access-token:${{ github.token }}@github.com/XinChengP/OxygenBlogPlatform.git blog-repo
           git -C blog-repo sparse-checkout set cloudflare/gallery-assets
-          if [ ! -f blog-repo/cloudflare/gallery-assets/wrangler.toml ]; then
-            echo "博客仓库未找到 cloudflare/gallery-assets/wrangler.toml，请先在 XinChengP/OxygenBlogPlatform 推入 Worker 骨架" >&2
-            exit 1
-          fi
           cp -r blog-repo/cloudflare/gallery-assets/. worker/
           rm -rf blog-repo
+          for f in wrangler.toml wrangler.thumbs.toml wrangler.large.toml; do
+            if [ ! -f "worker/$f" ]; then
+              echo "博客仓库缺少 cloudflare/gallery-assets/$f，请先推入三 Worker 分片配置" >&2
+              exit 1
+            fi
+          done
           ls -la worker/
 
       - name: Compute gallery tree hash
@@ -133,12 +141,32 @@ jobs:
             }
           '
 
-      - name: Deploy Worker with assets
-        # wrangler-action@v3 在部分环境下 npx 拉包需要交互确认，改为显式安装后直接调用
+      - name: Split assets into Worker shards
+        # 按变体拆成 main/thumbs/large 三个 Worker 资产目录，每个各算 20,000 文件。
+        # 用硬链接落盘，不复制 GB 级图片；split-assets.mjs 内部会校验各分片文件数，
+        # 19,000 告警、20,000 直接失败，避免部署到一半才撞上限。
+        run: |
+          SPLIT_SCRIPT=worker/split-assets.mjs
+          if [ ! -f "$SPLIT_SCRIPT" ]; then
+            echo "博客骨架缺少 split-assets.mjs，使用本仓库 CI 副本"
+            SPLIT_SCRIPT=scripts/gallery-assets/split-assets.mjs
+          fi
+          node "$SPLIT_SCRIPT" worker/assets worker/shards
+
+      - name: Deploy workers
+        # 顺序：thumbs → large → 主 Worker。主 Worker 最后上，确保新 manifest
+        # 引用的变体已经部署；任一步失败，主 Worker 仍保留旧清单。
+        # wrangler-action@v3 在部分环境下 npx 拉包需要交互确认，改为显式安装后直接调用。
         run: |
           cd worker
           npm install --no-save wrangler@^4
-          npx wrangler deploy
+          npx wrangler deploy -c wrangler.thumbs.toml
+          if [ -d shards/large ]; then
+            npx wrangler deploy -c wrangler.large.toml
+          else
+            echo "未生成 large 资产，跳过 gallery-large"
+          fi
+          npx wrangler deploy -c wrangler.toml
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
